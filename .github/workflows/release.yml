@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - 'release/*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from branch name
+        id: get-version
+        run: |
+          BRANCH_NAME=${GITHUB_REF#refs/heads/release/}
+          echo "version=$BRANCH_NAME" >> $GITHUB_OUTPUT
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Tauri app (Apple Silicon)
+        run: npm run tauri build -- --target aarch64-apple-darwin
+
+      - name: List build outputs
+        run: |
+          echo "=== Bundle directory ==="
+          ls -la src-tauri/target/aarch64-apple-darwin/release/bundle/
+          echo "=== macOS bundle ==="
+          ls -la src-tauri/target/aarch64-apple-darwin/release/bundle/macos/
+          echo "=== DMG bundle ==="
+          ls -la src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/
+
+      - name: Create DMG with Applications symlink
+        run: |
+          VERSION=${{ steps.get-version.outputs.version }}
+          APP_PATH=$(find src-tauri/target/aarch64-apple-darwin/release/bundle/macos -name "*.app" | head -1)
+          DMG_PATH="src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/Agent-Hub_${VERSION}_aarch64.dmg"
+
+          # Remove old DMG if it exists
+          rm -f "$DMG_PATH"
+
+          # Create a staging directory with app and Applications symlink
+          DMG_STAGING="$RUNNER_TEMP/dmg-staging"
+          rm -rf "$DMG_STAGING"
+          mkdir -p "$DMG_STAGING"
+
+          # Copy the app
+          cp -R "$APP_PATH" "$DMG_STAGING/"
+
+          # Create Applications symlink for drag-to-install
+          ln -s /Applications "$DMG_STAGING/Applications"
+
+          # Create new DMG with both app and Applications folder
+          hdiutil create -volname "Agent Hub" -srcfolder "$DMG_STAGING" -ov -format UDZO "$DMG_PATH"
+
+          echo "Created DMG at: $DMG_PATH"
+          ls -la src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/
+
+      - name: Create Release and Upload Assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=${{ steps.get-version.outputs.version }}
+
+          # Create release
+          gh release create "v$VERSION" \
+            --title "Agent Hub v$VERSION" \
+            --generate-notes \
+            --draft=false \
+            --latest
+
+          # Upload DMG
+          DMG_FILE="src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/Agent-Hub_${VERSION}_aarch64.dmg"
+          if [ -f "$DMG_FILE" ]; then
+            gh release upload "v$VERSION" "$DMG_FILE"
+          fi
+
+          echo "Release v$VERSION created and assets uploaded!"
+          echo "https://github.com/${{ github.repository }}/releases/tag/v$VERSION"
