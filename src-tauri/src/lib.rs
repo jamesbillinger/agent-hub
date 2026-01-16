@@ -10,9 +10,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+#[cfg(not(target_os = "ios"))]
 use futures::{SinkExt, StreamExt};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+#[cfg(not(target_os = "ios"))]
 use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -22,22 +24,25 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
-use tauri::{
-    AppHandle, Emitter,
-    menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
-};
+use tauri::{AppHandle, Emitter};
+#[cfg(not(target_os = "ios"))]
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+#[cfg(not(target_os = "ios"))]
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 
+#[cfg(not(target_os = "ios"))]
 struct PtySession {
     pair: PtyPair,
     writer: Box<dyn Write + Send>,
 }
 
+#[cfg(not(target_os = "ios"))]
 static PTY_SESSIONS: Lazy<Mutex<HashMap<String, Arc<Mutex<PtySession>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 // Broadcast channels for PTY output - used by both Tauri and WebSocket clients
+#[cfg(not(target_os = "ios"))]
 static PTY_BROADCASTERS: Lazy<Mutex<HashMap<String, broadcast::Sender<Vec<u8>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -338,6 +343,7 @@ fn update_session_claude_id(session_id: String, claude_session_id: String) -> Re
     Ok(())
 }
 
+#[cfg(not(target_os = "ios"))]
 #[tauri::command]
 fn spawn_pty(
     app: AppHandle,
@@ -505,6 +511,7 @@ fn spawn_pty(
     Ok(())
 }
 
+#[cfg(not(target_os = "ios"))]
 #[tauri::command]
 fn write_pty(session_id: String, data: String) -> Result<(), String> {
     let sessions = PTY_SESSIONS.lock();
@@ -521,6 +528,7 @@ fn write_pty(session_id: String, data: String) -> Result<(), String> {
     }
 }
 
+#[cfg(not(target_os = "ios"))]
 #[tauri::command]
 fn resize_pty(session_id: String, cols: u16, rows: u16) -> Result<(), String> {
     let sessions = PTY_SESSIONS.lock();
@@ -542,6 +550,7 @@ fn resize_pty(session_id: String, cols: u16, rows: u16) -> Result<(), String> {
     }
 }
 
+#[cfg(not(target_os = "ios"))]
 #[tauri::command]
 fn kill_pty(session_id: String) -> Result<(), String> {
     let mut sessions = PTY_SESSIONS.lock();
@@ -696,6 +705,7 @@ fn load_app_settings() -> Result<AppSettings, String> {
     Ok(settings)
 }
 
+#[cfg(not(target_os = "ios"))]
 fn create_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     // File menu
     let new_session = MenuItem::with_id(app, "new_session", "New Session", true, Some("CmdOrCtrl+T"))?;
@@ -1480,6 +1490,7 @@ async fn api_auth_check(
 }
 
 // GET /api/sessions - List all sessions with running status
+#[cfg(not(target_os = "ios"))]
 async fn api_list_sessions(headers: axum::http::HeaderMap) -> impl IntoResponse {
     if let Some(err) = check_auth(&headers) {
         return err.into_response();
@@ -1504,6 +1515,35 @@ async fn api_list_sessions(headers: axum::http::HeaderMap) -> impl IntoResponse 
                     "claude_session_id": s.claude_session_id,
                     "sort_order": s.sort_order,
                     "running": is_running
+                })
+            }).collect();
+
+            Json(sessions_with_status).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+// iOS version - no PTY running status
+#[cfg(target_os = "ios")]
+async fn api_list_sessions(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    if let Some(err) = check_auth(&headers) {
+        return err.into_response();
+    }
+    match load_sessions() {
+        Ok(sessions) => {
+            // On iOS, sessions are never running locally
+            let sessions_with_status: Vec<serde_json::Value> = sessions.into_iter().map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "name": s.name,
+                    "agent_type": s.agent_type,
+                    "command": s.command,
+                    "working_dir": s.working_dir,
+                    "created_at": s.created_at,
+                    "claude_session_id": s.claude_session_id,
+                    "sort_order": s.sort_order,
+                    "running": false
                 })
             }).collect();
 
@@ -1621,6 +1661,7 @@ async fn api_get_buffer(
 }
 
 // POST /api/sessions/{id}/start - Start a session remotely
+#[cfg(not(target_os = "ios"))]
 async fn api_start_session(
     headers: axum::http::HeaderMap,
     Path(session_id): Path<String>,
@@ -1676,7 +1717,23 @@ async fn api_start_session(
     }
 }
 
+// iOS version - cannot start PTY sessions locally
+#[cfg(target_os = "ios")]
+async fn api_start_session(
+    headers: axum::http::HeaderMap,
+    Path(_session_id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(err) = check_auth(&headers) {
+        return err.into_response();
+    }
+    (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
+        "error": "not_supported",
+        "message": "PTY sessions cannot be started on iOS. Connect to a desktop Agent Hub instance."
+    }))).into_response()
+}
+
 // WebSocket handler for PTY streaming
+#[cfg(not(target_os = "ios"))]
 async fn ws_handler(
     Path(session_id): Path<String>,
     ws: WebSocketUpgrade,
@@ -1684,6 +1741,7 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_ws(socket, session_id))
 }
 
+#[cfg(not(target_os = "ios"))]
 async fn handle_ws(socket: WebSocket, session_id: String) {
     let (mut sender, mut receiver) = socket.split();
     let session_id_for_emit = session_id.clone();
@@ -1751,6 +1809,16 @@ async fn handle_ws(socket: WebSocket, session_id: String) {
     }
 }
 
+// iOS stub - WebSocket not supported without PTY
+#[cfg(target_os = "ios")]
+async fn ws_handler(
+    Path(_session_id): Path<String>,
+    _ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    (StatusCode::NOT_IMPLEMENTED, "WebSocket PTY streaming not supported on iOS")
+}
+
+#[cfg(not(target_os = "ios"))]
 fn start_web_server() {
     // Load paired devices from database
     load_paired_devices();
@@ -1818,8 +1886,158 @@ fn start_web_server() {
     });
 }
 
+// iOS version of web server - same functionality but no PTY routes will work
+// The iOS app is intended to be a remote client connecting to a desktop instance,
+// but we still run the server for potential local testing/development
+#[cfg(target_os = "ios")]
+fn start_web_server() {
+    // Load paired devices from database
+    load_paired_devices();
+
+    // Spawn web server in a dedicated thread with its own tokio runtime
+    thread::spawn(|| {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime for web server");
+        rt.block_on(async {
+            let app = Router::new()
+                .route("/", get(web_index))
+                // Auth endpoints (no auth required)
+                .route("/api/auth/check", get(api_auth_check))
+                .route("/api/auth/request-pairing", axum::routing::post(api_request_pairing))
+                .route("/api/auth/pair", axum::routing::post(api_pair))
+                // Protected endpoints - PTY start and WebSocket will return errors on iOS
+                .route("/api/sessions", get(api_list_sessions).post(api_create_session))
+                .route("/api/sessions/:session_id/buffer", get(api_get_buffer))
+                .route("/api/sessions/:session_id/start", axum::routing::post(api_start_session))
+                .route("/api/ws/:session_id", get(ws_handler))
+                .layer(CorsLayer::permissive());
+
+            // Try ports starting from WEB_PORT_BASE until we find one available
+            let mut listener = None;
+            let mut bound_port = WEB_PORT_BASE;
+
+            for port_offset in 0..WEB_PORT_MAX_ATTEMPTS {
+                let port = WEB_PORT_BASE + port_offset;
+                let addr = SocketAddr::from(([0, 0, 0, 0], port));
+
+                match tokio::net::TcpListener::bind(addr).await {
+                    Ok(l) => {
+                        bound_port = port;
+                        listener = Some(l);
+                        break;
+                    }
+                    Err(e) => {
+                        println!("Port {} unavailable ({}), trying next...", port, e);
+                    }
+                }
+            }
+
+            let listener = listener.expect(&format!(
+                "Failed to bind to any port in range {}-{}",
+                WEB_PORT_BASE,
+                WEB_PORT_BASE + WEB_PORT_MAX_ATTEMPTS - 1
+            ));
+
+            // Store the bound port for other parts of the app to access
+            {
+                let mut port_guard = WEB_SERVER_PORT.lock();
+                *port_guard = Some(bound_port);
+            }
+
+            // Notify the app about the bound port
+            if let Some(app) = APP_HANDLE.lock().as_ref() {
+                let _ = app.emit("web-server-started", serde_json::json!({
+                    "port": bound_port
+                }));
+            }
+
+            println!("Web server listening on http://0.0.0.0:{}", bound_port);
+            axum::serve(listener, app).await.unwrap();
+        });
+    });
+}
+
 // ============== End Web API ==============
 
+// Desktop setup with menus
+#[cfg(not(target_os = "ios"))]
+fn setup_app(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    // Create and set the menu
+    let menu = create_menu(app.handle())?;
+    app.set_menu(menu)?;
+
+    // Handle menu events
+    app.on_menu_event(|app, event| {
+        let id = event.id().as_ref();
+        match id {
+            "new_session" => {
+                let _ = app.emit("menu-event", "new_session");
+            }
+            "close_session" => {
+                let _ = app.emit("menu-event", "close_session");
+            }
+            "settings" => {
+                let _ = app.emit("menu-event", "settings");
+            }
+            "toggle_sidebar" => {
+                let _ = app.emit("menu-event", "toggle_sidebar");
+            }
+            "zoom_in" => {
+                let _ = app.emit("menu-event", "zoom_in");
+            }
+            "zoom_out" => {
+                let _ = app.emit("menu-event", "zoom_out");
+            }
+            "reset_zoom" => {
+                let _ = app.emit("menu-event", "reset_zoom");
+            }
+            "rename_session" => {
+                let _ = app.emit("menu-event", "rename_session");
+            }
+            "duplicate_session" => {
+                let _ = app.emit("menu-event", "duplicate_session");
+            }
+            "next_session" => {
+                let _ = app.emit("menu-event", "next_session");
+            }
+            "prev_session" => {
+                let _ = app.emit("menu-event", "prev_session");
+            }
+            "about" => {
+                let _ = app.emit("menu-event", "about");
+            }
+            _ => {}
+        }
+    });
+
+    // Store AppHandle for web server to use
+    {
+        let mut handle = APP_HANDLE.lock();
+        *handle = Some(app.handle().clone());
+    }
+
+    // Start web server for remote access
+    start_web_server();
+
+    Ok(())
+}
+
+// iOS setup without menus
+#[cfg(target_os = "ios")]
+fn setup_app(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    // Store AppHandle for web server to use
+    {
+        let mut handle = APP_HANDLE.lock();
+        *handle = Some(app.handle().clone());
+    }
+
+    // Start web server for remote access
+    start_web_server();
+
+    Ok(())
+}
+
+// Desktop version with full PTY support
+#[cfg(not(target_os = "ios"))]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1827,70 +2045,45 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
-            // Create and set the menu
-            let menu = create_menu(app.handle())?;
-            app.set_menu(menu)?;
-
-            // Handle menu events
-            app.on_menu_event(|app, event| {
-                let id = event.id().as_ref();
-                match id {
-                    "new_session" => {
-                        let _ = app.emit("menu-event", "new_session");
-                    }
-                    "close_session" => {
-                        let _ = app.emit("menu-event", "close_session");
-                    }
-                    "settings" => {
-                        let _ = app.emit("menu-event", "settings");
-                    }
-                    "toggle_sidebar" => {
-                        let _ = app.emit("menu-event", "toggle_sidebar");
-                    }
-                    "zoom_in" => {
-                        let _ = app.emit("menu-event", "zoom_in");
-                    }
-                    "zoom_out" => {
-                        let _ = app.emit("menu-event", "zoom_out");
-                    }
-                    "reset_zoom" => {
-                        let _ = app.emit("menu-event", "reset_zoom");
-                    }
-                    "rename_session" => {
-                        let _ = app.emit("menu-event", "rename_session");
-                    }
-                    "duplicate_session" => {
-                        let _ = app.emit("menu-event", "duplicate_session");
-                    }
-                    "next_session" => {
-                        let _ = app.emit("menu-event", "next_session");
-                    }
-                    "prev_session" => {
-                        let _ = app.emit("menu-event", "prev_session");
-                    }
-                    "about" => {
-                        let _ = app.emit("menu-event", "about");
-                    }
-                    _ => {}
-                }
-            });
-
-            // Store AppHandle for web server to use
-            {
-                let mut handle = APP_HANDLE.lock();
-                *handle = Some(app.handle().clone());
-            }
-
-            // Start web server for remote access
-            start_web_server();
-
-            Ok(())
+            setup_app(app)
         })
         .invoke_handler(tauri::generate_handler![
             spawn_pty,
             write_pty,
             resize_pty,
             kill_pty,
+            load_sessions,
+            save_session,
+            delete_session,
+            update_session_claude_id,
+            update_session_orders,
+            save_terminal_buffer,
+            load_terminal_buffer,
+            delete_terminal_buffer,
+            save_window_state,
+            load_window_state,
+            save_app_settings,
+            load_app_settings,
+            get_web_server_port
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+
+// iOS version without PTY commands (PTY not supported on iOS)
+#[cfg(target_os = "ios")]
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
+        .setup(|app| {
+            setup_app(app)
+        })
+        .invoke_handler(tauri::generate_handler![
+            // PTY commands not available on iOS:
+            // spawn_pty, write_pty, resize_pty, kill_pty
             load_sessions,
             save_session,
             delete_session,
