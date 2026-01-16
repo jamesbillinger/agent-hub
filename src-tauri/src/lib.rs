@@ -1,0 +1,1627 @@
+use axum::{
+    Router,
+    extract::{Path, WebSocketUpgrade, ws::{Message, WebSocket}},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::get,
+    Json,
+};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use futures::{SinkExt, StreamExt};
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
+use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::thread;
+use tauri::{
+    AppHandle, Emitter,
+    menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
+};
+use tokio::sync::broadcast;
+use tower_http::cors::CorsLayer;
+
+struct PtySession {
+    pair: PtyPair,
+    writer: Box<dyn Write + Send>,
+}
+
+static PTY_SESSIONS: Lazy<Mutex<HashMap<String, Arc<Mutex<PtySession>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+// Broadcast channels for PTY output - used by both Tauri and WebSocket clients
+static PTY_BROADCASTERS: Lazy<Mutex<HashMap<String, broadcast::Sender<Vec<u8>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+// Global AppHandle for web server to use
+static APP_HANDLE: Lazy<Mutex<Option<AppHandle>>> = Lazy::new(|| Mutex::new(None));
+
+// Authentication: Active pairing requests (pairing_id -> code)
+static PAIRING_REQUESTS: Lazy<Mutex<HashMap<String, PairingRequest>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+// Authentication: Paired devices (token -> device info)
+static PAIRED_DEVICES: Lazy<Mutex<HashMap<String, PairedDevice>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PairingRequest {
+    code: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    device_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PairedDevice {
+    id: String,
+    name: String,
+    paired_at: String,
+    last_seen: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PtyOutput {
+    session_id: String,
+    data: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct WindowState {
+    width: Option<u32>,
+    height: Option<u32>,
+    x: Option<i32>,
+    y: Option<i32>,
+    sidebar_width: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppSettings {
+    font_size: u32,
+    font_family: String,
+    theme: String,
+    default_working_dir: String,
+    default_agent_type: String,
+    notifications_enabled: bool,
+    #[serde(default = "default_renderer")]
+    renderer: String,
+}
+
+fn default_renderer() -> String {
+    "webgl".to_string()
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            font_size: 13,
+            font_family: "Menlo, Monaco, 'Courier New', monospace".to_string(),
+            theme: "dark".to_string(),
+            default_working_dir: "~/dev/pplsi".to_string(),
+            default_agent_type: "claude".to_string(),
+            notifications_enabled: true,
+            renderer: "webgl".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionData {
+    id: String,
+    name: String,
+    agent_type: String,
+    command: String,
+    working_dir: String,
+    created_at: String,
+    claude_session_id: Option<String>,
+    sort_order: i32,
+}
+
+fn get_db_path() -> PathBuf {
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("agent-hub");
+    std::fs::create_dir_all(&data_dir).ok();
+    data_dir.join("sessions.db")
+}
+
+fn init_db() -> rusqlite::Result<Connection> {
+    let conn = Connection::open(get_db_path())?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            agent_type TEXT NOT NULL,
+            command TEXT NOT NULL,
+            working_dir TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            claude_session_id TEXT,
+            sort_order INTEGER NOT NULL DEFAULT 0
+        )",
+        [],
+    )?;
+    // Migration: Add sort_order column if it doesn't exist
+    let _ = conn.execute("ALTER TABLE sessions ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0", []);
+
+    // Create terminal_buffers table for scrollback persistence
+    // Stores compressed (gzip + base64) terminal buffer content
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS terminal_buffers (
+            session_id TEXT PRIMARY KEY,
+            buffer_data TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
+    // Create paired_devices table for remote access authentication
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS paired_devices (
+            token TEXT PRIMARY KEY,
+            id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            paired_at TEXT NOT NULL,
+            last_seen TEXT NOT NULL
+        )",
+        [],
+    )?;
+
+    Ok(conn)
+}
+
+// Load paired devices from database into memory
+fn load_paired_devices() {
+    if let Ok(conn) = init_db() {
+        if let Ok(mut stmt) = conn.prepare("SELECT token, id, name, paired_at, last_seen FROM paired_devices") {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    PairedDevice {
+                        id: row.get(1)?,
+                        name: row.get(2)?,
+                        paired_at: row.get(3)?,
+                        last_seen: row.get(4)?,
+                    },
+                ))
+            }) {
+                let mut devices = PAIRED_DEVICES.lock();
+                for row in rows.flatten() {
+                    devices.insert(row.0, row.1);
+                }
+            }
+        }
+    }
+}
+
+// Save a paired device to database
+fn save_paired_device(token: &str, device: &PairedDevice) -> Result<(), String> {
+    let conn = init_db().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT OR REPLACE INTO paired_devices (token, id, name, paired_at, last_seen) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![token, device.id, device.name, device.paired_at, device.last_seen],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// Delete a paired device from database
+fn delete_paired_device_db(token: &str) -> Result<(), String> {
+    let conn = init_db().map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM paired_devices WHERE token = ?1", params![token])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// Generate a random 6-digit pairing code
+fn generate_pairing_code() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{:06}", (seed % 1_000_000) as u32)
+}
+
+// Generate a random token for device auth
+fn generate_token() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{:x}{:x}", seed, seed.wrapping_mul(0x5DEECE66D))
+}
+
+// Check if a token is valid
+fn is_valid_token(token: &str) -> bool {
+    let devices = PAIRED_DEVICES.lock();
+    devices.contains_key(token)
+}
+
+#[tauri::command]
+fn load_sessions() -> Result<Vec<SessionData>, String> {
+    let conn = init_db().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order FROM sessions ORDER BY sort_order ASC, created_at DESC")
+        .map_err(|e| e.to_string())?;
+
+    let sessions = stmt
+        .query_map([], |row| {
+            Ok(SessionData {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                agent_type: row.get(2)?,
+                command: row.get(3)?,
+                working_dir: row.get(4)?,
+                created_at: row.get(5)?,
+                claude_session_id: row.get(6)?,
+                sort_order: row.get(7)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(sessions)
+}
+
+#[tauri::command]
+fn save_session(session: SessionData) -> Result<(), String> {
+    let conn = init_db().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT OR REPLACE INTO sessions (id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            session.id,
+            session.name,
+            session.agent_type,
+            session.command,
+            session.working_dir,
+            session.created_at,
+            session.claude_session_id,
+            session.sort_order,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn update_session_orders(session_orders: Vec<(String, i32)>) -> Result<(), String> {
+    let conn = init_db().map_err(|e| e.to_string())?;
+    for (session_id, sort_order) in session_orders {
+        conn.execute(
+            "UPDATE sessions SET sort_order = ?1 WHERE id = ?2",
+            params![sort_order, session_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_session(session_id: String) -> Result<(), String> {
+    let conn = init_db().map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn update_session_claude_id(session_id: String, claude_session_id: String) -> Result<(), String> {
+    let conn = init_db().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE sessions SET claude_session_id = ?1 WHERE id = ?2",
+        params![claude_session_id, session_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn spawn_pty(
+    app: AppHandle,
+    session_id: String,
+    command: Option<String>,
+    working_dir: Option<String>,
+    cols: u16,
+    rows: u16,
+    claude_session_id: Option<String>,
+    resume_session: Option<bool>,
+) -> Result<(), String> {
+    let pty_system = native_pty_system();
+
+    let pair = pty_system
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut cmd_str = command.unwrap_or_else(|| {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+    });
+
+    // Handle Claude session resume
+    // If we have a claude_session_id and resume_session is true, modify the command
+    // to use --resume instead of starting fresh
+    if cmd_str.contains("claude") {
+        if let Some(ref claude_id) = claude_session_id {
+            if resume_session.unwrap_or(false) {
+                // Replace the command to use --resume with the existing session ID
+                // Keep --dangerously-skip-permissions if it was present
+                let has_skip_perms = cmd_str.contains("--dangerously-skip-permissions");
+                cmd_str = if has_skip_perms {
+                    format!("claude --resume {} --dangerously-skip-permissions", claude_id)
+                } else {
+                    format!("claude --resume {}", claude_id)
+                };
+            } else {
+                // New session with pre-determined session ID
+                // Insert --session-id before any other flags
+                let has_skip_perms = cmd_str.contains("--dangerously-skip-permissions");
+                cmd_str = if has_skip_perms {
+                    format!("claude --session-id {} --dangerously-skip-permissions", claude_id)
+                } else {
+                    format!("claude --session-id {}", claude_id)
+                };
+            }
+        }
+    }
+
+    // Resolve working directory
+    let work_dir = working_dir
+        .map(|d| {
+            if d.starts_with("~/") {
+                dirs::home_dir()
+                    .map(|h| h.join(&d[2..]))
+                    .unwrap_or_else(|| std::path::PathBuf::from(&d))
+            } else if d == "~" {
+                dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(&d))
+            } else {
+                std::path::PathBuf::from(&d)
+            }
+        })
+        .or_else(|| dirs::home_dir());
+
+    let mut cmd = CommandBuilder::new(&cmd_str);
+
+    // Set up environment
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("LANG", "en_US.UTF-8");
+
+    // Set working directory
+    if let Some(ref dir) = work_dir {
+        cmd.cwd(dir);
+    }
+
+    // For login shell behavior with agent commands (to get proper PATH)
+    // This ensures tools installed via nvm, pyenv, etc. are available
+    if cmd_str.contains("claude") || cmd_str.contains("aider") || cmd_str.contains("codex") {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        cmd = CommandBuilder::new(&shell);
+        cmd.args(&["-l", "-c", &cmd_str]);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("LANG", "en_US.UTF-8");
+        if let Some(ref dir) = work_dir {
+            cmd.cwd(dir);
+        }
+    }
+
+    let _child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| e.to_string())?;
+
+    let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+    let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
+
+    let session = Arc::new(Mutex::new(PtySession { pair, writer }));
+
+    // Create broadcast channel for this session (for WebSocket clients)
+    let (tx, _rx) = broadcast::channel::<Vec<u8>>(256);
+
+    {
+        let mut sessions = PTY_SESSIONS.lock();
+        sessions.insert(session_id.clone(), session);
+    }
+    {
+        let mut broadcasters = PTY_BROADCASTERS.lock();
+        broadcasters.insert(session_id.clone(), tx.clone());
+    }
+
+    // Spawn reader thread
+    let session_id_clone = session_id.clone();
+    let app_clone = app.clone();
+    thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => {
+                    // EOF - process exited
+                    let _ = app_clone.emit(
+                        "pty-exit",
+                        PtyOutput {
+                            session_id: session_id_clone.clone(),
+                            data: String::new(),
+                        },
+                    );
+                    break;
+                }
+                Ok(n) => {
+                    let data_bytes = buf[..n].to_vec();
+                    let data = String::from_utf8_lossy(&data_bytes).to_string();
+
+                    // Emit to Tauri app
+                    let _ = app_clone.emit(
+                        "pty-output",
+                        PtyOutput {
+                            session_id: session_id_clone.clone(),
+                            data,
+                        },
+                    );
+
+                    // Broadcast to WebSocket clients
+                    let _ = tx.send(data_bytes);
+                }
+                Err(_) => break,
+            }
+        }
+        // Clean up session
+        {
+            let mut sessions = PTY_SESSIONS.lock();
+            sessions.remove(&session_id_clone);
+        }
+        {
+            let mut broadcasters = PTY_BROADCASTERS.lock();
+            broadcasters.remove(&session_id_clone);
+        }
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn write_pty(session_id: String, data: String) -> Result<(), String> {
+    let sessions = PTY_SESSIONS.lock();
+    if let Some(session) = sessions.get(&session_id) {
+        let mut session = session.lock();
+        session
+            .writer
+            .write_all(data.as_bytes())
+            .map_err(|e| e.to_string())?;
+        session.writer.flush().map_err(|e| e.to_string())?;
+        Ok(())
+    } else {
+        Err("Session not found".to_string())
+    }
+}
+
+#[tauri::command]
+fn resize_pty(session_id: String, cols: u16, rows: u16) -> Result<(), String> {
+    let sessions = PTY_SESSIONS.lock();
+    if let Some(session) = sessions.get(&session_id) {
+        let session = session.lock();
+        session
+            .pair
+            .master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    } else {
+        Err("Session not found".to_string())
+    }
+}
+
+#[tauri::command]
+fn kill_pty(session_id: String) -> Result<(), String> {
+    let mut sessions = PTY_SESSIONS.lock();
+    sessions.remove(&session_id);
+    Ok(())
+}
+
+/// Compress and save terminal buffer content to the database
+/// The buffer_content is the raw terminal content from xterm.js serialization
+#[tauri::command]
+fn save_terminal_buffer(session_id: String, buffer_content: String) -> Result<(), String> {
+    // Compress the buffer content using gzip
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(buffer_content.as_bytes())
+        .map_err(|e| format!("Failed to compress buffer: {}", e))?;
+    let compressed = encoder
+        .finish()
+        .map_err(|e| format!("Failed to finish compression: {}", e))?;
+
+    // Encode to base64 for safe text storage
+    let encoded = BASE64.encode(&compressed);
+
+    let conn = init_db().map_err(|e| e.to_string())?;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    conn.execute(
+        "INSERT OR REPLACE INTO terminal_buffers (session_id, buffer_data, updated_at)
+         VALUES (?1, ?2, ?3)",
+        params![session_id, encoded, now],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Load and decompress terminal buffer content from the database
+/// Returns the raw terminal content to be written to xterm.js
+#[tauri::command]
+fn load_terminal_buffer(session_id: String) -> Result<Option<String>, String> {
+    let conn = init_db().map_err(|e| e.to_string())?;
+
+    let result: Result<String, _> = conn.query_row(
+        "SELECT buffer_data FROM terminal_buffers WHERE session_id = ?1",
+        params![session_id],
+        |row| row.get(0),
+    );
+
+    match result {
+        Ok(encoded) => {
+            // Decode from base64
+            let compressed = BASE64
+                .decode(&encoded)
+                .map_err(|e| format!("Failed to decode buffer: {}", e))?;
+
+            // Decompress using gzip
+            let mut decoder = GzDecoder::new(&compressed[..]);
+            let mut decompressed = String::new();
+            decoder
+                .read_to_string(&mut decompressed)
+                .map_err(|e| format!("Failed to decompress buffer: {}", e))?;
+
+            Ok(Some(decompressed))
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Delete terminal buffer when session is deleted
+#[tauri::command]
+fn delete_terminal_buffer(session_id: String) -> Result<(), String> {
+    let conn = init_db().map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM terminal_buffers WHERE session_id = ?1",
+        params![session_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn get_config_path() -> PathBuf {
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("agent-hub");
+    std::fs::create_dir_all(&data_dir).ok();
+    data_dir.join("config.json")
+}
+
+fn get_window_state_path() -> PathBuf {
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("agent-hub");
+    std::fs::create_dir_all(&data_dir).ok();
+    data_dir.join("window_state.json")
+}
+
+/// Save window state to config file
+#[tauri::command]
+fn save_window_state(state: WindowState) -> Result<(), String> {
+    let path = get_window_state_path();
+    let json = serde_json::to_string_pretty(&state)
+        .map_err(|e| format!("Failed to serialize window state: {}", e))?;
+    std::fs::write(&path, json)
+        .map_err(|e| format!("Failed to write window state: {}", e))?;
+    Ok(())
+}
+
+/// Load window state from config file
+#[tauri::command]
+fn load_window_state() -> Result<WindowState, String> {
+    let path = get_window_state_path();
+    if !path.exists() {
+        return Ok(WindowState::default());
+    }
+    let json = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read window state: {}", e))?;
+    let state: WindowState = serde_json::from_str(&json)
+        .map_err(|e| format!("Failed to parse window state: {}", e))?;
+    Ok(state)
+}
+
+/// Save app settings to config file
+#[tauri::command]
+fn save_app_settings(settings: AppSettings) -> Result<(), String> {
+    let path = get_config_path();
+    let json = serde_json::to_string_pretty(&settings)
+        .map_err(|e| format!("Failed to serialize settings: {}", e))?;
+    std::fs::write(&path, json)
+        .map_err(|e| format!("Failed to write settings: {}", e))?;
+    Ok(())
+}
+
+/// Load app settings from config file
+#[tauri::command]
+fn load_app_settings() -> Result<AppSettings, String> {
+    let path = get_config_path();
+    if !path.exists() {
+        return Ok(AppSettings::default());
+    }
+    let json = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read settings: {}", e))?;
+    let settings: AppSettings = serde_json::from_str(&json)
+        .map_err(|e| format!("Failed to parse settings: {}", e))?;
+    Ok(settings)
+}
+
+fn create_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    // File menu
+    let new_session = MenuItem::with_id(app, "new_session", "New Session", true, Some("CmdOrCtrl+T"))?;
+    let close_session = MenuItem::with_id(app, "close_session", "Close Session", true, Some("CmdOrCtrl+W"))?;
+    let settings = MenuItem::with_id(app, "settings", "Settings...", true, Some("CmdOrCtrl+,"))?;
+
+    let file_menu = Submenu::with_items(
+        app,
+        "File",
+        true,
+        &[
+            &new_session,
+            &close_session,
+            &PredefinedMenuItem::separator(app)?,
+            &settings,
+        ],
+    )?;
+
+    // Edit menu
+    let edit_menu = Submenu::with_items(
+        app,
+        "Edit",
+        true,
+        &[
+            &PredefinedMenuItem::undo(app, Some("Undo"))?,
+            &PredefinedMenuItem::redo(app, Some("Redo"))?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::cut(app, Some("Cut"))?,
+            &PredefinedMenuItem::copy(app, Some("Copy"))?,
+            &PredefinedMenuItem::paste(app, Some("Paste"))?,
+            &PredefinedMenuItem::select_all(app, Some("Select All"))?,
+        ],
+    )?;
+
+    // View menu
+    let toggle_sidebar = MenuItem::with_id(app, "toggle_sidebar", "Toggle Sidebar", true, Some("CmdOrCtrl+B"))?;
+    let zoom_in = MenuItem::with_id(app, "zoom_in", "Zoom In", true, Some("CmdOrCtrl+Plus"))?;
+    let zoom_out = MenuItem::with_id(app, "zoom_out", "Zoom Out", true, Some("CmdOrCtrl+-"))?;
+    let reset_zoom = MenuItem::with_id(app, "reset_zoom", "Reset Zoom", true, Some("CmdOrCtrl+0"))?;
+
+    let view_menu = Submenu::with_items(
+        app,
+        "View",
+        true,
+        &[
+            &toggle_sidebar,
+            &PredefinedMenuItem::separator(app)?,
+            &zoom_in,
+            &zoom_out,
+            &reset_zoom,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::fullscreen(app, Some("Toggle Full Screen"))?,
+        ],
+    )?;
+
+    // Session menu
+    let rename_session = MenuItem::with_id(app, "rename_session", "Rename Session", true, Some("CmdOrCtrl+I"))?;
+    let duplicate_session = MenuItem::with_id(app, "duplicate_session", "Duplicate Session", true, Some("CmdOrCtrl+Shift+D"))?;
+    let next_session = MenuItem::with_id(app, "next_session", "Next Session", true, Some("Ctrl+Tab"))?;
+    let prev_session = MenuItem::with_id(app, "prev_session", "Previous Session", true, Some("Ctrl+Shift+Tab"))?;
+
+    let session_menu = Submenu::with_items(
+        app,
+        "Session",
+        true,
+        &[
+            &rename_session,
+            &duplicate_session,
+            &PredefinedMenuItem::separator(app)?,
+            &next_session,
+            &prev_session,
+        ],
+    )?;
+
+    // Window menu
+    let window_menu = Submenu::with_items(
+        app,
+        "Window",
+        true,
+        &[
+            &PredefinedMenuItem::minimize(app, Some("Minimize"))?,
+            &PredefinedMenuItem::maximize(app, Some("Zoom"))?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::close_window(app, Some("Close Window"))?,
+        ],
+    )?;
+
+    // Help menu
+    let about = MenuItem::with_id(app, "about", "About Agent Hub", true, None::<&str>)?;
+
+    let help_menu = Submenu::with_items(
+        app,
+        "Help",
+        true,
+        &[
+            &about,
+        ],
+    )?;
+
+    // Build the menu
+    Menu::with_items(
+        app,
+        &[
+            &file_menu,
+            &edit_menu,
+            &view_menu,
+            &session_menu,
+            &window_menu,
+            &help_menu,
+        ],
+    )
+}
+
+// ============== Web API ==============
+
+const WEB_PORT: u16 = 3847;
+
+// Simple HTML page for mobile web client with auth
+const MOBILE_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Agent Hub</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      background: #1a1a1a;
+      color: #e6e6e6;
+      font-family: -apple-system, sans-serif;
+      height: 100%;
+      width: 100%;
+      overflow: hidden;
+      position: fixed;
+      touch-action: none;
+    }
+    body { display: flex; flex-direction: column; }
+    #header { padding: 8px 12px; background: #252526; border-bottom: 1px solid #3c3c3c; display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+    #header select { flex: 1; padding: 8px; background: #3c3c3c; border: 1px solid #5a5a5a; border-radius: 4px; color: #e6e6e6; font-size: 16px; }
+    #header button { padding: 8px 16px; background: #0e639c; border: none; border-radius: 4px; color: white; font-size: 14px; }
+    #terminal-container { flex: 1; padding: 4px; overflow: hidden; position: relative; }
+    #terminal-container .xterm { height: 100%; width: 100%; }
+    #terminal-container .xterm-viewport { overflow-y: auto !important; -webkit-overflow-scrolling: touch; }
+    #status { padding: 4px 12px; background: #252526; font-size: 12px; color: #808080; flex-shrink: 0; }
+    .connected { color: #4ec9b0 !important; }
+    .disconnected { color: #f14c4c !important; }
+    /* Pairing screen styles */
+    #pairing-screen { display: none; flex: 1; flex-direction: column; align-items: center; justify-content: center; padding: 20px; text-align: center; }
+    #pairing-screen h2 { margin-bottom: 20px; font-size: 24px; }
+    #pairing-screen p { margin-bottom: 20px; color: #808080; }
+    #pairing-screen input { width: 200px; padding: 12px; font-size: 24px; text-align: center; letter-spacing: 8px; background: #3c3c3c; border: 1px solid #5a5a5a; border-radius: 4px; color: #e6e6e6; margin-bottom: 16px; }
+    #pairing-screen button { padding: 12px 24px; font-size: 16px; background: #0e639c; border: none; border-radius: 4px; color: white; cursor: pointer; }
+    #pairing-screen button:disabled { background: #555; }
+    #pairing-screen .error { color: #f14c4c; margin-top: 12px; }
+    #main-app { display: none; flex-direction: column; flex: 1; overflow: hidden; }
+    #terminal-container { touch-action: pan-y; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <!-- Pairing Screen -->
+  <div id="pairing-screen">
+    <h2>Pair Device</h2>
+    <p id="pairing-status">Enter the code shown on your desktop</p>
+    <input type="text" id="pairing-code" maxlength="6" placeholder="000000" autocomplete="off">
+    <button id="pairing-submit">Pair</button>
+    <p class="error" id="pairing-error"></p>
+  </div>
+
+  <!-- Main App -->
+  <div id="main-app">
+    <div id="header">
+      <select id="session-select"><option value="">Select session...</option></select>
+      <button id="start-btn" style="display:none;">Start</button>
+      <button id="refresh-btn">↻</button>
+    </div>
+    <div id="terminal-container"></div>
+    <div id="status" class="disconnected">Disconnected</div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+  <script>
+    // Auth token management
+    const TOKEN_KEY = 'agent_hub_token';
+    function getToken() { return localStorage.getItem(TOKEN_KEY); }
+    function setToken(t) { localStorage.setItem(TOKEN_KEY, t); }
+    function clearToken() { localStorage.removeItem(TOKEN_KEY); }
+
+    // Fetch with auth
+    async function authFetch(url, options = {}) {
+      const token = getToken();
+      const headers = { ...options.headers };
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const res = await fetch(url, { ...options, headers });
+      if (res.status === 401) {
+        clearToken();
+        showPairingScreen();
+        throw new Error('Unauthorized');
+      }
+      return res;
+    }
+
+    // UI state
+    const pairingScreen = document.getElementById('pairing-screen');
+    const mainApp = document.getElementById('main-app');
+    let pairingId = null;
+
+    function showPairingScreen() {
+      pairingScreen.style.display = 'flex';
+      mainApp.style.display = 'none';
+    }
+
+    function showMainApp() {
+      pairingScreen.style.display = 'none';
+      mainApp.style.display = 'flex';
+      initMainApp();
+    }
+
+    // Pairing flow
+    async function requestPairing() {
+      document.getElementById('pairing-status').textContent = 'Requesting pairing code...';
+      try {
+        const res = await fetch('/api/auth/request-pairing', { method: 'POST' });
+        const data = await res.json();
+        pairingId = data.pairing_id;
+        document.getElementById('pairing-status').textContent = 'Enter the code shown on your desktop';
+        document.getElementById('pairing-code').focus();
+      } catch (e) {
+        document.getElementById('pairing-error').textContent = 'Failed to request pairing';
+      }
+    }
+
+    async function submitPairing() {
+      const code = document.getElementById('pairing-code').value;
+      const btn = document.getElementById('pairing-submit');
+      const error = document.getElementById('pairing-error');
+
+      if (!code || code.length !== 6) {
+        error.textContent = 'Please enter a 6-digit code';
+        return;
+      }
+      if (!pairingId) {
+        error.textContent = 'No pairing request active';
+        return;
+      }
+
+      btn.disabled = true;
+      btn.textContent = 'Pairing...';
+      error.textContent = '';
+
+      try {
+        const res = await fetch('/api/auth/pair', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pairing_id: pairingId, code, device_name: 'Mobile Browser' })
+        });
+        const data = await res.json();
+        if (data.token) {
+          setToken(data.token);
+          showMainApp();
+        } else {
+          error.textContent = data.message || 'Pairing failed';
+        }
+      } catch (e) {
+        error.textContent = 'Failed to pair';
+      }
+      btn.disabled = false;
+      btn.textContent = 'Pair';
+    }
+
+    // Check auth on load
+    async function checkAuth() {
+      // If no local token, always require pairing first
+      if (!getToken()) {
+        showPairingScreen();
+        requestPairing();
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/auth/check', {
+          headers: { 'Authorization': `Bearer ${getToken()}` }
+        });
+        const data = await res.json();
+        if (data.authenticated) {
+          showMainApp();
+        } else {
+          // Token invalid, clear it and show pairing
+          localStorage.removeItem('agent_hub_token');
+          showPairingScreen();
+          requestPairing();
+        }
+      } catch (e) {
+        showPairingScreen();
+        requestPairing();
+      }
+    }
+
+    // Pairing event listeners
+    document.getElementById('pairing-submit').addEventListener('click', submitPairing);
+    document.getElementById('pairing-code').addEventListener('keyup', (e) => {
+      if (e.key === 'Enter') submitPairing();
+    });
+
+    // Main app initialization (called after auth)
+    let term, fitAddon;
+    function initMainApp() {
+      if (term) return; // Already initialized
+
+      term = new Terminal({
+        fontSize: 14,
+        fontFamily: 'Menlo, Monaco, monospace',
+        theme: { background: '#1a1a1a', foreground: '#e6e6e6' }
+      });
+      fitAddon = new FitAddon.FitAddon();
+      term.loadAddon(fitAddon);
+      term.open(document.getElementById('terminal-container'));
+      fitAddon.fit();
+      window.addEventListener('resize', () => fitAddon.fit());
+
+      initSessionHandlers();
+    }
+
+    let ws = null;
+    let sessionsData = [];
+    let dataHandler = null;
+    let resizeHandler = null;
+
+    function initSessionHandlers() {
+      const select = document.getElementById('session-select');
+      const startBtn = document.getElementById('start-btn');
+      const status = document.getElementById('status');
+
+      async function loadSessions() {
+        const res = await authFetch('/api/sessions');
+        sessionsData = await res.json();
+        select.innerHTML = '<option value="">Select session...</option>';
+        sessionsData.forEach(s => {
+          const opt = document.createElement('option');
+          opt.value = s.id;
+          opt.dataset.running = s.running;
+          const runningIcon = s.running ? '● ' : '○ ';
+          opt.textContent = `${runningIcon}${s.name} (${s.agent_type})`;
+          opt.style.color = s.running ? '#4ec9b0' : '#808080';
+          select.appendChild(opt);
+        });
+      }
+
+      async function showBuffer(sessionId) {
+        term.clear();
+        status.textContent = 'Loading history...';
+        status.className = 'disconnected';
+        try {
+          const res = await authFetch(`/api/sessions/${sessionId}/buffer`);
+          const data = await res.json();
+          if (data.buffer) {
+            term.write(data.buffer);
+            status.textContent = 'Viewing saved history (not live)';
+          } else {
+            status.textContent = 'No saved history';
+          }
+        } catch (e) {
+          status.textContent = 'Failed to load history';
+        }
+      }
+
+      async function startSession(sessionId) {
+        startBtn.disabled = true;
+        startBtn.textContent = 'Starting...';
+        try {
+          const res = await authFetch(`/api/sessions/${sessionId}/start`, { method: 'POST' });
+          const data = await res.json();
+          if (data.status === 'started' || data.status === 'already_running') {
+            await new Promise(r => setTimeout(r, 100));
+            await loadSessions();
+            select.value = sessionId;
+            connect(sessionId);
+          } else {
+            status.textContent = 'Failed to start: ' + JSON.stringify(data);
+          }
+        } catch (e) {
+          status.textContent = 'Failed to start session';
+        }
+        startBtn.disabled = false;
+        startBtn.textContent = 'Start';
+      }
+
+      function connect(sessionId) {
+        if (ws) ws.close();
+        if (dataHandler) dataHandler.dispose();
+        if (resizeHandler) resizeHandler.dispose();
+        dataHandler = null;
+        resizeHandler = null;
+
+        if (!sessionId) {
+          startBtn.style.display = 'none';
+          return;
+        }
+
+        const session = sessionsData.find(s => s.id === sessionId);
+        if (!session?.running) {
+          startBtn.style.display = 'inline-block';
+          showBuffer(sessionId);
+          return;
+        }
+
+        startBtn.style.display = 'none';
+        term.clear();
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(`${protocol}//${location.host}/api/ws/${sessionId}`);
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = () => {
+          status.textContent = 'Connected';
+          status.className = 'connected';
+          ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+        };
+        ws.onclose = () => {
+          status.textContent = 'Disconnected';
+          status.className = 'disconnected';
+        };
+        ws.onmessage = (e) => {
+          if (e.data instanceof ArrayBuffer) {
+            term.write(new Uint8Array(e.data));
+          }
+        };
+
+        dataHandler = term.onData(data => {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(data);
+          }
+        });
+
+        resizeHandler = term.onResize(({ cols, rows }) => {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+          }
+        });
+      }
+
+      function updateUrl(sessionId) {
+        if (sessionId) window.location.hash = sessionId;
+        else history.replaceState(null, '', window.location.pathname);
+      }
+
+      function getSessionFromUrl() {
+        return window.location.hash.slice(1) || null;
+      }
+
+      select.addEventListener('change', () => {
+        updateUrl(select.value);
+        connect(select.value);
+      });
+      startBtn.addEventListener('click', () => startSession(select.value));
+      document.getElementById('refresh-btn').addEventListener('click', loadSessions);
+
+      window.addEventListener('hashchange', () => {
+        const sessionId = getSessionFromUrl();
+        if (sessionId && select.value !== sessionId) {
+          select.value = sessionId;
+          connect(sessionId);
+        }
+      });
+
+      loadSessions().then(() => {
+        const sessionId = getSessionFromUrl();
+        if (sessionId) {
+          select.value = sessionId;
+          connect(sessionId);
+        }
+      });
+    }
+
+    // Start auth check
+    checkAuth();
+  </script>
+</body>
+</html>"#;
+
+// GET / - Serve mobile web client
+async fn web_index() -> impl IntoResponse {
+    axum::response::Html(MOBILE_HTML)
+}
+
+// Extract auth token from request headers
+fn extract_token(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.to_string())
+}
+
+// Check auth and return error response if not authorized
+fn check_auth(headers: &axum::http::HeaderMap) -> Option<impl IntoResponse> {
+    let devices = PAIRED_DEVICES.lock();
+    if devices.is_empty() {
+        // No devices paired yet - allow access (first-time setup)
+        return None;
+    }
+    drop(devices);
+
+    match extract_token(headers) {
+        Some(token) if is_valid_token(&token) => None,
+        _ => Some((StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "unauthorized",
+            "message": "Device not paired. Request pairing first."
+        })))),
+    }
+}
+
+// POST /api/auth/request-pairing - Request a new pairing code
+async fn api_request_pairing(
+    _headers: axum::http::HeaderMap,
+    body: Option<Json<serde_json::Value>>,
+) -> impl IntoResponse {
+    let device_name = body
+        .and_then(|b| b.get("device_name").and_then(|v| v.as_str()).map(|s| s.to_string()));
+
+    let pairing_id = generate_token();
+    let code = generate_pairing_code();
+
+    // Store pairing request
+    {
+        let mut requests = PAIRING_REQUESTS.lock();
+        requests.insert(pairing_id.clone(), PairingRequest {
+            code: code.clone(),
+            created_at: chrono::Utc::now(),
+            device_name: device_name.clone(),
+        });
+    }
+
+    // Notify desktop app to show the code
+    if let Some(app) = APP_HANDLE.lock().as_ref() {
+        let _ = app.emit("pairing-requested", serde_json::json!({
+            "pairing_id": pairing_id,
+            "code": code,
+            "device_name": device_name,
+        }));
+    }
+
+    Json(serde_json::json!({
+        "pairing_id": pairing_id,
+        "expires_in": 300  // 5 minutes
+    }))
+}
+
+// POST /api/auth/pair - Complete pairing with code
+async fn api_pair(
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let pairing_id = body.get("pairing_id").and_then(|v| v.as_str());
+    let code = body.get("code").and_then(|v| v.as_str());
+    let device_name = body.get("device_name").and_then(|v| v.as_str()).unwrap_or("Mobile Device");
+
+    let (pairing_id, code) = match (pairing_id, code) {
+        (Some(p), Some(c)) => (p, c),
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "missing_fields",
+            "message": "pairing_id and code are required"
+        }))).into_response(),
+    };
+
+    // Verify the code
+    let valid = {
+        let requests = PAIRING_REQUESTS.lock();
+        if let Some(request) = requests.get(pairing_id) {
+            // Check code matches and hasn't expired (5 min)
+            let age = chrono::Utc::now() - request.created_at;
+            request.code == code && age.num_seconds() < 300
+        } else {
+            false
+        }
+    };
+
+    if !valid {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "invalid_code",
+            "message": "Invalid or expired pairing code"
+        }))).into_response();
+    }
+
+    // Remove the pairing request
+    {
+        let mut requests = PAIRING_REQUESTS.lock();
+        requests.remove(pairing_id);
+    }
+
+    // Generate token and store device
+    let token = generate_token();
+    let device_id = generate_token();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let device = PairedDevice {
+        id: device_id,
+        name: device_name.to_string(),
+        paired_at: now.clone(),
+        last_seen: now,
+    };
+
+    // Store in memory and database
+    {
+        let mut devices = PAIRED_DEVICES.lock();
+        devices.insert(token.clone(), device.clone());
+    }
+    let _ = save_paired_device(&token, &device);
+
+    // Notify desktop
+    if let Some(app) = APP_HANDLE.lock().as_ref() {
+        let _ = app.emit("device-paired", serde_json::json!({
+            "device": device,
+        }));
+    }
+
+    Json(serde_json::json!({
+        "token": token,
+        "device_id": device.id
+    })).into_response()
+}
+
+// GET /api/auth/check - Check if current token is valid
+async fn api_auth_check(
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let devices = PAIRED_DEVICES.lock();
+    if devices.is_empty() {
+        // No devices paired - no auth required
+        return Json(serde_json::json!({
+            "authenticated": true,
+            "reason": "no_devices_paired"
+        })).into_response();
+    }
+    drop(devices);
+
+    match extract_token(&headers) {
+        Some(token) if is_valid_token(&token) => {
+            Json(serde_json::json!({ "authenticated": true })).into_response()
+        }
+        _ => {
+            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+                "authenticated": false,
+                "reason": "invalid_token"
+            }))).into_response()
+        }
+    }
+}
+
+// GET /api/sessions - List all sessions with running status
+async fn api_list_sessions(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    if let Some(err) = check_auth(&headers) {
+        return err.into_response();
+    }
+    match load_sessions() {
+        Ok(sessions) => {
+            let running_ids: std::collections::HashSet<String> = {
+                let broadcasters = PTY_BROADCASTERS.lock();
+                broadcasters.keys().cloned().collect()
+            };
+
+            // Add running status to each session
+            let sessions_with_status: Vec<serde_json::Value> = sessions.into_iter().map(|s| {
+                let is_running = running_ids.contains(&s.id);
+                serde_json::json!({
+                    "id": s.id,
+                    "name": s.name,
+                    "agent_type": s.agent_type,
+                    "command": s.command,
+                    "working_dir": s.working_dir,
+                    "created_at": s.created_at,
+                    "claude_session_id": s.claude_session_id,
+                    "sort_order": s.sort_order,
+                    "running": is_running
+                })
+            }).collect();
+
+            Json(sessions_with_status).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+// GET /api/sessions/{id}/buffer - Get saved terminal buffer for a session
+async fn api_get_buffer(
+    headers: axum::http::HeaderMap,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(err) = check_auth(&headers) {
+        return err.into_response();
+    }
+    match load_terminal_buffer(session_id) {
+        Ok(Some(buffer)) => Json(serde_json::json!({ "buffer": buffer })).into_response(),
+        Ok(None) => Json(serde_json::json!({ "buffer": null })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+// POST /api/sessions/{id}/start - Start a session remotely
+async fn api_start_session(
+    headers: axum::http::HeaderMap,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(err) = check_auth(&headers) {
+        return err.into_response();
+    }
+    // Check if already running
+    {
+        let broadcasters = PTY_BROADCASTERS.lock();
+        if broadcasters.contains_key(&session_id) {
+            return Json(serde_json::json!({ "status": "already_running" })).into_response();
+        }
+    }
+
+    // Get session from database
+    let session = match load_sessions() {
+        Ok(sessions) => sessions.into_iter().find(|s| s.id == session_id),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+
+    let Some(session) = session else {
+        return (StatusCode::NOT_FOUND, "Session not found").into_response();
+    };
+
+    // Get AppHandle
+    let app = {
+        let handle = APP_HANDLE.lock();
+        handle.clone()
+    };
+
+    let Some(app) = app else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "App not initialized").into_response();
+    };
+
+    // Spawn PTY (use default terminal size, will be resized on connect)
+    match spawn_pty(
+        app.clone(),
+        session.id.clone(),
+        Some(session.command),
+        Some(session.working_dir),
+        120,  // default cols
+        30,   // default rows
+        session.claude_session_id,
+        Some(true),  // resume_session
+    ) {
+        Ok(()) => {
+            // Notify desktop app that session was started remotely
+            let _ = app.emit("remote-session-started", session.id.clone());
+            Json(serde_json::json!({ "status": "started", "session_id": session.id })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+// WebSocket handler for PTY streaming
+async fn ws_handler(
+    Path(session_id): Path<String>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws(socket, session_id))
+}
+
+async fn handle_ws(socket: WebSocket, session_id: String) {
+    let (mut sender, mut receiver) = socket.split();
+    let session_id_for_emit = session_id.clone();
+
+    // Get broadcast receiver for this session
+    let rx = {
+        let broadcasters = PTY_BROADCASTERS.lock();
+        broadcasters.get(&session_id).map(|tx| tx.subscribe())
+    };
+
+    let Some(mut rx) = rx else {
+        let _ = sender.send(Message::Text("Session not found or not running".into())).await;
+        return;
+    };
+
+    // Spawn task to forward PTY output to WebSocket
+    let send_task = tokio::spawn(async move {
+        while let Ok(data) = rx.recv().await {
+            if sender.send(Message::Binary(data)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Handle incoming messages from WebSocket (user input)
+    let recv_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = receiver.next().await {
+            match msg {
+                Message::Text(text) => {
+                    // Check if it's a control message (JSON)
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if json.get("type").and_then(|v| v.as_str()) == Some("resize") {
+                            if let (Some(cols), Some(rows)) = (
+                                json.get("cols").and_then(|v| v.as_u64()),
+                                json.get("rows").and_then(|v| v.as_u64()),
+                            ) {
+                                let _ = resize_pty(session_id.clone(), cols as u16, rows as u16);
+                            }
+                        }
+                    } else {
+                        // Regular text input
+                        let _ = write_pty(session_id.clone(), text);
+                    }
+                }
+                Message::Binary(data) => {
+                    if let Ok(text) = String::from_utf8(data) {
+                        let _ = write_pty(session_id.clone(), text);
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    // Wait for either task to finish
+    tokio::select! {
+        _ = send_task => {},
+        _ = recv_task => {},
+    }
+
+    // Mobile client disconnected - notify desktop to restore its size
+    if let Some(app) = APP_HANDLE.lock().as_ref() {
+        let _ = app.emit("remote-client-disconnected", session_id_for_emit);
+    }
+}
+
+fn start_web_server() {
+    // Load paired devices from database
+    load_paired_devices();
+
+    // Spawn web server in a dedicated thread with its own tokio runtime
+    // This avoids issues with Tauri's runtime not being ready during setup
+    thread::spawn(|| {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime for web server");
+        rt.block_on(async {
+            let app = Router::new()
+                .route("/", get(web_index))
+                // Auth endpoints (no auth required)
+                .route("/api/auth/check", get(api_auth_check))
+                .route("/api/auth/request-pairing", axum::routing::post(api_request_pairing))
+                .route("/api/auth/pair", axum::routing::post(api_pair))
+                // Protected endpoints
+                .route("/api/sessions", get(api_list_sessions))
+                .route("/api/sessions/:session_id/buffer", get(api_get_buffer))
+                .route("/api/sessions/:session_id/start", axum::routing::post(api_start_session))
+                .route("/api/ws/:session_id", get(ws_handler))
+                .layer(CorsLayer::permissive());
+
+            let addr = SocketAddr::from(([0, 0, 0, 0], WEB_PORT));
+            println!("Web server listening on http://{}", addr);
+
+            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+            axum::serve(listener, app).await.unwrap();
+        });
+    });
+}
+
+// ============== End Web API ==============
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
+        .setup(|app| {
+            // Create and set the menu
+            let menu = create_menu(app.handle())?;
+            app.set_menu(menu)?;
+
+            // Handle menu events
+            app.on_menu_event(|app, event| {
+                let id = event.id().as_ref();
+                match id {
+                    "new_session" => {
+                        let _ = app.emit("menu-event", "new_session");
+                    }
+                    "close_session" => {
+                        let _ = app.emit("menu-event", "close_session");
+                    }
+                    "settings" => {
+                        let _ = app.emit("menu-event", "settings");
+                    }
+                    "toggle_sidebar" => {
+                        let _ = app.emit("menu-event", "toggle_sidebar");
+                    }
+                    "zoom_in" => {
+                        let _ = app.emit("menu-event", "zoom_in");
+                    }
+                    "zoom_out" => {
+                        let _ = app.emit("menu-event", "zoom_out");
+                    }
+                    "reset_zoom" => {
+                        let _ = app.emit("menu-event", "reset_zoom");
+                    }
+                    "rename_session" => {
+                        let _ = app.emit("menu-event", "rename_session");
+                    }
+                    "duplicate_session" => {
+                        let _ = app.emit("menu-event", "duplicate_session");
+                    }
+                    "next_session" => {
+                        let _ = app.emit("menu-event", "next_session");
+                    }
+                    "prev_session" => {
+                        let _ = app.emit("menu-event", "prev_session");
+                    }
+                    "about" => {
+                        let _ = app.emit("menu-event", "about");
+                    }
+                    _ => {}
+                }
+            });
+
+            // Store AppHandle for web server to use
+            {
+                let mut handle = APP_HANDLE.lock();
+                *handle = Some(app.handle().clone());
+            }
+
+            // Start web server for remote access
+            start_web_server();
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            spawn_pty,
+            write_pty,
+            resize_pty,
+            kill_pty,
+            load_sessions,
+            save_session,
+            delete_session,
+            update_session_claude_id,
+            update_session_orders,
+            save_terminal_buffer,
+            load_terminal_buffer,
+            delete_terminal_buffer,
+            save_window_state,
+            load_window_state,
+            save_app_settings,
+            load_app_settings
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}

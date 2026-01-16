@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agent Hub</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <div id="app">
+      <!-- Sidebar -->
+      <div id="sidebar">
+        <div id="sidebar-header">
+          <h1>Sessions</h1>
+          <div id="new-session-group">
+            <button id="new-session-btn">+ New</button>
+            <button id="new-session-dropdown-btn" title="Create with different agent">▾</button>
+            <div id="new-session-menu" class="dropdown-menu">
+              <button data-agent="claude">Claude Code</button>
+              <button data-agent="codex">Codex (OpenAI)</button>
+              <button data-agent="aider">Aider</button>
+              <button data-agent="shell">Shell</button>
+              <button data-agent="custom">Custom...</button>
+            </div>
+          </div>
+        </div>
+        <div id="sidebar-controls">
+          <input type="text" id="session-search" placeholder="Search sessions..." />
+          <div id="sort-controls">
+            <select id="sort-select">
+              <option value="custom">Custom Order</option>
+              <option value="name">Name</option>
+              <option value="date">Date Created</option>
+              <option value="agent">Agent Type</option>
+            </select>
+          </div>
+        </div>
+        <div id="session-list"></div>
+      </div>
+
+      <!-- Sidebar Resize Handle -->
+      <div id="sidebar-resize-handle"></div>
+
+      <!-- Main terminal area -->
+      <div id="main">
+        <div id="terminal-container"></div>
+        <div id="start-session-banner">
+          <div class="banner-content">
+            <span class="banner-status">Session inactive</span>
+            <span class="banner-action">Press any key or click to resume</span>
+          </div>
+        </div>
+        <div id="empty-state">
+          <div class="icon">⌘</div>
+          <h2>No Active Session</h2>
+          <p>Create a new session to get started with Claude Code or another agent.</p>
+          <button id="empty-new-session-btn">Create Session</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- New Session Modal -->
+    <div id="new-session-modal">
+      <div class="modal-content">
+        <h2>New Session</h2>
+        <div class="form-group">
+          <label for="session-name">Session Name</label>
+          <input type="text" id="session-name" placeholder="My Project" />
+        </div>
+        <div class="form-group">
+          <label for="agent-type">Agent Type</label>
+          <select id="agent-type">
+            <option value="claude">Claude Code</option>
+            <option value="codex">Codex (OpenAI)</option>
+            <option value="aider">Aider</option>
+            <option value="shell">Shell</option>
+            <option value="custom">Custom Command</option>
+          </select>
+        </div>
+        <div class="form-group" id="custom-command-group" style="display: none;">
+          <label for="custom-command">Custom Command</label>
+          <input type="text" id="custom-command" placeholder="/bin/zsh" />
+        </div>
+        <div class="form-group">
+          <label for="working-dir">Working Directory</label>
+          <input type="text" id="working-dir" placeholder="~ (home directory)" />
+        </div>
+        <div class="modal-actions">
+          <button class="cancel-btn" id="modal-cancel">Cancel</button>
+          <button class="create-btn" id="modal-create">Create</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div id="settings-modal">
+      <div class="modal-content settings-modal-content">
+        <h2>Settings</h2>
+
+        <div class="settings-section">
+          <h3>Terminal</h3>
+          <div class="form-group">
+            <label for="settings-font-size">Font Size</label>
+            <input type="number" id="settings-font-size" min="8" max="32" value="13" />
+          </div>
+          <div class="form-group">
+            <label for="settings-font-family">Font Family</label>
+            <select id="settings-font-family">
+              <option value="Menlo, Monaco, 'Courier New', monospace">Menlo (Default)</option>
+              <option value="Monaco, Menlo, 'Courier New', monospace">Monaco</option>
+              <option value="'SF Mono', Menlo, Monaco, 'Courier New', monospace">SF Mono</option>
+              <option value="'Fira Code', Menlo, Monaco, 'Courier New', monospace">Fira Code</option>
+              <option value="'JetBrains Mono', Menlo, Monaco, 'Courier New', monospace">JetBrains Mono</option>
+              <option value="'Source Code Pro', Menlo, Monaco, 'Courier New', monospace">Source Code Pro</option>
+              <option value="Consolas, 'Courier New', monospace">Consolas</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="settings-renderer">Renderer</label>
+            <select id="settings-renderer">
+              <option value="webgl">WebGL (Recommended)</option>
+              <option value="dom">DOM (Fallback)</option>
+            </select>
+            <p class="form-hint">Try DOM renderer if you experience visual artifacts. Requires app restart.</p>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <h3>Appearance</h3>
+          <div class="form-group">
+            <label for="settings-theme">Theme</label>
+            <select id="settings-theme">
+              <option value="system">Follow System</option>
+              <option value="dark">Dark</option>
+              <option value="light">Light</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <h3>Defaults</h3>
+          <div class="form-group">
+            <label for="settings-default-working-dir">Default Working Directory</label>
+            <input type="text" id="settings-default-working-dir" placeholder="~/dev/pplsi" />
+          </div>
+          <div class="form-group">
+            <label for="settings-default-agent">Default Agent Type</label>
+            <select id="settings-default-agent">
+              <option value="claude">Claude Code</option>
+              <option value="codex">Codex (OpenAI)</option>
+              <option value="aider">Aider</option>
+              <option value="shell">Shell</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <h3>Notifications</h3>
+          <div class="form-group checkbox-group">
+            <label for="settings-notifications">
+              <input type="checkbox" id="settings-notifications" checked />
+              Show notifications when processes complete
+            </label>
+            <p class="form-hint">Notifications are shown when a process exits and the app is not focused.</p>
+          </div>
+        </div>
+
+        <div class="modal-actions">
+          <button class="cancel-btn" id="settings-cancel">Cancel</button>
+          <button class="create-btn" id="settings-save">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Pairing Code Modal -->
+    <div id="pairing-modal">
+      <div class="modal-content pairing-modal-content">
+        <h2>Device Pairing Request</h2>
+        <p class="pairing-device-name"></p>
+        <div class="pairing-code-display">
+          <span id="pairing-code-value">------</span>
+        </div>
+        <p class="pairing-instructions">Enter this code on your mobile device to pair</p>
+        <p class="pairing-expires">Code expires in <span id="pairing-expires-time">5:00</span></p>
+        <div class="modal-actions">
+          <button class="cancel-btn" id="pairing-dismiss">Dismiss</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- About Modal -->
+    <div id="about-modal">
+      <div class="modal-content about-modal-content">
+        <h2>Agent Hub</h2>
+        <p class="version">Version 0.1.0</p>
+        <p class="description">A terminal session manager for AI coding agents.</p>
+        <p class="copyright">Built with Tauri + xterm.js</p>
+        <div class="modal-actions">
+          <button class="create-btn" id="about-close">Close</button>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
