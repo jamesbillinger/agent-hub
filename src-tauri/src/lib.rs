@@ -44,6 +44,9 @@ static PTY_BROADCASTERS: Lazy<Mutex<HashMap<String, broadcast::Sender<Vec<u8>>>>
 // Global AppHandle for web server to use
 static APP_HANDLE: Lazy<Mutex<Option<AppHandle>>> = Lazy::new(|| Mutex::new(None));
 
+// Web server port - determined at runtime with failover
+static WEB_SERVER_PORT: Lazy<Mutex<Option<u16>>> = Lazy::new(|| Mutex::new(None));
+
 // Authentication: Active pairing requests (pairing_id -> code)
 static PAIRING_REQUESTS: Lazy<Mutex<HashMap<String, PairingRequest>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -124,10 +127,20 @@ struct SessionData {
     sort_order: i32,
 }
 
+/// Get the app data directory name based on build type
+/// In debug builds, use "agent-hub-dev" to separate data from production
+fn get_app_data_dir_name() -> &'static str {
+    if cfg!(debug_assertions) {
+        "agent-hub-dev"
+    } else {
+        "agent-hub"
+    }
+}
+
 fn get_db_path() -> PathBuf {
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("agent-hub");
+        .join(get_app_data_dir_name());
     std::fs::create_dir_all(&data_dir).ok();
     data_dir.join("sessions.db")
 }
@@ -610,10 +623,17 @@ fn delete_terminal_buffer(session_id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Get the web server port (for frontend to know which port to use for remote access)
+#[tauri::command]
+fn get_web_server_port() -> Result<Option<u16>, String> {
+    let port = WEB_SERVER_PORT.lock();
+    Ok(*port)
+}
+
 fn get_config_path() -> PathBuf {
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("agent-hub");
+        .join(get_app_data_dir_name());
     std::fs::create_dir_all(&data_dir).ok();
     data_dir.join("config.json")
 }
@@ -621,7 +641,7 @@ fn get_config_path() -> PathBuf {
 fn get_window_state_path() -> PathBuf {
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("agent-hub");
+        .join(get_app_data_dir_name());
     std::fs::create_dir_all(&data_dir).ok();
     data_dir.join("window_state.json")
 }
@@ -791,7 +811,9 @@ fn create_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 
 // ============== Web API ==============
 
-const WEB_PORT: u16 = 3847;
+// Base port for web server - will try this and subsequent ports if unavailable
+const WEB_PORT_BASE: u16 = 3847;
+const WEB_PORT_MAX_ATTEMPTS: u16 = 10;
 
 // Simple HTML page for mobile web client with auth
 const MOBILE_HTML: &str = r#"<!DOCTYPE html>
@@ -817,6 +839,7 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
     #header { padding: 8px 12px; background: #252526; border-bottom: 1px solid #3c3c3c; display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
     #header select { flex: 1; padding: 8px; background: #3c3c3c; border: 1px solid #5a5a5a; border-radius: 4px; color: #e6e6e6; font-size: 16px; }
     #header button { padding: 8px 16px; background: #0e639c; border: none; border-radius: 4px; color: white; font-size: 14px; }
+    #header button.new-btn { background: #388a34; }
     #terminal-container { flex: 1; padding: 4px; overflow: hidden; position: relative; }
     #terminal-container .xterm { height: 100%; width: 100%; }
     #terminal-container .xterm-viewport { overflow-y: auto !important; -webkit-overflow-scrolling: touch; }
@@ -834,6 +857,20 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
     #main-app { display: none; flex-direction: column; flex: 1; overflow: hidden; }
     #terminal-container { touch-action: pan-y; }
     .hidden { display: none !important; }
+    /* New Session Modal styles */
+    .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 1000; align-items: center; justify-content: center; }
+    .modal-overlay.visible { display: flex; }
+    .modal-content { background: #252526; border-radius: 8px; padding: 20px; width: 90%; max-width: 400px; }
+    .modal-content h3 { margin-bottom: 16px; font-size: 18px; }
+    .modal-content .form-group { margin-bottom: 16px; }
+    .modal-content label { display: block; margin-bottom: 6px; font-size: 14px; color: #808080; }
+    .modal-content input, .modal-content select { width: 100%; padding: 10px; background: #3c3c3c; border: 1px solid #5a5a5a; border-radius: 4px; color: #e6e6e6; font-size: 16px; }
+    .modal-content .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; }
+    .modal-content .modal-actions button { padding: 10px 20px; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; }
+    .modal-content .cancel-btn { background: #5a5a5a; color: #e6e6e6; }
+    .modal-content .create-btn { background: #388a34; color: white; }
+    .modal-content .create-btn:disabled { background: #555; }
+    .modal-content .error { color: #f14c4c; margin-top: 8px; font-size: 14px; }
   </style>
 </head>
 <body>
@@ -846,11 +883,45 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
     <p class="error" id="pairing-error"></p>
   </div>
 
+  <!-- New Session Modal -->
+  <div id="new-session-modal" class="modal-overlay">
+    <div class="modal-content">
+      <h3>New Session</h3>
+      <div class="form-group">
+        <label for="new-session-name">Session Name (optional)</label>
+        <input type="text" id="new-session-name" placeholder="My Session">
+      </div>
+      <div class="form-group">
+        <label for="new-session-agent">Agent Type</label>
+        <select id="new-session-agent">
+          <option value="claude">Claude Code</option>
+          <option value="aider">Aider</option>
+          <option value="shell">Shell</option>
+          <option value="custom">Custom</option>
+        </select>
+      </div>
+      <div class="form-group" id="custom-command-group" style="display:none;">
+        <label for="new-session-command">Custom Command</label>
+        <input type="text" id="new-session-command" placeholder="/bin/zsh">
+      </div>
+      <div class="form-group">
+        <label for="new-session-dir">Working Directory (optional)</label>
+        <input type="text" id="new-session-dir" placeholder="~/dev/pplsi">
+      </div>
+      <p class="error" id="new-session-error"></p>
+      <div class="modal-actions">
+        <button class="cancel-btn" id="new-session-cancel">Cancel</button>
+        <button class="create-btn" id="new-session-create">Create</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Main App -->
   <div id="main-app">
     <div id="header">
       <select id="session-select"><option value="">Select session...</option></select>
       <button id="start-btn" style="display:none;">Start</button>
+      <button id="new-btn" class="new-btn">+</button>
       <button id="refresh-btn">↻</button>
     </div>
     <div id="terminal-container"></div>
@@ -1142,6 +1213,89 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         }
       });
 
+      // New Session Modal handlers
+      const newSessionModal = document.getElementById('new-session-modal');
+      const newSessionName = document.getElementById('new-session-name');
+      const newSessionAgent = document.getElementById('new-session-agent');
+      const newSessionCommand = document.getElementById('new-session-command');
+      const newSessionDir = document.getElementById('new-session-dir');
+      const customCommandGroup = document.getElementById('custom-command-group');
+      const newSessionError = document.getElementById('new-session-error');
+      const newSessionCreate = document.getElementById('new-session-create');
+
+      // Show/hide custom command field based on agent type
+      newSessionAgent.addEventListener('change', () => {
+        customCommandGroup.style.display = newSessionAgent.value === 'custom' ? 'block' : 'none';
+      });
+
+      // Open modal
+      document.getElementById('new-btn').addEventListener('click', () => {
+        newSessionModal.classList.add('visible');
+        newSessionName.value = '';
+        newSessionAgent.value = 'claude';
+        newSessionCommand.value = '';
+        newSessionDir.value = '';
+        newSessionError.textContent = '';
+        customCommandGroup.style.display = 'none';
+        newSessionName.focus();
+      });
+
+      // Close modal
+      document.getElementById('new-session-cancel').addEventListener('click', () => {
+        newSessionModal.classList.remove('visible');
+      });
+      newSessionModal.addEventListener('click', (e) => {
+        if (e.target === newSessionModal) newSessionModal.classList.remove('visible');
+      });
+
+      // Create session
+      async function createNewSession() {
+        const name = newSessionName.value.trim();
+        const agentType = newSessionAgent.value;
+        const customCommand = newSessionCommand.value.trim();
+        const workingDir = newSessionDir.value.trim() || '~/dev/pplsi';
+
+        newSessionCreate.disabled = true;
+        newSessionCreate.textContent = 'Creating...';
+        newSessionError.textContent = '';
+
+        try {
+          const res = await authFetch('/api/sessions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name: name || null,
+              agent_type: agentType,
+              custom_command: agentType === 'custom' ? customCommand : null,
+              working_dir: workingDir
+            })
+          });
+          const data = await res.json();
+          if (data.id) {
+            newSessionModal.classList.remove('visible');
+            await loadSessions();
+            select.value = data.id;
+            // If auto_start was true, try to connect
+            if (data.running) {
+              connect(data.id);
+            } else {
+              // Show start button for new session
+              startBtn.style.display = 'inline-block';
+              status.textContent = 'Session created - click Start to begin';
+            }
+          } else {
+            newSessionError.textContent = data.error || 'Failed to create session';
+          }
+        } catch (e) {
+          newSessionError.textContent = 'Failed to create session';
+        }
+        newSessionCreate.disabled = false;
+        newSessionCreate.textContent = 'Create';
+      }
+
+      newSessionCreate.addEventListener('click', createNewSession);
+      newSessionName.addEventListener('keyup', (e) => { if (e.key === 'Enter') createNewSession(); });
+
       loadSessions().then(() => {
         const sessionId = getSessionFromUrl();
         if (sessionId) {
@@ -1359,6 +1513,98 @@ async fn api_list_sessions(headers: axum::http::HeaderMap) -> impl IntoResponse 
     }
 }
 
+// POST /api/sessions - Create a new session
+async fn api_create_session(
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Some(err) = check_auth(&headers) {
+        return err.into_response();
+    }
+
+    let name = body.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let agent_type = body.get("agent_type").and_then(|v| v.as_str()).unwrap_or("claude");
+    let custom_command = body.get("custom_command").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let working_dir = body.get("working_dir").and_then(|v| v.as_str()).unwrap_or("~/dev/pplsi");
+
+    // Generate session ID
+    let session_id = generate_token();
+
+    // Determine command based on agent type
+    let command = match agent_type {
+        "claude" => "claude --dangerously-skip-permissions".to_string(),
+        "aider" => "aider".to_string(),
+        "shell" => std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string()),
+        "custom" => custom_command.clone().unwrap_or_else(|| "/bin/zsh".to_string()),
+        _ => "claude --dangerously-skip-permissions".to_string(),
+    };
+
+    // Generate auto-name if not provided
+    let session_name = name.unwrap_or_else(|| {
+        // Get count of existing sessions for auto-numbering
+        let count = load_sessions().map(|s| s.len()).unwrap_or(0);
+        let agent_label = match agent_type {
+            "claude" => "Claude",
+            "aider" => "Aider",
+            "shell" => "Shell",
+            "custom" => "Custom",
+            _ => "Session",
+        };
+        format!("{} {}", agent_label, count + 1)
+    });
+
+    // Generate claude_session_id for Claude sessions
+    let claude_session_id = if agent_type == "claude" {
+        Some(generate_token())
+    } else {
+        None
+    };
+
+    // Calculate sort order (put new sessions at top)
+    let min_sort_order = load_sessions()
+        .map(|sessions| sessions.iter().map(|s| s.sort_order).min().unwrap_or(0))
+        .unwrap_or(0);
+
+    let session = SessionData {
+        id: session_id.clone(),
+        name: session_name,
+        agent_type: agent_type.to_string(),
+        command,
+        working_dir: working_dir.to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        claude_session_id,
+        sort_order: min_sort_order - 1,
+    };
+
+    // Save to database
+    if let Err(e) = save_session(session.clone()) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": e
+        }))).into_response();
+    }
+
+    // Notify desktop app about new session
+    if let Some(app) = APP_HANDLE.lock().as_ref() {
+        let _ = app.emit("remote-session-created", serde_json::json!({
+            "session": {
+                "id": session.id,
+                "name": session.name,
+                "agent_type": session.agent_type,
+                "working_dir": session.working_dir,
+            }
+        }));
+    }
+
+    Json(serde_json::json!({
+        "id": session.id,
+        "name": session.name,
+        "agent_type": session.agent_type,
+        "command": session.command,
+        "working_dir": session.working_dir,
+        "running": false
+    })).into_response()
+}
+
 // GET /api/sessions/{id}/buffer - Get saved terminal buffer for a session
 async fn api_get_buffer(
     headers: axum::http::HeaderMap,
@@ -1521,16 +1767,52 @@ fn start_web_server() {
                 .route("/api/auth/request-pairing", axum::routing::post(api_request_pairing))
                 .route("/api/auth/pair", axum::routing::post(api_pair))
                 // Protected endpoints
-                .route("/api/sessions", get(api_list_sessions))
+                .route("/api/sessions", get(api_list_sessions).post(api_create_session))
                 .route("/api/sessions/:session_id/buffer", get(api_get_buffer))
                 .route("/api/sessions/:session_id/start", axum::routing::post(api_start_session))
                 .route("/api/ws/:session_id", get(ws_handler))
                 .layer(CorsLayer::permissive());
 
-            let addr = SocketAddr::from(([0, 0, 0, 0], WEB_PORT));
-            println!("Web server listening on http://{}", addr);
+            // Try ports starting from WEB_PORT_BASE until we find one available
+            let mut listener = None;
+            let mut bound_port = WEB_PORT_BASE;
 
-            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+            for port_offset in 0..WEB_PORT_MAX_ATTEMPTS {
+                let port = WEB_PORT_BASE + port_offset;
+                let addr = SocketAddr::from(([0, 0, 0, 0], port));
+
+                match tokio::net::TcpListener::bind(addr).await {
+                    Ok(l) => {
+                        bound_port = port;
+                        listener = Some(l);
+                        break;
+                    }
+                    Err(e) => {
+                        println!("Port {} unavailable ({}), trying next...", port, e);
+                    }
+                }
+            }
+
+            let listener = listener.expect(&format!(
+                "Failed to bind to any port in range {}-{}",
+                WEB_PORT_BASE,
+                WEB_PORT_BASE + WEB_PORT_MAX_ATTEMPTS - 1
+            ));
+
+            // Store the bound port for other parts of the app to access
+            {
+                let mut port_guard = WEB_SERVER_PORT.lock();
+                *port_guard = Some(bound_port);
+            }
+
+            // Notify the app about the bound port
+            if let Some(app) = APP_HANDLE.lock().as_ref() {
+                let _ = app.emit("web-server-started", serde_json::json!({
+                    "port": bound_port
+                }));
+            }
+
+            println!("Web server listening on http://0.0.0.0:{}", bound_port);
             axum::serve(listener, app).await.unwrap();
         });
     });
@@ -1620,7 +1902,8 @@ pub fn run() {
             save_window_state,
             load_window_state,
             save_app_settings,
-            load_app_settings
+            load_app_settings,
+            get_web_server_port
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

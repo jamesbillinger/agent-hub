@@ -373,6 +373,52 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   });
 
+  // Listen for remote session creation (from mobile web)
+  await listen<{ session: { id: string; name: string; agent_type: string; working_dir: string } }>("remote-session-created", async (event) => {
+    const { session: remoteSession } = event.payload;
+
+    // Only add the new session if it doesn't already exist (to avoid overwriting terminal instances)
+    if (!sessions.has(remoteSession.id)) {
+      // Load sessions from database, but only add the new one to avoid overwriting existing sessions
+      const savedSessions: SessionData[] = await invoke("load_sessions");
+      const newSessionData = savedSessions.find(s => s.id === remoteSession.id);
+      if (newSessionData) {
+        const minSortOrder = Math.min(0, ...Array.from(sessions.values()).map(s => s.sortOrder));
+        const claudeSessionId = newSessionData.agent_type === "claude" ? (newSessionData.claude_session_id || crypto.randomUUID()) : undefined;
+        const session: Session = {
+          id: newSessionData.id,
+          name: newSessionData.name,
+          agentType: newSessionData.agent_type as Session["agentType"],
+          command: newSessionData.command,
+          workingDir: newSessionData.working_dir,
+          createdAt: new Date(newSessionData.created_at),
+          isRunning: false,
+          claudeSessionId,
+          hasBeenStarted: false,
+          sortOrder: newSessionData.sort_order || minSortOrder - 1,
+        };
+        sessions.set(session.id, session);
+      }
+    }
+    renderSessionList();
+
+    // Send notification
+    if (appSettings.notifications_enabled) {
+      try {
+        const win = getCurrentWindow();
+        const isFocused = await win.isFocused();
+        if (!isFocused) {
+          await showNotification(
+            "Remote Session Created",
+            `Session "${remoteSession.name}" created from mobile`
+          );
+        }
+      } catch (err) {
+        console.error("Failed to send notification:", err);
+      }
+    }
+  });
+
   // Listen for pairing requests (show code to user for mobile authentication)
   await listen<{ code: string; device_name?: string }>("pairing-requested", async (event) => {
     const { code, device_name } = event.payload;
