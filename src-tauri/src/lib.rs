@@ -6,6 +6,12 @@ use axum::{
     routing::get,
     Json,
 };
+
+// App name - different for dev vs prod to easily distinguish them
+#[cfg(debug_assertions)]
+const APP_NAME: &str = "Agent Hub (Dev)";
+#[cfg(not(debug_assertions))]
+const APP_NAME: &str = "Agent Hub";
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -24,7 +30,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 #[cfg(not(target_os = "ios"))]
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 #[cfg(not(target_os = "ios"))]
@@ -98,12 +104,22 @@ struct AppSettings {
     default_working_dir: String,
     default_agent_type: String,
     notifications_enabled: bool,
+    #[serde(default = "default_true")]
+    bell_notifications_enabled: bool,
+    #[serde(default = "default_true")]
+    bounce_dock_on_bell: bool,
+    #[serde(default)]
+    read_aloud_enabled: bool,
     #[serde(default = "default_renderer")]
     renderer: String,
 }
 
 fn default_renderer() -> String {
     "webgl".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AppSettings {
@@ -115,6 +131,9 @@ impl Default for AppSettings {
             default_working_dir: "~/dev/pplsi".to_string(),
             default_agent_type: "claude".to_string(),
             notifications_enabled: true,
+            bell_notifications_enabled: true,
+            bounce_dock_on_bell: true,
+            read_aloud_enabled: false,
             renderer: "webgl".to_string(),
         }
     }
@@ -412,30 +431,41 @@ fn spawn_pty(
         })
         .or_else(|| dirs::home_dir());
 
-    let mut cmd = CommandBuilder::new(&cmd_str);
+    // Get user's home directory and shell
+    let home_dir = dirs::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "/Users".to_string());
+    let user_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
 
-    // Set up environment
+    // Build PATH with common tool locations (GUI apps have minimal PATH)
+    let existing_path = std::env::var("PATH").unwrap_or_default();
+    let enhanced_path = format!(
+        "{}/.local/bin:{}/.nvm/versions/node/v24.10.0/bin:{}/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:{}",
+        home_dir, home_dir, home_dir, existing_path
+    );
+
+    // Always use login shell for agent commands to get proper environment
+    // This ensures nvm, pyenv, rbenv, etc. are properly initialized
+    let mut cmd = if cmd_str.contains("claude") || cmd_str.contains("aider") || cmd_str.contains("codex") {
+        let mut c = CommandBuilder::new(&user_shell);
+        // Use -l (login) and -i (interactive) to source all profile files
+        c.args(&["-l", "-i", "-c", &cmd_str]);
+        c
+    } else {
+        CommandBuilder::new(&cmd_str)
+    };
+
+    // Set up environment for GUI app context
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("LANG", "en_US.UTF-8");
+    cmd.env("HOME", &home_dir);
+    cmd.env("PATH", &enhanced_path);
+    cmd.env("SHELL", &user_shell);
 
     // Set working directory
     if let Some(ref dir) = work_dir {
         cmd.cwd(dir);
-    }
-
-    // For login shell behavior with agent commands (to get proper PATH)
-    // This ensures tools installed via nvm, pyenv, etc. are available
-    if cmd_str.contains("claude") || cmd_str.contains("aider") || cmd_str.contains("codex") {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        cmd = CommandBuilder::new(&shell);
-        cmd.args(&["-l", "-c", &cmd_str]);
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        cmd.env("LANG", "en_US.UTF-8");
-        if let Some(ref dir) = work_dir {
-            cmd.cwd(dir);
-        }
     }
 
     let _child = pair
@@ -707,6 +737,28 @@ fn load_app_settings() -> Result<AppSettings, String> {
 
 #[cfg(not(target_os = "ios"))]
 fn create_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    // App menu (macOS standard - has Quit)
+    let about_text = format!("About {}", APP_NAME);
+    let hide_text = format!("Hide {}", APP_NAME);
+    let quit_text = format!("Quit {}", APP_NAME);
+
+    let app_menu = Submenu::with_items(
+        app,
+        APP_NAME,
+        true,
+        &[
+            &PredefinedMenuItem::about(app, Some(&about_text), None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::services(app, Some("Services"))?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::hide(app, Some(&hide_text))?,
+            &PredefinedMenuItem::hide_others(app, Some("Hide Others"))?,
+            &PredefinedMenuItem::show_all(app, Some("Show All"))?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::quit(app, Some(&quit_text))?,
+        ],
+    )?;
+
     // File menu
     let new_session = MenuItem::with_id(app, "new_session", "New Session", true, Some("CmdOrCtrl+T"))?;
     let close_session = MenuItem::with_id(app, "close_session", "Close Session", true, Some("CmdOrCtrl+W"))?;
@@ -764,6 +816,7 @@ fn create_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     // Session menu
     let rename_session = MenuItem::with_id(app, "rename_session", "Rename Session", true, Some("CmdOrCtrl+I"))?;
     let duplicate_session = MenuItem::with_id(app, "duplicate_session", "Duplicate Session", true, Some("CmdOrCtrl+Shift+D"))?;
+    let reset_session_id = MenuItem::with_id(app, "reset_session_id", "Reset Session ID", true, None::<&str>)?;
     let next_session = MenuItem::with_id(app, "next_session", "Next Session", true, Some("Ctrl+Tab"))?;
     let prev_session = MenuItem::with_id(app, "prev_session", "Previous Session", true, Some("Ctrl+Shift+Tab"))?;
 
@@ -774,6 +827,7 @@ fn create_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         &[
             &rename_session,
             &duplicate_session,
+            &reset_session_id,
             &PredefinedMenuItem::separator(app)?,
             &next_session,
             &prev_session,
@@ -794,7 +848,8 @@ fn create_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     )?;
 
     // Help menu
-    let about = MenuItem::with_id(app, "about", "About Agent Hub", true, None::<&str>)?;
+    let help_about_text = format!("About {}", APP_NAME);
+    let about = MenuItem::with_id(app, "about", &help_about_text, true, None::<&str>)?;
 
     let help_menu = Submenu::with_items(
         app,
@@ -805,10 +860,11 @@ fn create_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         ],
     )?;
 
-    // Build the menu
+    // Build the menu (app_menu first for macOS standard layout)
     Menu::with_items(
         app,
         &[
+            &app_menu,
             &file_menu,
             &edit_menu,
             &view_menu,
@@ -821,66 +877,327 @@ fn create_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 
 // ============== Web API ==============
 
-// Base port for web server - will try this and subsequent ports if unavailable
+// Port configuration - dev and prod use different ports to avoid conflicts
+// Prod: 3847 (fixed, no fallback - it's the primary instance)
+// Dev:  3857 (with fallback - in case multiple dev instances)
+#[cfg(debug_assertions)]
+const WEB_PORT_BASE: u16 = 3857;
+#[cfg(not(debug_assertions))]
 const WEB_PORT_BASE: u16 = 3847;
-const WEB_PORT_MAX_ATTEMPTS: u16 = 10;
 
-// Simple HTML page for mobile web client with auth
+#[cfg(debug_assertions)]
+const WEB_PORT_MAX_ATTEMPTS: u16 = 10;
+#[cfg(not(debug_assertions))]
+const WEB_PORT_MAX_ATTEMPTS: u16 = 1; // Prod doesn't fallback - it owns port 3847
+
+// Mobile web client with Messages-style navigation
 const MOBILE_HTML: &str = r#"<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Agent Hub</title>
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>{{APP_NAME}}</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body {
       background: #1a1a1a;
       color: #e6e6e6;
-      font-family: -apple-system, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
       height: 100%;
       width: 100%;
       overflow: hidden;
       position: fixed;
-      touch-action: none;
     }
-    body { display: flex; flex-direction: column; }
-    #header { padding: 8px 12px; background: #252526; border-bottom: 1px solid #3c3c3c; display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-    #header select { flex: 1; padding: 8px; background: #3c3c3c; border: 1px solid #5a5a5a; border-radius: 4px; color: #e6e6e6; font-size: 16px; }
-    #header button { padding: 8px 16px; background: #0e639c; border: none; border-radius: 4px; color: white; font-size: 14px; }
-    #header button.new-btn { background: #388a34; }
-    #terminal-container { flex: 1; padding: 4px; overflow: hidden; position: relative; }
+
+    /* Navigation container - handles slide transitions */
+    #nav-container {
+      display: flex;
+      width: 200%;
+      height: 100%;
+      transition: transform 0.3s ease-out;
+    }
+    #nav-container.show-session {
+      transform: translateX(-50%);
+    }
+
+    /* Sessions List View */
+    #sessions-view {
+      width: 50%;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+    }
+
+    .view-header {
+      padding: 12px 16px;
+      padding-top: max(12px, env(safe-area-inset-top));
+      background: #252526;
+      border-bottom: 1px solid #3c3c3c;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+    .view-header h1 {
+      font-size: 20px;
+      font-weight: 600;
+    }
+    .view-header-actions {
+      display: flex;
+      gap: 8px;
+    }
+    .view-header button {
+      padding: 8px 12px;
+      background: transparent;
+      border: none;
+      color: #0e9fd8;
+      font-size: 16px;
+      cursor: pointer;
+    }
+    .view-header button:active {
+      opacity: 0.6;
+    }
+
+    #session-list {
+      flex: 1;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    .session-item {
+      display: flex;
+      align-items: center;
+      padding: 14px 16px;
+      border-bottom: 1px solid #3c3c3c;
+      cursor: pointer;
+      transition: background-color 0.1s;
+    }
+    .session-item:active {
+      background: #2a2a2a;
+    }
+    .session-status {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-right: 12px;
+      flex-shrink: 0;
+    }
+    .session-status.running { background: #4ec9b0; }
+    .session-status.stopped { background: #555; }
+    .session-info {
+      flex: 1;
+      min-width: 0;
+    }
+    .session-name {
+      font-size: 16px;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .session-meta {
+      font-size: 13px;
+      color: #808080;
+      margin-top: 2px;
+    }
+    .session-chevron {
+      color: #555;
+      font-size: 18px;
+      margin-left: 8px;
+    }
+
+    .empty-state {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 40px;
+      color: #808080;
+    }
+    .empty-state-icon { font-size: 48px; margin-bottom: 16px; opacity: 0.5; }
+    .empty-state h2 { font-size: 18px; margin-bottom: 8px; color: #aaa; }
+
+    /* Session Detail View */
+    #session-view {
+      width: 50%;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+    }
+
+    .session-header {
+      padding: 12px 16px;
+      padding-top: max(12px, env(safe-area-inset-top));
+      background: #252526;
+      border-bottom: 1px solid #3c3c3c;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+    .back-btn {
+      padding: 8px;
+      margin: -8px;
+      margin-right: 0;
+      background: none;
+      border: none;
+      color: #0e9fd8;
+      font-size: 18px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .back-btn:active { opacity: 0.6; }
+    .session-title {
+      flex: 1;
+      font-size: 17px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .start-btn {
+      padding: 6px 14px;
+      background: #388a34;
+      border: none;
+      border-radius: 6px;
+      color: white;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .start-btn:disabled { background: #555; }
+
+    #terminal-container {
+      flex: 1;
+      padding: 4px;
+      overflow: hidden;
+      position: relative;
+    }
     #terminal-container .xterm { height: 100%; width: 100%; }
-    #terminal-container .xterm-viewport { overflow-y: auto !important; -webkit-overflow-scrolling: touch; }
-    #status { padding: 4px 12px; background: #252526; font-size: 12px; color: #808080; flex-shrink: 0; }
+    #terminal-container .xterm-viewport {
+      overflow-y: auto !important;
+    }
+    /* Touch overlay for iOS scroll fix */
+    #touch-overlay {
+      display: none;
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      z-index: 10;
+      touch-action: pan-y;
+    }
+    @media (pointer: coarse) {
+      #touch-overlay { display: block; }
+    }
+
+    #status {
+      padding: 6px 16px;
+      padding-bottom: max(6px, env(safe-area-inset-bottom));
+      background: #252526;
+      font-size: 12px;
+      color: #808080;
+      flex-shrink: 0;
+    }
     .connected { color: #4ec9b0 !important; }
     .disconnected { color: #f14c4c !important; }
-    /* Pairing screen styles */
-    #pairing-screen { display: none; flex: 1; flex-direction: column; align-items: center; justify-content: center; padding: 20px; text-align: center; }
+
+    /* Pairing screen */
+    #pairing-screen {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      text-align: center;
+      background: #1a1a1a;
+      z-index: 100;
+    }
     #pairing-screen h2 { margin-bottom: 20px; font-size: 24px; }
     #pairing-screen p { margin-bottom: 20px; color: #808080; }
-    #pairing-screen input { width: 200px; padding: 12px; font-size: 24px; text-align: center; letter-spacing: 8px; background: #3c3c3c; border: 1px solid #5a5a5a; border-radius: 4px; color: #e6e6e6; margin-bottom: 16px; }
-    #pairing-screen button { padding: 12px 24px; font-size: 16px; background: #0e639c; border: none; border-radius: 4px; color: white; cursor: pointer; }
+    #pairing-screen input {
+      width: 200px;
+      padding: 12px;
+      font-size: 24px;
+      text-align: center;
+      letter-spacing: 8px;
+      background: #3c3c3c;
+      border: 1px solid #5a5a5a;
+      border-radius: 8px;
+      color: #e6e6e6;
+      margin-bottom: 16px;
+    }
+    #pairing-screen button {
+      padding: 14px 28px;
+      font-size: 16px;
+      background: #0e639c;
+      border: none;
+      border-radius: 8px;
+      color: white;
+      cursor: pointer;
+    }
     #pairing-screen button:disabled { background: #555; }
     #pairing-screen .error { color: #f14c4c; margin-top: 12px; }
-    #main-app { display: none; flex-direction: column; flex: 1; overflow: hidden; }
-    #terminal-container { touch-action: pan-y; }
-    .hidden { display: none !important; }
-    /* New Session Modal styles */
-    .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 1000; align-items: center; justify-content: center; }
+
+    /* New Session Modal */
+    .modal-overlay {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.7);
+      z-index: 1000;
+      align-items: flex-end;
+      justify-content: center;
+    }
     .modal-overlay.visible { display: flex; }
-    .modal-content { background: #252526; border-radius: 8px; padding: 20px; width: 90%; max-width: 400px; }
-    .modal-content h3 { margin-bottom: 16px; font-size: 18px; }
+    .modal-content {
+      background: #252526;
+      border-radius: 12px 12px 0 0;
+      padding: 20px;
+      padding-bottom: max(20px, env(safe-area-inset-bottom));
+      width: 100%;
+      max-height: 80vh;
+      overflow-y: auto;
+    }
+    .modal-content h3 { margin-bottom: 20px; font-size: 20px; text-align: center; }
     .modal-content .form-group { margin-bottom: 16px; }
     .modal-content label { display: block; margin-bottom: 6px; font-size: 14px; color: #808080; }
-    .modal-content input, .modal-content select { width: 100%; padding: 10px; background: #3c3c3c; border: 1px solid #5a5a5a; border-radius: 4px; color: #e6e6e6; font-size: 16px; }
-    .modal-content .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; }
-    .modal-content .modal-actions button { padding: 10px 20px; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; }
+    .modal-content input, .modal-content select {
+      width: 100%;
+      padding: 12px;
+      background: #3c3c3c;
+      border: 1px solid #5a5a5a;
+      border-radius: 8px;
+      color: #e6e6e6;
+      font-size: 16px;
+    }
+    .modal-content .modal-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 24px;
+    }
+    .modal-content .modal-actions button {
+      flex: 1;
+      padding: 14px;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: 500;
+      cursor: pointer;
+    }
     .modal-content .cancel-btn { background: #5a5a5a; color: #e6e6e6; }
     .modal-content .create-btn { background: #388a34; color: white; }
     .modal-content .create-btn:disabled { background: #555; }
-    .modal-content .error { color: #f14c4c; margin-top: 8px; font-size: 14px; }
+    .modal-content .error { color: #f14c4c; margin-top: 8px; font-size: 14px; text-align: center; }
+
+    #main-app { display: none; height: 100%; }
   </style>
 </head>
 <body>
@@ -888,7 +1205,7 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
   <div id="pairing-screen">
     <h2>Pair Device</h2>
     <p id="pairing-status">Enter the code shown on your desktop</p>
-    <input type="text" id="pairing-code" maxlength="6" placeholder="000000" autocomplete="off">
+    <input type="text" id="pairing-code" maxlength="6" placeholder="000000" autocomplete="off" inputmode="numeric">
     <button id="pairing-submit">Pair</button>
     <p class="error" id="pairing-error"></p>
   </div>
@@ -926,16 +1243,34 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Main App -->
+  <!-- Main App with slide navigation -->
   <div id="main-app">
-    <div id="header">
-      <select id="session-select"><option value="">Select session...</option></select>
-      <button id="start-btn" style="display:none;">Start</button>
-      <button id="new-btn" class="new-btn">+</button>
-      <button id="refresh-btn">↻</button>
+    <div id="nav-container">
+      <!-- Sessions List View -->
+      <div id="sessions-view">
+        <div class="view-header">
+          <h1>Sessions</h1>
+          <div class="view-header-actions">
+            <button id="refresh-btn" title="Refresh">↻</button>
+            <button id="new-btn" title="New Session">+</button>
+          </div>
+        </div>
+        <div id="session-list"></div>
+      </div>
+
+      <!-- Session Detail View -->
+      <div id="session-view">
+        <div class="session-header">
+          <button class="back-btn" id="back-btn">‹ Back</button>
+          <span class="session-title" id="session-title">Session</span>
+          <button class="start-btn" id="start-btn" style="display:none;">Start</button>
+        </div>
+        <div id="terminal-container">
+          <div id="touch-overlay"></div>
+        </div>
+        <div id="status" class="disconnected">Disconnected</div>
+      </div>
     </div>
-    <div id="terminal-container"></div>
-    <div id="status" class="disconnected">Disconnected</div>
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
@@ -961,9 +1296,14 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
       return res;
     }
 
-    // UI state
+    // UI elements
     const pairingScreen = document.getElementById('pairing-screen');
     const mainApp = document.getElementById('main-app');
+    const navContainer = document.getElementById('nav-container');
+    const sessionList = document.getElementById('session-list');
+    const sessionTitle = document.getElementById('session-title');
+    const startBtn = document.getElementById('start-btn');
+    const status = document.getElementById('status');
     let pairingId = null;
 
     function showPairingScreen() {
@@ -973,8 +1313,24 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
 
     function showMainApp() {
       pairingScreen.style.display = 'none';
-      mainApp.style.display = 'flex';
+      mainApp.style.display = 'block';
       initMainApp();
+    }
+
+    // Navigation functions
+    function showSessionsList() {
+      navContainer.classList.remove('show-session');
+      if (ws) ws.close();
+      history.replaceState(null, '', window.location.pathname);
+    }
+
+    function showSessionView(sessionId) {
+      navContainer.classList.add('show-session');
+      window.location.hash = sessionId;
+      // Fit terminal after transition
+      setTimeout(() => {
+        if (fitAddon) fitAddon.fit();
+      }, 350);
     }
 
     // Pairing flow
@@ -1031,7 +1387,6 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
 
     // Check auth on load
     async function checkAuth() {
-      // If no local token, always require pairing first
       if (!getToken()) {
         showPairingScreen();
         requestPairing();
@@ -1046,7 +1401,6 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         if (data.authenticated) {
           showMainApp();
         } else {
-          // Token invalid, clear it and show pairing
           localStorage.removeItem('agent_hub_token');
           showPairingScreen();
           requestPairing();
@@ -1063,48 +1417,202 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
       if (e.key === 'Enter') submitPairing();
     });
 
-    // Main app initialization (called after auth)
+    // Main app initialization
     let term, fitAddon;
+    let ws = null;
+    let sessionsData = [];
+    let currentSessionId = null;
+    let dataHandler = null;
+    let resizeHandler = null;
+
     function initMainApp() {
-      if (term) return; // Already initialized
+      if (term) return;
 
       term = new Terminal({
         fontSize: 14,
         fontFamily: 'Menlo, Monaco, monospace',
-        theme: { background: '#1a1a1a', foreground: '#e6e6e6' }
+        theme: { background: '#1a1a1a', foreground: '#e6e6e6' },
+        scrollback: 5000
       });
       fitAddon = new FitAddon.FitAddon();
       term.loadAddon(fitAddon);
       term.open(document.getElementById('terminal-container'));
-      fitAddon.fit();
-      window.addEventListener('resize', () => fitAddon.fit());
+
+      // Mobile momentum scrolling
+      setupMobileTouchScroll();
+
+      window.addEventListener('resize', () => {
+        if (navContainer.classList.contains('show-session')) {
+          fitAddon.fit();
+        }
+      });
 
       initSessionHandlers();
     }
 
-    let ws = null;
-    let sessionsData = [];
-    let dataHandler = null;
-    let resizeHandler = null;
+    // Mobile touch scrolling with momentum
+    // Uses a touch overlay to capture events before xterm.js
+    function setupMobileTouchScroll() {
+      const overlay = document.getElementById('touch-overlay');
+      if (!overlay || !('ontouchstart' in window)) return;
+
+      let touchStartY = 0, touchStartX = 0, lastTouchY = 0, lastTouchTime = 0;
+      let velocity = 0, momentumId = null, isScrolling = false;
+      let accumulatedScroll = 0;
+      const velocitySamples = [];
+      const friction = 0.94, minVelocity = 0.3;
+      const SCROLL_THRESHOLD = 5; // Pixels before we decide it's a scroll vs tap
+
+      function cancelMomentum() {
+        if (momentumId) { cancelAnimationFrame(momentumId); momentumId = null; }
+        velocity = 0;
+        accumulatedScroll = 0;
+      }
+
+      function scrollByPixels(pixels) {
+        if (!term) return;
+        const lineHeight = 17; // Approximate, works well enough
+        accumulatedScroll += pixels / lineHeight;
+        const lines = Math.trunc(accumulatedScroll);
+        if (lines !== 0) {
+          term.scrollLines(lines);
+          accumulatedScroll -= lines;
+        }
+      }
+
+      overlay.addEventListener('touchstart', (e) => {
+        cancelMomentum();
+        const touch = e.touches[0];
+        touchStartY = lastTouchY = touch.clientY;
+        touchStartX = touch.clientX;
+        lastTouchTime = performance.now();
+        velocitySamples.length = 0;
+        isScrolling = false;
+      }, { passive: true });
+
+      overlay.addEventListener('touchmove', (e) => {
+        const touch = e.touches[0];
+        const deltaY = lastTouchY - touch.clientY;
+        const totalDeltaY = touchStartY - touch.clientY;
+        const totalDeltaX = touchStartX - touch.clientX;
+        const currentTime = performance.now();
+        const deltaTime = currentTime - lastTouchTime;
+
+        // Determine if this is a scroll gesture (vertical) vs something else
+        if (!isScrolling && Math.abs(totalDeltaY) > SCROLL_THRESHOLD) {
+          // More vertical than horizontal = scroll
+          if (Math.abs(totalDeltaY) > Math.abs(totalDeltaX)) {
+            isScrolling = true;
+          }
+        }
+
+        if (isScrolling) {
+          scrollByPixels(deltaY);
+          e.preventDefault(); // Prevent page scroll
+
+          if (deltaTime > 0) {
+            velocitySamples.push({ dy: deltaY, dt: deltaTime });
+            if (velocitySamples.length > 5) velocitySamples.shift();
+          }
+        }
+
+        lastTouchY = touch.clientY;
+        lastTouchTime = currentTime;
+      }, { passive: false });
+
+      overlay.addEventListener('touchend', (e) => {
+        // If it was a tap (not a scroll), focus terminal for keyboard
+        if (!isScrolling) {
+          term?.focus();
+        }
+
+        if (!isScrolling) return;
+
+        // Calculate momentum
+        if (velocitySamples.length > 0) {
+          let totalDy = 0, totalDt = 0;
+          velocitySamples.forEach(s => { totalDy += s.dy; totalDt += s.dt; });
+          velocity = totalDt > 0 ? (totalDy / totalDt) * 16 : 0;
+        }
+
+        if (Math.abs(velocity) > minVelocity) {
+          function animate() {
+            if (Math.abs(velocity) < minVelocity) { cancelMomentum(); return; }
+            scrollByPixels(velocity);
+            velocity *= friction;
+            momentumId = requestAnimationFrame(animate);
+          }
+          momentumId = requestAnimationFrame(animate);
+        }
+
+        isScrolling = false;
+      }, { passive: true });
+
+      console.log('Touch overlay scroll initialized');
+    }
 
     function initSessionHandlers() {
-      const select = document.getElementById('session-select');
-      const startBtn = document.getElementById('start-btn');
-      const status = document.getElementById('status');
+      // Render sessions list
+      function renderSessionsList() {
+        if (sessionsData.length === 0) {
+          sessionList.innerHTML = `
+            <div class="empty-state">
+              <div class="empty-state-icon">⌘</div>
+              <h2>No Sessions</h2>
+              <p>Tap + to create your first session</p>
+            </div>
+          `;
+          return;
+        }
+
+        sessionList.innerHTML = sessionsData.map(s => `
+          <div class="session-item" data-id="${s.id}">
+            <div class="session-status ${s.running ? 'running' : 'stopped'}"></div>
+            <div class="session-info">
+              <div class="session-name">${escapeHtml(s.name)}</div>
+              <div class="session-meta">${s.agent_type}${s.working_dir ? ' • ' + s.working_dir : ''}</div>
+            </div>
+            <span class="session-chevron">›</span>
+          </div>
+        `).join('');
+
+        // Add click handlers
+        sessionList.querySelectorAll('.session-item').forEach(item => {
+          item.addEventListener('click', () => openSession(item.dataset.id));
+        });
+      }
+
+      function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+      }
 
       async function loadSessions() {
-        const res = await authFetch('/api/sessions');
-        sessionsData = await res.json();
-        select.innerHTML = '<option value="">Select session...</option>';
-        sessionsData.forEach(s => {
-          const opt = document.createElement('option');
-          opt.value = s.id;
-          opt.dataset.running = s.running;
-          const runningIcon = s.running ? '● ' : '○ ';
-          opt.textContent = `${runningIcon}${s.name} (${s.agent_type})`;
-          opt.style.color = s.running ? '#4ec9b0' : '#808080';
-          select.appendChild(opt);
-        });
+        try {
+          const res = await authFetch('/api/sessions');
+          sessionsData = await res.json();
+          renderSessionsList();
+        } catch (e) {
+          console.error('Failed to load sessions', e);
+        }
+      }
+
+      async function openSession(sessionId) {
+        currentSessionId = sessionId;
+        const session = sessionsData.find(s => s.id === sessionId);
+        if (!session) return;
+
+        sessionTitle.textContent = session.name;
+        showSessionView(sessionId);
+
+        if (session.running) {
+          startBtn.style.display = 'none';
+          connectWebSocket(sessionId);
+        } else {
+          startBtn.style.display = 'inline-block';
+          await showBuffer(sessionId);
+        }
       }
 
       async function showBuffer(sessionId) {
@@ -1116,56 +1624,20 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           const data = await res.json();
           if (data.buffer) {
             term.write(data.buffer);
-            status.textContent = 'Viewing saved history (not live)';
+            status.textContent = 'Viewing saved history (tap Start to resume)';
           } else {
-            status.textContent = 'No saved history';
+            status.textContent = 'No history - tap Start to begin';
           }
         } catch (e) {
           status.textContent = 'Failed to load history';
         }
       }
 
-      async function startSession(sessionId) {
-        startBtn.disabled = true;
-        startBtn.textContent = 'Starting...';
-        try {
-          const res = await authFetch(`/api/sessions/${sessionId}/start`, { method: 'POST' });
-          const data = await res.json();
-          if (data.status === 'started' || data.status === 'already_running') {
-            await new Promise(r => setTimeout(r, 100));
-            await loadSessions();
-            select.value = sessionId;
-            connect(sessionId);
-          } else {
-            status.textContent = 'Failed to start: ' + JSON.stringify(data);
-          }
-        } catch (e) {
-          status.textContent = 'Failed to start session';
-        }
-        startBtn.disabled = false;
-        startBtn.textContent = 'Start';
-      }
-
-      function connect(sessionId) {
+      function connectWebSocket(sessionId) {
         if (ws) ws.close();
         if (dataHandler) dataHandler.dispose();
         if (resizeHandler) resizeHandler.dispose();
-        dataHandler = null;
-        resizeHandler = null;
 
-        if (!sessionId) {
-          startBtn.style.display = 'none';
-          return;
-        }
-
-        const session = sessionsData.find(s => s.id === sessionId);
-        if (!session?.running) {
-          startBtn.style.display = 'inline-block';
-          showBuffer(sessionId);
-          return;
-        }
-
-        startBtn.style.display = 'none';
         term.clear();
         const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
         ws = new WebSocket(`${protocol}//${location.host}/api/ws/${sessionId}`);
@@ -1199,27 +1671,41 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         });
       }
 
-      function updateUrl(sessionId) {
-        if (sessionId) window.location.hash = sessionId;
-        else history.replaceState(null, '', window.location.pathname);
+      async function startCurrentSession() {
+        if (!currentSessionId) return;
+        startBtn.disabled = true;
+        startBtn.textContent = 'Starting...';
+        try {
+          const res = await authFetch(`/api/sessions/${currentSessionId}/start`, { method: 'POST' });
+          const data = await res.json();
+          if (data.status === 'started' || data.status === 'already_running') {
+            await new Promise(r => setTimeout(r, 100));
+            await loadSessions();
+            startBtn.style.display = 'none';
+            connectWebSocket(currentSessionId);
+          } else {
+            status.textContent = 'Failed to start session';
+          }
+        } catch (e) {
+          status.textContent = 'Failed to start session';
+        }
+        startBtn.disabled = false;
+        startBtn.textContent = 'Start';
       }
 
-      function getSessionFromUrl() {
-        return window.location.hash.slice(1) || null;
-      }
-
-      select.addEventListener('change', () => {
-        updateUrl(select.value);
-        connect(select.value);
+      // Event listeners
+      document.getElementById('back-btn').addEventListener('click', () => {
+        showSessionsList();
+        loadSessions(); // Refresh list when going back
       });
-      startBtn.addEventListener('click', () => startSession(select.value));
+
+      startBtn.addEventListener('click', startCurrentSession);
       document.getElementById('refresh-btn').addEventListener('click', loadSessions);
 
-      window.addEventListener('hashchange', () => {
-        const sessionId = getSessionFromUrl();
-        if (sessionId && select.value !== sessionId) {
-          select.value = sessionId;
-          connect(sessionId);
+      // Handle browser back button
+      window.addEventListener('popstate', () => {
+        if (!window.location.hash) {
+          showSessionsList();
         }
       });
 
@@ -1233,12 +1719,10 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
       const newSessionError = document.getElementById('new-session-error');
       const newSessionCreate = document.getElementById('new-session-create');
 
-      // Show/hide custom command field based on agent type
       newSessionAgent.addEventListener('change', () => {
         customCommandGroup.style.display = newSessionAgent.value === 'custom' ? 'block' : 'none';
       });
 
-      // Open modal
       document.getElementById('new-btn').addEventListener('click', () => {
         newSessionModal.classList.add('visible');
         newSessionName.value = '';
@@ -1247,10 +1731,9 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         newSessionDir.value = '';
         newSessionError.textContent = '';
         customCommandGroup.style.display = 'none';
-        newSessionName.focus();
+        setTimeout(() => newSessionName.focus(), 100);
       });
 
-      // Close modal
       document.getElementById('new-session-cancel').addEventListener('click', () => {
         newSessionModal.classList.remove('visible');
       });
@@ -1258,7 +1741,6 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         if (e.target === newSessionModal) newSessionModal.classList.remove('visible');
       });
 
-      // Create session
       async function createNewSession() {
         const name = newSessionName.value.trim();
         const agentType = newSessionAgent.value;
@@ -1284,15 +1766,8 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           if (data.id) {
             newSessionModal.classList.remove('visible');
             await loadSessions();
-            select.value = data.id;
-            // If auto_start was true, try to connect
-            if (data.running) {
-              connect(data.id);
-            } else {
-              // Show start button for new session
-              startBtn.style.display = 'inline-block';
-              status.textContent = 'Session created - click Start to begin';
-            }
+            // Open the new session
+            openSession(data.id);
           } else {
             newSessionError.textContent = data.error || 'Failed to create session';
           }
@@ -1304,13 +1779,12 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
       }
 
       newSessionCreate.addEventListener('click', createNewSession);
-      newSessionName.addEventListener('keyup', (e) => { if (e.key === 'Enter') createNewSession(); });
 
+      // Load sessions and check for deep link
       loadSessions().then(() => {
-        const sessionId = getSessionFromUrl();
+        const sessionId = window.location.hash.slice(1);
         if (sessionId) {
-          select.value = sessionId;
-          connect(sessionId);
+          openSession(sessionId);
         }
       });
     }
@@ -1323,7 +1797,8 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
 
 // GET / - Serve mobile web client
 async fn web_index() -> impl IntoResponse {
-    axum::response::Html(MOBILE_HTML)
+    let html = MOBILE_HTML.replace("{{APP_NAME}}", APP_NAME);
+    axum::response::Html(html)
 }
 
 // Extract auth token from request headers
@@ -1961,6 +2436,11 @@ fn start_web_server() {
 // Desktop setup with menus
 #[cfg(not(target_os = "ios"))]
 fn setup_app(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    // Set window title (different for dev vs prod)
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_title(APP_NAME);
+    }
+
     // Create and set the menu
     let menu = create_menu(app.handle())?;
     app.set_menu(menu)?;
@@ -1995,6 +2475,9 @@ fn setup_app(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             }
             "duplicate_session" => {
                 let _ = app.emit("menu-event", "duplicate_session");
+            }
+            "reset_session_id" => {
+                let _ = app.emit("menu-event", "reset_session_id");
             }
             "next_session" => {
                 let _ = app.emit("menu-event", "next_session");

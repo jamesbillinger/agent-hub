@@ -372,6 +372,25 @@ body.resizing-sidebar {
   background: var(--accent-green);
 }
 
+/* Activity indicator - pulsing animation when session is actively outputting */
+.session-item.session-active .status.running {
+  animation: pulse-activity 0.6s ease-in-out infinite;
+  box-shadow: 0 0 6px var(--accent-green);
+}
+
+@keyframes pulse-activity {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+    box-shadow: 0 0 4px var(--accent-green);
+  }
+  50% {
+    opacity: 0.7;
+    transform: scale(1.5);
+    box-shadow: 0 0 10px var(--accent-green);
+  }
+}
+
 /* Agent type badge */
 .session-item .agent-badge {
   font-size: 10px;
@@ -458,6 +477,28 @@ body.resizing-sidebar {
 
 #terminal-container .xterm-viewport {
   overflow-y: auto !important;
+  /* Enable momentum scrolling on iOS Safari (fallback if custom handler not active) */
+  -webkit-overflow-scrolling: touch;
+  /* Allow vertical touch scrolling */
+  touch-action: pan-y;
+}
+
+/* Mobile-specific terminal improvements */
+@media (max-width: 768px), (pointer: coarse) {
+  #terminal-container .xterm-viewport {
+    /* Larger scrollbar touch target on mobile */
+    scrollbar-width: thin;
+  }
+
+  /* Make terminal fill available space on mobile */
+  .terminal-wrapper {
+    padding: 2px;
+  }
+
+  /* Ensure touch scrolling is smooth */
+  #terminal-container .xterm {
+    touch-action: pan-y;
+  }
 }
 
 #terminal-container .xterm-screen {

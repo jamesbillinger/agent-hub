@@ -142,10 +142,31 @@ npm install
 npm run tauri dev
 ```
 
-### Build
+### Build (Production Release)
+
+To create a production release:
+
 ```bash
+cd agent-hub-tauri
 npm run tauri build
 ```
+
+This creates two artifacts in `src-tauri/target/release/bundle/`:
+
+| Artifact | Location | Use |
+|----------|----------|-----|
+| `.app` bundle | `bundle/macos/Agent Hub.app` | Direct app for testing |
+| `.dmg` installer | `bundle/dmg/Agent Hub_0.1.0_aarch64.dmg` | Distributable installer |
+
+**To install the new release:**
+1. Open the `.dmg` file
+2. Drag "Agent Hub" to Applications (or run directly)
+3. If upgrading, quit the old version first
+
+**Notes:**
+- Build takes ~30 seconds (mostly Rust compilation)
+- The warning about `delete_paired_device_db` is harmless (reserved for future use)
+- Version number is configured in `src-tauri/tauri.conf.json`
 
 ## Technical Notes
 
@@ -232,6 +253,80 @@ All data stored in `~/Library/Application Support/agent-hub/`:
 
 - **Visual artifacts during heavy TUI output** - The WebGL renderer's texture atlas can become corrupted during rapid screen updates (Claude Code "thinking" animations, etc.). We mitigate this with periodic `clearTextureAtlas()` + `refresh()` calls. See "xterm.js WebGL Rendering & Visual Artifacts" section for details. Resizing the window also clears artifacts. As a fallback, users can switch to DOM renderer in settings.
 
+## Mobile Support
+
+### Mobile Web (Current Approach)
+
+Agent Hub includes a built-in web server for mobile access. When running on desktop, you can connect from any browser (including mobile) to control sessions remotely.
+
+**Features:**
+- View and switch between sessions
+- Create new sessions
+- See terminal output in real-time
+- Send input to running sessions
+- Pairing system for secure authentication
+
+**Access:** Connect to `http://<desktop-ip>:3847` from your mobile browser. Port failover to 3848, 3849, etc. if 3847 is in use.
+
+### iOS Native App (Explored, Deferred)
+
+We explored building a native iOS app using Tauri's iOS support. Here's what we learned:
+
+#### Why a Native iOS App Can't Run Claude Code Locally
+
+**iOS Sandbox Restrictions:**
+- iOS doesn't allow apps to spawn child processes (PTY functionality)
+- This is a fundamental security restriction of the iOS platform
+- There's no workaround - it's enforced at the OS level
+
+**What This Means:**
+- A native iOS app can ONLY act as a remote client to a desktop server
+- The actual Claude Code process MUST run on a desktop machine
+- This is the same limitation mobile web has - just with a native wrapper
+
+#### iOS App Architecture Options Considered
+
+1. **Tauri iOS (WebView-based)** - Technically works, but:
+   - Still uses WKWebView for the UI
+   - Terminal emulation requires xterm.js (can't be native)
+   - No benefit over mobile web since it's the same WebView
+
+2. **SwiftUI Native** - For a true native feel, but:
+   - Would still need WebView for terminal emulation (xterm.js)
+   - Chat-style apps (ChatGPT, Claude) work natively because they display formatted messages
+   - Terminal apps need character-by-character rendering with ANSI escape codes
+
+3. **React Native with WebView** - Same issues as Tauri iOS
+
+#### Why Mobile Apps Like ChatGPT Work Differently
+
+ChatGPT and Claude mobile apps display **chat messages** - formatted text bubbles that can be rendered natively with SwiftUI/UIKit. Agent Hub displays a **terminal** with:
+- Real-time character streaming
+- Cursor positioning
+- ANSI escape sequences for colors/formatting
+- Full screen TUI applications (like Claude Code's interface)
+
+This requires a terminal emulator (xterm.js), which needs a WebView.
+
+#### Current Recommendation
+
+Focus on improving mobile web experience:
+- Works on any device without app installation
+- No App Store deployment/approval needed
+- Same functionality as a native app would have
+- Easier to maintain and update
+
+**Files related to iOS support (for reference):**
+- `src-tauri/src/lib.rs` - Has conditional compilation for iOS (`#[cfg(not(target_os = "ios"))]`)
+- `src-tauri/Cargo.toml` - `portable-pty` marked as desktop-only dependency
+- `src-tauri/tauri.conf.json` - Contains iOS development team ID for signing
+
+**To build iOS (if needed for testing):**
+```bash
+npm run tauri ios init  # First time setup
+npm run tauri ios dev   # Run in simulator
+```
+
 ## Future Ideas
 
 - [x] Light theme (implemented - follows system or manual selection)
@@ -241,6 +336,7 @@ All data stored in `~/Library/Application Support/agent-hub/`:
 - [ ] Session templates
 - [ ] Keyboard navigation in session list
 - [ ] Context menu on session items
+- [ ] Improved mobile web scrolling/touch support
 
 ## License
 

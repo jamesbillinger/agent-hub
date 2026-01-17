@@ -61,6 +61,9 @@ interface AppSettings {
   default_working_dir: string;
   default_agent_type: string;
   notifications_enabled: boolean;
+  bell_notifications_enabled: boolean;
+  bounce_dock_on_bell: boolean;
+  read_aloud_enabled: boolean;
   renderer: "webgl" | "dom";
 }
 
@@ -79,6 +82,9 @@ let appSettings: AppSettings = {
   default_working_dir: "~/dev/pplsi",
   default_agent_type: "claude",
   notifications_enabled: false,
+  bell_notifications_enabled: true,
+  bounce_dock_on_bell: true,
+  read_aloud_enabled: false,
   renderer: "webgl",
 };
 let sidebarResizeHandle: HTMLElement;
@@ -96,6 +102,245 @@ const AGENT_COMMANDS: Record<string, string> = {
 
 // Default working directory
 const DEFAULT_WORKING_DIR = "~/dev/pplsi";
+
+// Read-aloud state (per session)
+interface ReadAloudState {
+  textBuffer: string;
+  lastOutputTime: number;
+  silenceTimer: number | null;
+  isSpeaking: boolean;
+}
+const readAloudState: Map<string, ReadAloudState> = new Map();
+
+// Activity tracking (per session) - tracks if session is actively outputting
+interface ActivityState {
+  lastOutputTime: number;
+  lastInputTime: number;  // Track input to filter out echo
+  isActive: boolean;
+}
+const activityState: Map<string, ActivityState> = new Map();
+
+// Silence threshold for read-aloud (ms) - wait this long after output stops before speaking
+const READ_ALOUD_SILENCE_THRESHOLD = 1500;
+
+// Track sessions with detected errors (to avoid repeated notifications)
+const sessionErrorsDetected: Set<string> = new Set();
+
+// Activity threshold (ms) - consider session "active" if output within this window
+const ACTIVITY_THRESHOLD = 1000;
+
+// Echo filter (ms) - ignore output that comes shortly after input (likely echo)
+const ECHO_FILTER_MS = 150;
+
+/**
+ * Strip ANSI escape codes from text for TTS.
+ */
+function stripAnsi(text: string): string {
+  // Remove ANSI escape sequences
+  return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")
+    // Remove other control characters
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "")
+    // Normalize whitespace
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+}
+
+/**
+ * Speak text using Web Speech API.
+ */
+function speakText(text: string): void {
+  if (!text.trim()) return;
+
+  // Cancel any ongoing speech
+  speechSynthesis.cancel();
+
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.rate = 1.0;
+  utterance.pitch = 1.0;
+
+  speechSynthesis.speak(utterance);
+}
+
+/**
+ * Process new output for read-aloud functionality.
+ */
+function processReadAloudOutput(sessionId: string, rawData: string): void {
+  if (!appSettings.read_aloud_enabled) return;
+
+  let state = readAloudState.get(sessionId);
+  if (!state) {
+    state = {
+      textBuffer: "",
+      lastOutputTime: 0,
+      silenceTimer: null,
+      isSpeaking: false,
+    };
+    readAloudState.set(sessionId, state);
+  }
+
+  // Strip ANSI codes and add to buffer
+  const cleanText = stripAnsi(rawData);
+  state.textBuffer += cleanText;
+  state.lastOutputTime = Date.now();
+
+  // Clear existing silence timer
+  if (state.silenceTimer) {
+    clearTimeout(state.silenceTimer);
+  }
+
+  // Set new silence timer - when silence is detected, speak the buffer
+  state.silenceTimer = window.setTimeout(() => {
+    if (state && state.textBuffer.trim()) {
+      speakText(state.textBuffer.trim());
+      state.textBuffer = "";
+    }
+  }, READ_ALOUD_SILENCE_THRESHOLD);
+}
+
+/**
+ * Update activity state for a session (called on output).
+ */
+function updateActivityState(sessionId: string): void {
+  let state = activityState.get(sessionId);
+  if (!state) {
+    state = { lastOutputTime: 0, lastInputTime: 0, isActive: false };
+    activityState.set(sessionId, state);
+  }
+
+  const now = Date.now();
+
+  // Filter out echo: if output comes shortly after input, it's likely echo
+  if (now - state.lastInputTime < ECHO_FILTER_MS) {
+    return; // Ignore this output, it's probably echo
+  }
+
+  const wasActive = state.isActive;
+  state.lastOutputTime = now;
+  state.isActive = true;
+
+  // Update UI if state changed
+  if (!wasActive) {
+    updateSessionActivityIndicator(sessionId, true);
+  }
+
+  // Schedule activity check
+  setTimeout(() => {
+    const currentState = activityState.get(sessionId);
+    if (currentState && Date.now() - currentState.lastOutputTime >= ACTIVITY_THRESHOLD) {
+      currentState.isActive = false;
+      updateSessionActivityIndicator(sessionId, false);
+    }
+  }, ACTIVITY_THRESHOLD + 50);
+}
+
+/**
+ * Record that input was sent to a session (for echo filtering).
+ */
+function recordSessionInput(sessionId: string): void {
+  let state = activityState.get(sessionId);
+  if (!state) {
+    state = { lastOutputTime: 0, lastInputTime: 0, isActive: false };
+    activityState.set(sessionId, state);
+  }
+  state.lastInputTime = Date.now();
+}
+
+/**
+ * Update the activity indicator in the session list.
+ */
+function updateSessionActivityIndicator(sessionId: string, isActive: boolean): void {
+  const sessionItem = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
+  if (sessionItem) {
+    if (isActive) {
+      sessionItem.classList.add("session-active");
+    } else {
+      sessionItem.classList.remove("session-active");
+    }
+  }
+}
+
+// Buffer for accumulating output to detect multi-line error messages
+const errorDetectionBuffer: Map<string, string> = new Map();
+
+/**
+ * Detect Claude session errors like "No conversation found".
+ * This can happen when:
+ * - The session was created but never used
+ * - Claude Code internally reset/moved the session
+ * - The session data was cleaned up
+ *
+ * When detected, automatically reset and restart with a fresh session.
+ */
+function detectClaudeSessionError(sessionId: string, data: string): void {
+  const session = sessions.get(sessionId);
+  if (!session || session.agentType !== "claude") return;
+
+  // Accumulate output for error detection (keep last 500 chars)
+  const currentBuffer = errorDetectionBuffer.get(sessionId) || "";
+  const newBuffer = (currentBuffer + data).slice(-500);
+  errorDetectionBuffer.set(sessionId, newBuffer);
+
+  // Check for the specific error message
+  if (newBuffer.includes("No conversation found with session ID:") && !sessionErrorsDetected.has(sessionId)) {
+    sessionErrorsDetected.add(sessionId);
+
+    // Show brief message and auto-recover
+    session.terminal?.write("\r\n\x1b[33m[Session not found - starting fresh...]\x1b[0m\r\n");
+
+    // Auto-recover: reset session ID and restart
+    autoRecoverClaudeSession(sessionId);
+  }
+}
+
+/**
+ * Automatically recover from a Claude session error by resetting and restarting.
+ */
+async function autoRecoverClaudeSession(sessionId: string): Promise<void> {
+  const session = sessions.get(sessionId);
+  if (!session || session.agentType !== "claude") return;
+
+  // Generate new Claude session ID
+  session.claudeSessionId = crypto.randomUUID();
+  session.hasBeenStarted = false;
+
+  // Clear error detection state
+  sessionErrorsDetected.delete(sessionId);
+  errorDetectionBuffer.delete(sessionId);
+
+  // Save to database
+  await saveSessionToDb(session);
+
+  // Wait a moment for the failed process to exit, then restart
+  setTimeout(async () => {
+    // Only restart if the session is no longer running (process exited)
+    if (!session.isRunning) {
+      session.terminal?.write("\x1b[32m[Restarting with new session...]\x1b[0m\r\n\r\n");
+      await startSessionProcess(session);
+    }
+  }, 500);
+}
+
+/**
+ * Reset a Claude session ID to start fresh.
+ */
+async function resetClaudeSessionId(sessionId: string): Promise<void> {
+  const session = sessions.get(sessionId);
+  if (!session || session.agentType !== "claude") return;
+
+  // Generate new Claude session ID
+  session.claudeSessionId = crypto.randomUUID();
+  session.hasBeenStarted = false;
+
+  // Clear error detection state
+  sessionErrorsDetected.delete(sessionId);
+  errorDetectionBuffer.delete(sessionId);
+
+  // Save to database
+  await saveSessionToDb(session);
+
+  // Show message
+  session.terminal?.write("\r\n\x1b[32m[Session ID reset - ready to start fresh]\x1b[0m\r\n");
+}
 
 /**
  * Calculate PTY dimensions with a buffer zone.
@@ -130,6 +375,9 @@ let settingsThemeSelect: HTMLSelectElement;
 let settingsDefaultWorkingDirInput: HTMLInputElement;
 let settingsDefaultAgentSelect: HTMLSelectElement;
 let settingsNotificationsCheckbox: HTMLInputElement;
+let settingsBellNotificationsCheckbox: HTMLInputElement;
+let settingsBounceDockCheckbox: HTMLInputElement;
+let settingsReadAloudCheckbox: HTMLInputElement;
 let settingsRendererSelect: HTMLSelectElement;
 
 // Initialize app
@@ -156,6 +404,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   settingsDefaultWorkingDirInput = document.getElementById("settings-default-working-dir") as HTMLInputElement;
   settingsDefaultAgentSelect = document.getElementById("settings-default-agent") as HTMLSelectElement;
   settingsNotificationsCheckbox = document.getElementById("settings-notifications") as HTMLInputElement;
+  settingsBellNotificationsCheckbox = document.getElementById("settings-bell-notifications") as HTMLInputElement;
+  settingsBounceDockCheckbox = document.getElementById("settings-bounce-dock") as HTMLInputElement;
+  settingsReadAloudCheckbox = document.getElementById("settings-read-aloud") as HTMLInputElement;
   settingsRendererSelect = document.getElementById("settings-renderer") as HTMLSelectElement;
 
   // Load window state and app settings
@@ -283,8 +534,18 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   await listen<PtyOutput>("pty-output", (event) => {
     const sessionId = event.payload.session_id;
+    const data = event.payload.data;
     const currentData = pendingWrites.get(sessionId) || "";
-    pendingWrites.set(sessionId, currentData + event.payload.data);
+    pendingWrites.set(sessionId, currentData + data);
+
+    // Update activity state (for spinner indicator)
+    updateActivityState(sessionId);
+
+    // Process for read-aloud if enabled
+    processReadAloudOutput(sessionId, data);
+
+    // Detect Claude session errors
+    detectClaudeSessionError(sessionId, data);
 
     if (!writeFrameScheduled) {
       writeFrameScheduled = true;
@@ -932,9 +1193,17 @@ async function switchToSession(sessionId: string) {
   renderSessionList();
 
   // Focus terminal after all view updates to ensure it receives keyboard input
-  setTimeout(() => {
-    session.terminal?.focus();
-  }, 0);
+  // Keep trying until terminal is ready (can take seconds for large buffers)
+  const focusTerminal = () => {
+    if (session.terminal) {
+      session.terminal.focus();
+    }
+  };
+
+  // Try immediately and then periodically for up to 3 seconds
+  focusTerminal();
+  const focusInterval = setInterval(focusTerminal, 200);
+  setTimeout(() => clearInterval(focusInterval), 3000);
 }
 
 /**
@@ -1048,6 +1317,8 @@ async function initializeTerminalView(session: Session) {
       // Session not running - ignore input, user must click banner to start
       return;
     }
+    // Record input time for echo filtering in activity indicator
+    recordSessionInput(session.id);
     invoke("write_pty", { sessionId: session.id, data });
 
     // Mark Claude session as started when user sends first input
@@ -1065,7 +1336,172 @@ async function initializeTerminalView(session: Session) {
     }
   });
 
+  // Handle terminal bell (attention needed)
+  terminal.onBell(async () => {
+    // Show notification if enabled
+    if (appSettings.bell_notifications_enabled) {
+      try {
+        const win = getCurrentWindow();
+        const isFocused = await win.isFocused();
+        if (!isFocused) {
+          await showNotification(
+            "Agent Hub",
+            `${session.name} needs attention`
+          );
+        }
+      } catch (err) {
+        console.error("Failed to send bell notification:", err);
+      }
+    }
+
+    // Bounce dock icon if enabled
+    if (appSettings.bounce_dock_on_bell) {
+      try {
+        const win = getCurrentWindow();
+        // 1 = informational attention (bounces once)
+        // 2 = critical attention (bounces until focused)
+        await win.requestUserAttention(1);
+      } catch (err) {
+        console.error("Failed to request user attention:", err);
+      }
+    }
+  });
+
+  // Set up mobile momentum scrolling
+  setupMobileTouchScroll(terminal, wrapper);
+
   terminal.focus();
+}
+
+/**
+ * Set up momentum-based touch scrolling for mobile devices.
+ * xterm.js intercepts touch events for mouse reporting, which kills native
+ * momentum scrolling. This implementation provides native-like inertia scrolling.
+ */
+function setupMobileTouchScroll(terminal: Terminal, wrapper: HTMLElement): void {
+  // Only set up on touch devices
+  if (!('ontouchstart' in window)) return;
+
+  // Get the xterm viewport element where scrolling happens
+  const viewport = wrapper.querySelector('.xterm-viewport') as HTMLElement | null;
+  if (!viewport) return;
+
+  // State for touch tracking
+  let touchStartY = 0;
+  let touchStartTime = 0;
+  let lastTouchY = 0;
+  let lastTouchTime = 0;
+  let velocity = 0;
+  let momentumId: number | null = null;
+  let isTracking = false;
+
+  // Velocity samples for smoother momentum calculation
+  const velocitySamples: { dy: number; dt: number }[] = [];
+  const maxSamples = 5;
+
+  // Physics constants for natural feeling scroll
+  const friction = 0.95; // Deceleration per frame (lower = more friction)
+  const minVelocity = 0.5; // Stop momentum below this threshold
+  const scrollMultiplier = 0.8; // Pixels per velocity unit
+
+  function cancelMomentum(): void {
+    if (momentumId !== null) {
+      cancelAnimationFrame(momentumId);
+      momentumId = null;
+    }
+    velocity = 0;
+  }
+
+  function handleTouchStart(e: TouchEvent): void {
+    // Cancel any existing momentum scroll
+    cancelMomentum();
+
+    const touch = e.touches[0];
+    touchStartY = touch.clientY;
+    touchStartTime = performance.now();
+    lastTouchY = touch.clientY;
+    lastTouchTime = touchStartTime;
+    velocitySamples.length = 0;
+    isTracking = true;
+  }
+
+  function handleTouchMove(e: TouchEvent): void {
+    if (!isTracking) return;
+
+    const touch = e.touches[0];
+    const currentTime = performance.now();
+    const deltaY = lastTouchY - touch.clientY;
+    const deltaTime = currentTime - lastTouchTime;
+
+    // Scroll the terminal
+    if (Math.abs(deltaY) > 0 && viewport) {
+      // Use viewport scrollTop directly for smoother scrolling
+      viewport.scrollTop += deltaY;
+
+      // Prevent default to avoid page scroll
+      e.preventDefault();
+    }
+
+    // Track velocity samples
+    if (deltaTime > 0) {
+      velocitySamples.push({ dy: deltaY, dt: deltaTime });
+      if (velocitySamples.length > maxSamples) {
+        velocitySamples.shift();
+      }
+    }
+
+    lastTouchY = touch.clientY;
+    lastTouchTime = currentTime;
+  }
+
+  function handleTouchEnd(e: TouchEvent): void {
+    if (!isTracking) return;
+    isTracking = false;
+
+    // Calculate average velocity from samples
+    if (velocitySamples.length > 0) {
+      let totalDy = 0;
+      let totalDt = 0;
+      for (const sample of velocitySamples) {
+        totalDy += sample.dy;
+        totalDt += sample.dt;
+      }
+      // Velocity in pixels per millisecond
+      velocity = totalDt > 0 ? (totalDy / totalDt) * 16 : 0; // Convert to per-frame
+    }
+
+    // Start momentum scrolling if velocity is significant
+    if (Math.abs(velocity) > minVelocity) {
+      startMomentumScroll();
+    }
+  }
+
+  function startMomentumScroll(): void {
+    function animate(): void {
+      if (Math.abs(velocity) < minVelocity || !viewport) {
+        cancelMomentum();
+        return;
+      }
+
+      // Apply scroll
+      const scrollAmount = velocity * scrollMultiplier;
+      viewport.scrollTop += scrollAmount;
+
+      // Apply friction
+      velocity *= friction;
+
+      // Continue animation
+      momentumId = requestAnimationFrame(animate);
+    }
+
+    momentumId = requestAnimationFrame(animate);
+  }
+
+  // Add event listeners with passive: false to allow preventDefault
+  viewport.addEventListener('touchstart', handleTouchStart, { passive: true });
+  viewport.addEventListener('touchmove', handleTouchMove, { passive: false });
+  viewport.addEventListener('touchend', handleTouchEnd, { passive: true });
+  viewport.addEventListener('touchcancel', handleTouchEnd, { passive: true });
 }
 
 /**
@@ -1217,7 +1653,9 @@ function renderSessionList() {
   for (let i = 0; i < sortedSessions.length; i++) {
     const session = sortedSessions[i];
     const item = document.createElement("div");
-    item.className = `session-item${session.id === activeSessionId ? " active" : ""}`;
+    // Preserve activity state across re-renders
+    const isSessionActive = activityState.get(session.id)?.isActive || false;
+    item.className = `session-item${session.id === activeSessionId ? " active" : ""}${isSessionActive ? " session-active" : ""}`;
     item.dataset.sessionId = session.id;
 
     const agentBadgeClass = session.agentType === "claude" ? "claude" :
@@ -1443,6 +1881,9 @@ function showSettingsModal(): void {
   settingsDefaultWorkingDirInput.value = appSettings.default_working_dir;
   settingsDefaultAgentSelect.value = appSettings.default_agent_type;
   settingsNotificationsCheckbox.checked = appSettings.notifications_enabled;
+  settingsBellNotificationsCheckbox.checked = appSettings.bell_notifications_enabled ?? true;
+  settingsBounceDockCheckbox.checked = appSettings.bounce_dock_on_bell ?? true;
+  settingsReadAloudCheckbox.checked = appSettings.read_aloud_enabled ?? false;
   settingsRendererSelect.value = appSettings.renderer || "webgl";
   settingsModal.classList.add("visible");
 }
@@ -1459,6 +1900,9 @@ async function saveSettings(): Promise<void> {
     default_working_dir: settingsDefaultWorkingDirInput.value || DEFAULT_WORKING_DIR,
     default_agent_type: settingsDefaultAgentSelect.value || "claude",
     notifications_enabled: settingsNotificationsCheckbox.checked,
+    bell_notifications_enabled: settingsBellNotificationsCheckbox.checked,
+    bounce_dock_on_bell: settingsBounceDockCheckbox.checked,
+    read_aloud_enabled: settingsReadAloudCheckbox.checked,
     renderer: settingsRendererSelect.value as "webgl" | "dom",
   };
 
@@ -1571,6 +2015,11 @@ function handleMenuEvent(eventId: string): void {
     case "duplicate_session":
       if (activeSessionId) {
         duplicateSession(activeSessionId);
+      }
+      break;
+    case "reset_session_id":
+      if (activeSessionId) {
+        resetClaudeSessionId(activeSessionId);
       }
       break;
     case "next_session":
