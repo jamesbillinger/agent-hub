@@ -390,8 +390,8 @@ fn spawn_pty(
     });
 
     // Handle Claude session resume
-    // If we have a claude_session_id and resume_session is true, modify the command
-    // to use --resume instead of starting fresh
+    // Only use --resume flag when explicitly resuming an existing session
+    // For new sessions, start Claude fresh and let it create its own session ID
     if cmd_str.contains("claude") {
         if let Some(ref claude_id) = claude_session_id {
             if resume_session.unwrap_or(false) {
@@ -403,16 +403,9 @@ fn spawn_pty(
                 } else {
                     format!("claude --resume {}", claude_id)
                 };
-            } else {
-                // New session with pre-determined session ID
-                // Insert --session-id before any other flags
-                let has_skip_perms = cmd_str.contains("--dangerously-skip-permissions");
-                cmd_str = if has_skip_perms {
-                    format!("claude --session-id {} --dangerously-skip-permissions", claude_id)
-                } else {
-                    format!("claude --session-id {}", claude_id)
-                };
             }
+            // For new sessions, don't use --session-id as it expects an existing session
+            // Claude will create its own session ID, which we'll capture from output
         }
     }
 
@@ -1079,7 +1072,27 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
       padding: 4px;
       overflow: hidden;
       position: relative;
+      /* Shrinks when keyboard appears */
+      min-height: 0;
     }
+
+    /* Paste indicator (shows on long-press) */
+    #paste-indicator {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      padding: 12px 24px;
+      background: rgba(14, 99, 156, 0.95);
+      border-radius: 8px;
+      color: white;
+      font-size: 16px;
+      font-weight: 500;
+      z-index: 30;
+      display: none;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    }
+    #paste-indicator.visible { display: block; }
     #terminal-container .xterm { height: 100%; width: 100%; }
     #terminal-container .xterm-viewport {
       overflow-y: auto !important;
@@ -1267,6 +1280,7 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         </div>
         <div id="terminal-container">
           <div id="touch-overlay"></div>
+          <div id="paste-indicator">Paste</div>
         </div>
         <div id="status" class="disconnected">Disconnected</div>
       </div>
@@ -1438,8 +1452,89 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
       term.loadAddon(fitAddon);
       term.open(document.getElementById('terminal-container'));
 
+      // Fix iOS keyboard input - enable autocorrect/autocomplete
+      const textarea = document.querySelector('#terminal-container textarea');
+      if (textarea) {
+        textarea.setAttribute('autocomplete', 'on');
+        textarea.setAttribute('autocorrect', 'on');
+        textarea.setAttribute('autocapitalize', 'sentences');
+        textarea.setAttribute('spellcheck', 'true');
+      }
+
       // Mobile momentum scrolling
       setupMobileTouchScroll();
+
+      // Long-press to paste handler
+      const pasteIndicator = document.getElementById('paste-indicator');
+      let longPressTimer = null;
+      const LONG_PRESS_DURATION = 500; // ms
+
+      async function doPaste() {
+        try {
+          const text = await navigator.clipboard.readText();
+          if (text && ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(text);
+            // Brief feedback
+            pasteIndicator.textContent = 'Pasted!';
+            pasteIndicator.classList.add('visible');
+            setTimeout(() => {
+              pasteIndicator.classList.remove('visible');
+              pasteIndicator.textContent = 'Paste';
+            }, 500);
+          }
+        } catch (e) {
+          console.error('Paste failed:', e);
+          pasteIndicator.textContent = 'Paste failed';
+          pasteIndicator.classList.add('visible');
+          setTimeout(() => {
+            pasteIndicator.classList.remove('visible');
+            pasteIndicator.textContent = 'Paste';
+          }, 1000);
+        }
+      }
+
+      // Add long-press detection to touch overlay
+      const overlay = document.getElementById('touch-overlay');
+      overlay.addEventListener('touchstart', (e) => {
+        longPressTimer = setTimeout(() => {
+          pasteIndicator.classList.add('visible');
+          doPaste();
+          longPressTimer = null;
+        }, LONG_PRESS_DURATION);
+      }, { passive: true });
+
+      overlay.addEventListener('touchend', () => {
+        if (longPressTimer) {
+          clearTimeout(longPressTimer);
+          longPressTimer = null;
+        }
+      }, { passive: true });
+
+      overlay.addEventListener('touchmove', () => {
+        // Cancel long-press if user moves finger (scrolling)
+        if (longPressTimer) {
+          clearTimeout(longPressTimer);
+          longPressTimer = null;
+        }
+      }, { passive: true });
+
+      // Handle iOS keyboard resize using visualViewport
+      if (window.visualViewport) {
+        const sessionView = document.getElementById('session-view');
+        window.visualViewport.addEventListener('resize', () => {
+          if (navContainer.classList.contains('show-session')) {
+            // Adjust height when keyboard appears/disappears
+            const vh = window.visualViewport.height;
+            sessionView.style.height = vh + 'px';
+            fitAddon.fit();
+            term.scrollToBottom();
+          }
+        });
+        window.visualViewport.addEventListener('scroll', () => {
+          // Prevent iOS from scrolling the page when keyboard opens
+          window.scrollTo(0, 0);
+        });
+      }
 
       window.addEventListener('resize', () => {
         if (navContainer.classList.contains('show-session')) {
@@ -1598,7 +1693,7 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         }
       }
 
-      async function openSession(sessionId) {
+      async function openSession(sessionId, autoStart = false) {
         currentSessionId = sessionId;
         const session = sessionsData.find(s => s.id === sessionId);
         if (!session) return;
@@ -1609,6 +1704,10 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         if (session.running) {
           startBtn.style.display = 'none';
           connectWebSocket(sessionId);
+        } else if (autoStart) {
+          // Auto-start newly created sessions
+          startBtn.style.display = 'none';
+          await startCurrentSession();
         } else {
           startBtn.style.display = 'inline-block';
           await showBuffer(sessionId);
@@ -1624,6 +1723,7 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           const data = await res.json();
           if (data.buffer) {
             term.write(data.buffer);
+            term.scrollToBottom(); // Scroll to latest content
             status.textContent = 'Viewing saved history (tap Start to resume)';
           } else {
             status.textContent = 'No history - tap Start to begin';
@@ -1655,6 +1755,8 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         ws.onmessage = (e) => {
           if (e.data instanceof ArrayBuffer) {
             term.write(new Uint8Array(e.data));
+            // Auto-scroll to bottom on new output
+            term.scrollToBottom();
           }
         };
 
@@ -1766,8 +1868,8 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           if (data.id) {
             newSessionModal.classList.remove('visible');
             await loadSessions();
-            // Open the new session
-            openSession(data.id);
+            // Open and auto-start the new session
+            openSession(data.id, true);
           } else {
             newSessionError.textContent = data.error || 'Failed to create session';
           }
@@ -1848,6 +1950,9 @@ async fn api_request_pairing(
             device_name: device_name.clone(),
         });
     }
+
+    // Log the pairing code for debugging
+    println!("🔑 Pairing code requested: {} (device: {:?})", code, device_name);
 
     // Notify desktop app to show the code
     if let Some(app) = APP_HANDLE.lock().as_ref() {
@@ -2068,12 +2173,9 @@ async fn api_create_session(
         format!("{} {}", agent_label, count + 1)
     });
 
-    // Generate claude_session_id for Claude sessions
-    let claude_session_id = if agent_type == "claude" {
-        Some(generate_token())
-    } else {
-        None
-    };
+    // Don't pre-generate claude_session_id - it will be captured from Claude's output
+    // when the session is first started. Only existing sessions with saved IDs should resume.
+    let claude_session_id: Option<String> = None;
 
     // Calculate sort order (put new sessions at top)
     let min_sort_order = load_sessions()
@@ -2173,6 +2275,8 @@ async fn api_start_session(
     };
 
     // Spawn PTY (use default terminal size, will be resized on connect)
+    // Only resume if we have a saved Claude session ID
+    let should_resume = session.claude_session_id.is_some();
     match spawn_pty(
         app.clone(),
         session.id.clone(),
@@ -2181,7 +2285,7 @@ async fn api_start_session(
         120,  // default cols
         30,   // default rows
         session.claude_session_id,
-        Some(true),  // resume_session
+        Some(should_resume),
     ) {
         Ok(()) => {
             // Notify desktop app that session was started remotely
