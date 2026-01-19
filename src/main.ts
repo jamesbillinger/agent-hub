@@ -84,6 +84,15 @@ interface ClaudeJsonMessage {
   tools?: string[];
   model?: string;
   claude_code_version?: string;
+  permissionMode?: string;
+  // Result message fields
+  num_turns?: number;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
+  };
 }
 
 // Chat UI state for JSON sessions
@@ -121,6 +130,7 @@ interface AppSettings {
   bounce_dock_on_bell: boolean;
   read_aloud_enabled: boolean;
   renderer: "webgl" | "dom";
+  remote_pin?: string | null;
 }
 
 // State
@@ -147,6 +157,11 @@ let appSettings: AppSettings = {
 let sidebarResizeHandle: HTMLElement;
 let sidebarEl: HTMLElement;
 let isResizingSidebar = false;
+
+// Mobile state
+type MobileView = "list" | "session";
+let currentMobileView: MobileView = "list";
+let isMobileLayout = false;
 
 // Agent commands
 const AGENT_COMMANDS: Record<string, string> = {
@@ -438,6 +453,7 @@ let settingsBellNotificationsCheckbox: HTMLInputElement;
 let settingsBounceDockCheckbox: HTMLInputElement;
 let settingsReadAloudCheckbox: HTMLInputElement;
 let settingsRendererSelect: HTMLSelectElement;
+let settingsRemotePinInput: HTMLInputElement;
 
 // Initialize app
 document.addEventListener("DOMContentLoaded", async () => {
@@ -468,6 +484,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   settingsBounceDockCheckbox = document.getElementById("settings-bounce-dock") as HTMLInputElement;
   settingsReadAloudCheckbox = document.getElementById("settings-read-aloud") as HTMLInputElement;
   settingsRendererSelect = document.getElementById("settings-renderer") as HTMLSelectElement;
+  settingsRemotePinInput = document.getElementById("settings-remote-pin") as HTMLInputElement;
 
   // Load window state and app settings
   await loadWindowState();
@@ -475,6 +492,39 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // Set up sidebar resize
   setupSidebarResize();
+
+  // Mobile layout initialization
+  isMobileLayout = checkMobileLayout();
+  window.addEventListener("resize", updateMobileLayout);
+  initMobileMenuInfo();
+
+  // Mobile header event listeners
+  document.getElementById("mobile-back-btn")?.addEventListener("click", navigateBackToList);
+  document.getElementById("mobile-menu-btn")?.addEventListener("click", toggleMobileMenu);
+  document.getElementById("mobile-settings-btn")?.addEventListener("click", () => {
+    hideMobileMenu();
+    showSettingsModal();
+  });
+  document.getElementById("mobile-logout-btn")?.addEventListener("click", () => {
+    hideMobileMenu();
+    window.location.reload();
+  });
+
+  // Close mobile menu when clicking outside
+  document.addEventListener("click", (e) => {
+    const menu = document.getElementById("mobile-user-menu");
+    const menuBtn = document.getElementById("mobile-menu-btn");
+    if (menu?.classList.contains("visible") &&
+        !menu.contains(e.target as Node) &&
+        !menuBtn?.contains(e.target as Node)) {
+      hideMobileMenu();
+    }
+  });
+
+  // Initial mobile view state
+  if (isMobileLayout) {
+    setMobileView("list");
+  }
 
   // Set up search and sort event listeners
   sessionSearchInput.addEventListener("input", () => {
@@ -1308,6 +1358,97 @@ async function saveSessionFromModal() {
   hideNewSessionModal();
 }
 
+// ============================================
+// Mobile Navigation
+// ============================================
+
+function checkMobileLayout(): boolean {
+  return window.matchMedia("(max-width: 768px)").matches;
+}
+
+function setMobileView(view: MobileView): void {
+  currentMobileView = view;
+
+  if (!isMobileLayout) return;
+
+  document.body.classList.remove("mobile-view-list", "mobile-view-session");
+  document.body.classList.add(`mobile-view-${view}`);
+
+  updateMobileHeader();
+}
+
+function updateMobileHeader(): void {
+  const titleEl = document.getElementById("mobile-session-name");
+  const statusEl = document.getElementById("mobile-session-status");
+
+  if (!titleEl || !statusEl) return;
+
+  if (currentMobileView === "list" || !activeSessionId) {
+    titleEl.textContent = "Sessions";
+    statusEl.classList.remove("running");
+    statusEl.style.display = "none";
+  } else {
+    const session = sessions.get(activeSessionId);
+    if (session) {
+      titleEl.textContent = session.name;
+      statusEl.style.display = "inline-block";
+      if (session.isRunning) {
+        statusEl.classList.add("running");
+      } else {
+        statusEl.classList.remove("running");
+      }
+    }
+  }
+}
+
+function updateMobileLayout(): void {
+  isMobileLayout = checkMobileLayout();
+
+  if (isMobileLayout) {
+    setMobileView(currentMobileView);
+  } else {
+    document.body.classList.remove("mobile-view-list", "mobile-view-session");
+  }
+}
+
+function navigateBackToList(): void {
+  if (isMobileLayout) {
+    setMobileView("list");
+  }
+}
+
+function toggleMobileMenu(): void {
+  const menu = document.getElementById("mobile-user-menu");
+  if (menu) {
+    menu.classList.toggle("visible");
+  }
+}
+
+function hideMobileMenu(): void {
+  const menu = document.getElementById("mobile-user-menu");
+  if (menu) {
+    menu.classList.remove("visible");
+  }
+}
+
+async function initMobileMenuInfo(): Promise<void> {
+  const serverUrlEl = document.getElementById("mobile-server-url");
+  const appVersionEl = document.getElementById("mobile-app-version");
+
+  if (appVersionEl) {
+    try {
+      const version = await getVersion();
+      appVersionEl.textContent = version;
+    } catch {
+      appVersionEl.textContent = "Unknown";
+    }
+  }
+
+  if (serverUrlEl) {
+    serverUrlEl.textContent = window.location.host || "localhost:3857";
+  }
+}
+
 async function switchToSession(sessionId: string) {
   // Hide current session UI
   if (activeSessionId) {
@@ -1329,6 +1470,11 @@ async function switchToSession(sessionId: string) {
   activeSessionId = sessionId;
   const session = sessions.get(sessionId);
   if (!session) return;
+
+  // Switch to session view on mobile
+  if (isMobileLayout) {
+    setMobileView("session");
+  }
 
   // Handle JSON (chat) sessions differently
   if (isJsonAgent(session.agentType)) {
@@ -2011,6 +2157,9 @@ function updateView() {
     const el = wrapper as HTMLElement;
     el.style.display = el.dataset.sessionId === activeSessionId ? "block" : "none";
   });
+
+  // Update mobile header
+  updateMobileHeader();
 }
 
 /**
@@ -2387,8 +2536,15 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
     return;
   }
 
+  // Check if at bottom before appending (for smart scroll)
+  const wasAtBottom = isChatAtBottom(chatSession.messagesEl);
+
   chatSession.messagesEl.appendChild(messageEl);
-  chatSession.messagesEl.scrollTop = chatSession.messagesEl.scrollHeight;
+
+  // Only auto-scroll if was already at bottom (or user message)
+  if (wasAtBottom || message.type === "user") {
+    chatSession.messagesEl.scrollTop = chatSession.messagesEl.scrollHeight;
+  }
 
   // Save messages when user sends a message
   if (message.type === "user") {
@@ -2492,7 +2648,19 @@ function showChatSession(sessionId: string) {
     chatContainerEl.style.display = "flex";
     terminalContainerEl.style.display = "none";
     chatSession.inputEl.focus();
+    // Scroll to bottom when opening session
+    setTimeout(() => {
+      chatSession.messagesEl.scrollTop = chatSession.messagesEl.scrollHeight;
+    }, 50);
   }
+}
+
+/**
+ * Check if chat is scrolled to bottom (within threshold)
+ */
+function isChatAtBottom(messagesEl: HTMLElement): boolean {
+  const threshold = 50; // pixels from bottom to consider "at bottom"
+  return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < threshold;
 }
 
 function escapeHtml(text: string): string {
@@ -2594,7 +2762,7 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
   }
 
   chatSession.messagesEl.appendChild(messageEl);
-  chatSession.messagesEl.scrollTop = chatSession.messagesEl.scrollHeight;
+  // Note: Caller should handle scrolling (showChatSession scrolls to bottom when opening)
 }
 
 // Terminal buffer persistence functions
@@ -2666,6 +2834,7 @@ function showSettingsModal(): void {
   settingsBounceDockCheckbox.checked = appSettings.bounce_dock_on_bell ?? true;
   settingsReadAloudCheckbox.checked = appSettings.read_aloud_enabled ?? false;
   settingsRendererSelect.value = appSettings.renderer || "webgl";
+  settingsRemotePinInput.value = appSettings.remote_pin || "";
   settingsModal.classList.add("visible");
 }
 
@@ -2685,6 +2854,7 @@ async function saveSettings(): Promise<void> {
     bounce_dock_on_bell: settingsBounceDockCheckbox.checked,
     read_aloud_enabled: settingsReadAloudCheckbox.checked,
     renderer: settingsRendererSelect.value as "webgl" | "dom",
+    remote_pin: settingsRemotePinInput.value || null,
   };
 
   try {

@@ -9,6 +9,37 @@
   </head>
   <body>
     <div id="app">
+      <!-- Mobile Header (hidden on desktop) -->
+      <div id="mobile-header">
+        <button id="mobile-back-btn" class="mobile-header-btn" aria-label="Back to sessions">
+          <span class="back-icon">&#8592;</span>
+        </button>
+        <div id="mobile-header-title">
+          <span id="mobile-session-name">Sessions</span>
+          <span id="mobile-session-status" class="status-dot"></span>
+        </div>
+        <button id="mobile-menu-btn" class="mobile-header-btn" aria-label="User menu">
+          <span class="menu-icon">&#8942;</span>
+        </button>
+      </div>
+
+      <!-- Mobile User Menu -->
+      <div id="mobile-user-menu">
+        <div class="mobile-menu-section">
+          <div class="mobile-menu-info">
+            <span class="info-label">Server</span>
+            <span id="mobile-server-url" class="info-value">--</span>
+          </div>
+          <div class="mobile-menu-info">
+            <span class="info-label">App Version</span>
+            <span id="mobile-app-version" class="info-value">--</span>
+          </div>
+        </div>
+        <div class="mobile-menu-divider"></div>
+        <button id="mobile-settings-btn" class="mobile-menu-item">Settings</button>
+        <button id="mobile-logout-btn" class="mobile-menu-item danger">Disconnect</button>
+      </div>
+
       <!-- Sidebar -->
       <div id="sidebar">
         <div id="sidebar-header">
@@ -193,6 +224,15 @@
               Read responses aloud
             </label>
             <p class="form-hint">Use text-to-speech to read agent responses automatically.</p>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <h3>Remote Access</h3>
+          <div class="form-group">
+            <label for="settings-remote-pin">Remote Access PIN</label>
+            <input type="password" id="settings-remote-pin" placeholder="Leave empty to disable" autocomplete="off" />
+            <p class="form-hint">Set a PIN to access Agent Hub remotely without being at your computer. Leave empty to require pairing codes only.</p>
           </div>
         </div>
 

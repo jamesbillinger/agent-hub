@@ -96,6 +96,10 @@ static PAIRED_DEVICES: Lazy<Mutex<HashMap<String, PairedDevice>>> =
 static MCP_HTTP_RESULTS: Lazy<Mutex<HashMap<String, Option<String>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+// PIN authentication: Rate limiting (IP -> (attempts, last_attempt_time))
+static PIN_RATE_LIMIT: Lazy<Mutex<HashMap<String, (u32, std::time::Instant)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PairingRequest {
     code: String,
@@ -142,6 +146,8 @@ struct AppSettings {
     read_aloud_enabled: bool,
     #[serde(default = "default_renderer")]
     renderer: String,
+    #[serde(default)]
+    remote_pin: Option<String>,
 }
 
 fn default_renderer() -> String {
@@ -165,6 +171,7 @@ impl Default for AppSettings {
             bounce_dock_on_bell: true,
             read_aloud_enabled: false,
             renderer: "webgl".to_string(),
+            remote_pin: None,
         }
     }
 }
@@ -770,6 +777,7 @@ fn spawn_json_process(
     resume_session: Option<bool>,
 ) -> Result<(), String> {
     use std::process::Stdio;
+    use std::sync::mpsc;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::process::Command;
 
@@ -791,6 +799,9 @@ fn spawn_json_process(
     // Create channel for stdin
     let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<String>(100);
 
+    // Create channel to signal when process is ready (registered in JSON_PROCESSES)
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+
     let session_id_clone = session_id.clone();
     let app_clone = app.clone();
 
@@ -804,6 +815,7 @@ fn spawn_json_process(
                     "session_id": session_id_clone,
                     "error": "Empty command"
                 }));
+                let _ = ready_tx.send(Err("Empty command".to_string()));
                 return;
             }
 
@@ -823,10 +835,12 @@ fn spawn_json_process(
             {
                 Ok(c) => c,
                 Err(e) => {
+                    let err_msg = format!("Failed to spawn process: {}", e);
                     let _ = app_clone.emit("json-process-error", serde_json::json!({
                         "session_id": session_id_clone,
-                        "error": format!("Failed to spawn process: {}", e)
+                        "error": &err_msg
                     }));
+                    let _ = ready_tx.send(Err(err_msg));
                     return;
                 }
             };
@@ -853,6 +867,9 @@ fn spawn_json_process(
                 let mut broadcasters = JSON_BROADCASTERS.lock();
                 broadcasters.insert(session_id_clone.clone(), broadcast_tx.clone());
             }
+
+            // Signal that process is ready - WebSocket connections can now find it
+            let _ = ready_tx.send(Ok(()));
 
             // Notify that process started
             let _ = app_clone.emit("json-process-started", serde_json::json!({
@@ -938,7 +955,14 @@ fn spawn_json_process(
         });
     });
 
-    Ok(())
+    // Wait for the process to be ready (registered in JSON_PROCESSES)
+    // This ensures WebSocket connections can find the session immediately
+    // Timeout after 10 seconds to avoid blocking forever
+    match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("Timeout waiting for process to start".to_string()),
+    }
 }
 
 /// Write data to a JSON process stdin
@@ -1657,6 +1681,41 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
     #pairing-screen button:disabled { background: #555; }
     #pairing-screen .error { color: #f14c4c; margin-top: 12px; }
 
+    /* Auth Tabs */
+    #auth-tabs {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 20px;
+    }
+    .auth-tab {
+      flex: 1;
+      padding: 10px;
+      background: #3c3c3c;
+      border: 1px solid #5a5a5a;
+      border-radius: 8px;
+      color: #808080;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .auth-tab.active {
+      background: #0e639c;
+      border-color: #1177bb;
+      color: white;
+    }
+    #pin-auth input, #pairing-auth input {
+      width: 100%;
+      padding: 16px;
+      font-size: 24px;
+      text-align: center;
+      letter-spacing: 8px;
+      background: #3c3c3c;
+      border: 1px solid #5a5a5a;
+      border-radius: 8px;
+      color: #e6e6e6;
+      margin-bottom: 16px;
+    }
+    #pin-auth input { letter-spacing: 2px; }
+
     /* New Session Modal */
     .modal-overlay {
       display: none;
@@ -1714,11 +1773,25 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
 <body>
   <!-- Pairing Screen -->
   <div id="pairing-screen">
-    <h2>Pair Device</h2>
-    <p id="pairing-status">Enter the code shown on your desktop</p>
-    <input type="text" id="pairing-code" maxlength="6" placeholder="000000" autocomplete="off" inputmode="numeric">
-    <button id="pairing-submit">Pair</button>
-    <p class="error" id="pairing-error"></p>
+    <h2>Connect to Agent Hub</h2>
+    <div id="auth-tabs" style="display:none;">
+      <button class="auth-tab active" data-tab="pin">PIN</button>
+      <button class="auth-tab" data-tab="pairing">Pairing Code</button>
+    </div>
+    <!-- PIN Auth -->
+    <div id="pin-auth" style="display:none;">
+      <p id="pin-status">Enter your remote access PIN</p>
+      <input type="password" id="pin-input" maxlength="20" placeholder="PIN" autocomplete="off" inputmode="numeric">
+      <button id="pin-submit">Connect</button>
+      <p class="error" id="pin-error"></p>
+    </div>
+    <!-- Pairing Code Auth (existing) -->
+    <div id="pairing-auth">
+      <p id="pairing-status">Enter the code shown on your desktop</p>
+      <input type="text" id="pairing-code" maxlength="6" placeholder="000000" autocomplete="off" inputmode="numeric">
+      <button id="pairing-submit">Pair</button>
+      <p class="error" id="pairing-error"></p>
+    </div>
   </div>
 
   <!-- New Session Modal -->
@@ -1907,9 +1980,15 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
 
     // Check auth on load
     async function checkAuth() {
+      // First check if PIN is configured
+      await checkPinStatus();
+
       if (!getToken()) {
         showPairingScreen();
-        requestPairing();
+        // Only auto-request pairing if PIN is not configured
+        if (!pinConfigured) {
+          requestPairing();
+        }
         return;
       }
 
@@ -1923,13 +2002,96 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         } else {
           localStorage.removeItem('agent_hub_token');
           showPairingScreen();
-          requestPairing();
+          if (!pinConfigured) {
+            requestPairing();
+          }
         }
       } catch (e) {
         showPairingScreen();
-        requestPairing();
+        if (!pinConfigured) {
+          requestPairing();
+        }
       }
     }
+
+    // PIN authentication
+    let pinConfigured = false;
+
+    async function checkPinStatus() {
+      try {
+        const res = await fetch('/api/auth/pin-status');
+        const data = await res.json();
+        pinConfigured = data.pin_configured;
+        if (pinConfigured) {
+          document.getElementById('auth-tabs').style.display = 'flex';
+          document.getElementById('pin-auth').style.display = 'block';
+          document.getElementById('pairing-auth').style.display = 'none';
+        }
+      } catch (e) {
+        console.log('PIN status check failed');
+      }
+    }
+
+    function switchAuthTab(tab) {
+      document.querySelectorAll('.auth-tab').forEach(t => t.classList.remove('active'));
+      document.querySelector(`.auth-tab[data-tab="${tab}"]`).classList.add('active');
+
+      if (tab === 'pin') {
+        document.getElementById('pin-auth').style.display = 'block';
+        document.getElementById('pairing-auth').style.display = 'none';
+        document.getElementById('pin-input').focus();
+      } else {
+        document.getElementById('pin-auth').style.display = 'none';
+        document.getElementById('pairing-auth').style.display = 'block';
+        document.getElementById('pairing-code').focus();
+        if (!pairingId) requestPairing();
+      }
+    }
+
+    async function submitPin() {
+      const pin = document.getElementById('pin-input').value;
+      const btn = document.getElementById('pin-submit');
+      const error = document.getElementById('pin-error');
+
+      if (!pin) {
+        error.textContent = 'Please enter your PIN';
+        return;
+      }
+
+      btn.disabled = true;
+      btn.textContent = 'Connecting...';
+      error.textContent = '';
+
+      try {
+        const res = await fetch('/api/auth/pin-login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pin, device_name: 'Mobile Browser (PIN)' })
+        });
+        const data = await res.json();
+        if (data.token) {
+          setToken(data.token);
+          showMainApp();
+        } else {
+          error.textContent = data.message || 'Invalid PIN';
+        }
+      } catch (e) {
+        error.textContent = 'Failed to connect';
+      }
+      btn.disabled = false;
+      btn.textContent = 'Connect';
+    }
+
+    // Auth tab event listeners
+    document.querySelectorAll('.auth-tab').forEach(tab => {
+      tab.addEventListener('click', () => switchAuthTab(tab.dataset.tab));
+    });
+
+    // PIN event listeners
+    document.getElementById('pin-submit').addEventListener('click', submitPin);
+    document.getElementById('pin-input').addEventListener('keyup', (e) => {
+      if (e.key === 'Enter') submitPin();
+    });
 
     // Pairing event listeners
     document.getElementById('pairing-submit').addEventListener('click', submitPairing);
@@ -2460,7 +2622,6 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           const res = await authFetch(`/api/sessions/${currentSessionId}/start`, { method: 'POST' });
           const data = await res.json();
           if (data.status === 'started' || data.status === 'already_running') {
-            await new Promise(r => setTimeout(r, 100));
             await loadSessions();
             startBtn.style.display = 'none';
             // Use appropriate connection for session type
@@ -2726,6 +2887,116 @@ async fn api_pair(
     })).into_response()
 }
 
+// GET /api/auth/pin-status - Check if PIN authentication is available
+async fn api_pin_status() -> impl IntoResponse {
+    let settings = load_app_settings().unwrap_or_default();
+    let pin_configured = settings.remote_pin.is_some();
+
+    Json(serde_json::json!({
+        "pin_configured": pin_configured
+    }))
+}
+
+// POST /api/auth/pin-login - Authenticate with PIN
+async fn api_pin_login(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let client_ip = addr.ip().to_string();
+
+    // Rate limiting: 5 attempts per 15 minutes
+    {
+        let mut rate_limits = PIN_RATE_LIMIT.lock();
+        if let Some((attempts, last_time)) = rate_limits.get(&client_ip) {
+            let elapsed = last_time.elapsed();
+            if elapsed < std::time::Duration::from_secs(900) && *attempts >= 5 {
+                let remaining = 900 - elapsed.as_secs();
+                return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+                    "error": "rate_limited",
+                    "message": format!("Too many attempts. Try again in {} minutes.", remaining / 60 + 1)
+                }))).into_response();
+            }
+            // Reset if 15 minutes have passed
+            if elapsed >= std::time::Duration::from_secs(900) {
+                rate_limits.remove(&client_ip);
+            }
+        }
+    }
+
+    let pin = match body.get("pin").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "missing_pin",
+            "message": "PIN is required"
+        }))).into_response(),
+    };
+
+    let device_name = body.get("device_name").and_then(|v| v.as_str()).unwrap_or("Mobile Device (PIN)");
+
+    // Load settings and check PIN
+    let settings = load_app_settings().unwrap_or_default();
+    let valid = match &settings.remote_pin {
+        Some(configured_pin) => configured_pin == pin,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "pin_not_configured",
+            "message": "PIN authentication is not configured"
+        }))).into_response(),
+    };
+
+    if !valid {
+        // Record failed attempt
+        {
+            let mut rate_limits = PIN_RATE_LIMIT.lock();
+            let entry = rate_limits.entry(client_ip).or_insert((0, std::time::Instant::now()));
+            entry.0 += 1;
+            entry.1 = std::time::Instant::now();
+        }
+
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "invalid_pin",
+            "message": "Invalid PIN"
+        }))).into_response();
+    }
+
+    // Clear rate limit on success
+    {
+        let mut rate_limits = PIN_RATE_LIMIT.lock();
+        rate_limits.remove(&addr.ip().to_string());
+    }
+
+    // Generate token and store device
+    let token = generate_token();
+    let device_id = generate_token();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let device = PairedDevice {
+        id: device_id,
+        name: device_name.to_string(),
+        paired_at: now.clone(),
+        last_seen: now,
+    };
+
+    // Store in memory and database
+    {
+        let mut devices = PAIRED_DEVICES.lock();
+        devices.insert(token.clone(), device.clone());
+    }
+    let _ = save_paired_device(&token, &device);
+
+    // Notify desktop
+    if let Some(app) = APP_HANDLE.lock().as_ref() {
+        let _ = app.emit("device-paired", serde_json::json!({
+            "device": device,
+            "method": "pin"
+        }));
+    }
+
+    Json(serde_json::json!({
+        "token": token,
+        "device_id": device.id
+    })).into_response()
+}
+
 // GET /api/auth/check - Check if current token is valid
 async fn api_auth_check(
     headers: axum::http::HeaderMap,
@@ -2837,6 +3108,7 @@ async fn api_create_session(
     // Determine command based on agent type
     let command = match agent_type {
         "claude" => "claude --dangerously-skip-permissions".to_string(),
+        "claude-json" => "claude --print --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions".to_string(),
         "aider" => "aider".to_string(),
         "shell" => std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string()),
         "custom" => custom_command.clone().unwrap_or_else(|| "/bin/zsh".to_string()),
@@ -2849,6 +3121,7 @@ async fn api_create_session(
         let count = load_sessions().map(|s| s.len()).unwrap_or(0);
         let agent_label = match agent_type {
             "claude" => "Claude",
+            "claude-json" => "Claude Chat",
             "aider" => "Aider",
             "shell" => "Shell",
             "custom" => "Custom",
@@ -3277,6 +3550,8 @@ fn start_web_server() {
                 .route("/api/auth/check", get(api_auth_check))
                 .route("/api/auth/request-pairing", axum::routing::post(api_request_pairing))
                 .route("/api/auth/pair", axum::routing::post(api_pair))
+                .route("/api/auth/pin-status", get(api_pin_status))
+                .route("/api/auth/pin-login", axum::routing::post(api_pin_login))
                 // Protected endpoints
                 .route("/api/sessions", get(api_list_sessions).post(api_create_session))
                 .route("/api/sessions/:session_id/buffer", get(api_get_buffer))
@@ -3350,6 +3625,8 @@ fn start_web_server() {
                 .route("/api/auth/check", get(api_auth_check))
                 .route("/api/auth/request-pairing", axum::routing::post(api_request_pairing))
                 .route("/api/auth/pair", axum::routing::post(api_pair))
+                .route("/api/auth/pin-status", get(api_pin_status))
+                .route("/api/auth/pin-login", axum::routing::post(api_pin_login))
                 // Protected endpoints - PTY start and WebSocket will return errors on iOS
                 .route("/api/sessions", get(api_list_sessions).post(api_create_session))
                 .route("/api/sessions/:session_id/buffer", get(api_get_buffer))

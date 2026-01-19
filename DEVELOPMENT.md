@@ -4,15 +4,15 @@
 
 Agent Hub is a Tauri desktop application for managing AI coding agent sessions. It supports multiple interfaces:
 - **Desktop App** - Native macOS application with terminal and chat UI
-- **Mobile Web** - Browser-based interface accessible from mobile devices
-- **iOS App** - Native iOS app (in development)
+- **Mobile Web** - Browser-based interface accessible from mobile devices (port 3857)
+- **Mobile App (Expo)** - Native iOS/Android app in the `mobile/` directory
 
 ## Prerequisites
 
 - Node.js 20+
 - Rust (latest stable)
 - npm or bun
-- Xcode (for iOS builds)
+- For mobile app: Expo CLI (`npm install -g expo-cli`)
 
 ## Development Setup
 
@@ -30,48 +30,37 @@ The dev server runs at:
 
 ## Building Releases
 
-### Version Bumping
-
-All version files must stay in sync:
-- `package.json`
-- `src-tauri/tauri.conf.json`
-- `src-tauri/Cargo.toml`
-
-Use the release script to bump versions:
+### Quick Release (Recommended)
 
 ```bash
-# Bump patch version (0.1.2 -> 0.1.3)
-npm run release patch
-
-# Bump minor version (0.1.2 -> 0.2.0)
-npm run release minor
-
-# Set specific version
-npm run release 1.0.0
+npm run release
 ```
 
-The script will:
-1. Update all version files
-2. Commit the changes
-3. Create a release branch
-4. Push to origin
+This single command:
+1. Auto-bumps the patch version (e.g., 0.1.5 → 0.1.6)
+2. Updates all version files (package.json, tauri.conf.json, Cargo.toml)
+3. Builds the release
+4. Kills any running Agent Hub instance
+5. Installs to `/Applications/Agent Hub.app`
 
-### Manual Release Build
+The DMG is also available at `src-tauri/target/release/bundle/dmg/`
+
+### Manual Build (without version bump)
 
 ```bash
-# Build release
+# Build only (keeps current version)
 npm run tauri build
 
-# Output locations:
-# - App: src-tauri/target/release/bundle/macos/Agent Hub.app
-# - DMG: src-tauri/target/release/bundle/dmg/Agent Hub_X.Y.Z_aarch64.dmg
+# Then manually install
+ditto "src-tauri/target/release/bundle/macos/Agent Hub.app" /Applications/"Agent Hub.app"
 ```
 
-### Installing Release
+### Cleaning Build Artifacts
+
+The `src-tauri/target/` folder can grow large (10-30GB). To clean:
 
 ```bash
-# Copy to Applications
-ditto "src-tauri/target/release/bundle/macos/Agent Hub.app" /Applications/"Agent Hub.app"
+cd src-tauri && cargo clean
 ```
 
 ## Testing
@@ -103,21 +92,37 @@ Mobile web features:
 - Create new sessions (Claude, Claude (xterm), Aider, Shell)
 - Chat interface for JSON sessions
 
-### iOS App Testing
+### Mobile App (Expo) Development
 
-For iOS simulator testing, consider using [ios-simulator-mcp](https://github.com/joshuayoes/ios-simulator-mcp):
+The mobile app is a standalone Expo React Native app in the `mobile/` directory.
 
 ```bash
-# Install
-npm install -g ios-simulator-mcp
+cd mobile
 
-# Use with Claude Code to automate iOS testing
+# Install dependencies
+npm install
+
+# Start Expo development server
+npm start
+
+# Or run directly in iOS simulator
+npm run ios
 ```
 
-iOS build (requires Xcode):
-```bash
-npm run tauri ios build
-```
+**Key mobile app features:**
+- Connect to Agent Hub desktop via IP address or production URL
+- PIN authentication for quick reconnection
+- View and manage `claude-json` chat sessions
+- Create new sessions from mobile
+- Real-time sync with desktop via WebSocket
+
+**Mobile app structure:**
+- `mobile/app/` - Expo Router screens
+- `mobile/components/` - React Native components
+- `mobile/services/` - API client and WebSocket manager
+- `mobile/stores/` - Zustand state management
+
+For iOS simulator testing with Claude Code, use [ios-simulator-mcp](https://github.com/anthropics/ios-simulator-mcp).
 
 ## Architecture
 
@@ -133,11 +138,19 @@ npm run tauri ios build
 
 ### Key Files
 
+**Desktop App:**
 - `src/main.ts` - Frontend TypeScript (UI, session management)
 - `src/styles.css` - Styling
-- `src-tauri/src/lib.rs` - Rust backend (PTY, JSON process, web server)
+- `src-tauri/src/lib.rs` - Rust backend (PTY, JSON process, web server, auth)
 - `src-tauri/src/mcp.rs` - MCP server implementation
 - `index.html` - Main HTML structure
+
+**Mobile App (Expo):**
+- `mobile/app/` - Expo Router screens and layouts
+- `mobile/components/chat/` - Chat UI components (ChatView, MessageList, ChatInput)
+- `mobile/services/api.ts` - REST API client
+- `mobile/services/websocket.ts` - WebSocket connection manager
+- `mobile/stores/` - Zustand stores (auth, sessions, settings)
 
 ### JSON Session Data
 
@@ -188,6 +201,19 @@ For terminal (xterm) Claude sessions, the app automatically detects Claude's ses
 
 **Known limitation:** If you use `/resume` within an existing xterm session to switch to a different Claude session, Agent Hub will not detect the new session ID. The stored ID only updates when the PTY session is first spawned. JSON sessions don't have this limitation—they update the session ID from each `init` message.
 
+### Remote Authentication
+
+The backend supports two authentication methods for mobile/remote access:
+
+1. **QR Code Pairing** - Scan a QR code displayed in the desktop app to pair a device
+2. **PIN Authentication** - Set a PIN in Settings for quick reconnection (rate-limited)
+
+Authentication flow:
+1. Mobile app connects to desktop's IP:3857
+2. If PIN is configured, enter PIN to authenticate
+3. Otherwise, request pairing and scan QR code from desktop
+4. Token is stored for subsequent connections
+
 ## Troubleshooting
 
 ### "No such file or directory" when spawning Claude
@@ -198,11 +224,21 @@ The release build needs to source shell profiles to find `claude` in PATH. The a
 
 Check that `claudeSessionId` is being detected and saved. For JSON sessions, this comes from the `init` message. For terminal sessions, it's detected by scanning the projects folder.
 
-### Mobile web not connecting
+### Mobile web/app not connecting
 
 1. Ensure desktop app is running
-2. Check that port 3857 is accessible
-3. Pair devices if prompted
+2. Check that port 3857 is accessible (try `curl http://localhost:3857/api/auth/check`)
+3. Verify the IP address is correct (network may have changed)
+4. Pair devices or enter PIN if prompted
+
+### Mobile app shows "Claude is thinking" indefinitely
+
+This usually means the session command is incorrect. For `claude-json` sessions, the command must include JSON streaming flags:
+```
+claude --print --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions
+```
+
+If an existing session has the wrong command, update it in the database or create a new session.
 
 ## Contributing
 
