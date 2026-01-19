@@ -122,9 +122,9 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   checkPinStatus: async () => {
     try {
-      const { enabled } = await apiClient.getPinStatus();
-      set({ pinEnabled: enabled });
-      return enabled;
+      const { pin_configured } = await apiClient.getPinStatus();
+      set({ pinEnabled: pin_configured });
+      return pin_configured;
     } catch (error) {
       console.error('Pin status check error:', error);
       set({ pinEnabled: false });

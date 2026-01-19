@@ -3602,7 +3602,7 @@ fn start_web_server() {
             }
 
             println!("Web server listening on http://0.0.0.0:{}", bound_port);
-            axum::serve(listener, app).await.unwrap();
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
         });
     });
 }
@@ -3674,7 +3674,7 @@ fn start_web_server() {
             }
 
             println!("Web server listening on http://0.0.0.0:{}", bound_port);
-            axum::serve(listener, app).await.unwrap();
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
         });
     });
 }

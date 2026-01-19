@@ -7,7 +7,7 @@ export interface PairingResponse {
 }
 
 export interface PinStatusResponse {
-  enabled: boolean;
+  pin_configured: boolean;
 }
 
 export interface PinLoginResponse {
