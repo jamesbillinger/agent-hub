@@ -1,19 +1,27 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalPosition, LogicalSize, type Theme } from "@tauri-apps/api/window";
+import { getVersion } from "@tauri-apps/api/app";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { marked } from "marked";
 import "@xterm/xterm/css/xterm.css";
+
+// Configure marked for safe rendering
+marked.setOptions({
+  breaks: true, // Convert \n to <br>
+  gfm: true,    // GitHub Flavored Markdown
+});
 
 // Types
 interface Session {
   id: string;
   name: string;
-  agentType: "claude" | "codex" | "aider" | "shell" | "custom";
+  agentType: "claude" | "claude-json" | "codex" | "aider" | "shell" | "custom";
   command: string;
   workingDir: string;
   createdAt: Date;
@@ -46,6 +54,54 @@ interface PtyOutput {
   data: string;
 }
 
+// JSON streaming message types from Claude
+interface ClaudeJsonMessage {
+  type: "system" | "user" | "assistant" | "result";
+  subtype?: "init" | "success" | "error";
+  session_id?: string;
+  message?: {
+    id: string;
+    type: string;
+    role: string;
+    content: Array<{ type: string; text?: string; name?: string; input?: unknown }>;
+    stop_reason?: string | null;
+    usage?: {
+      input_tokens?: number;
+      output_tokens?: number;
+      cache_creation_input_tokens?: number;
+      cache_read_input_tokens?: number;
+    };
+  };
+  result?: string;
+  is_error?: boolean;
+  duration_ms?: number;
+  duration_api_ms?: number;
+  total_cost_usd?: number;
+  total_input_tokens?: number;
+  total_output_tokens?: number;
+  // Init message fields
+  cwd?: string;
+  tools?: string[];
+  model?: string;
+  claude_code_version?: string;
+}
+
+// Chat UI state for JSON sessions
+interface ChatSession {
+  messagesEl: HTMLElement;
+  inputEl: HTMLTextAreaElement;
+  sendBtn: HTMLButtonElement;
+  statusEl: HTMLElement;
+  containerEl: HTMLElement;
+  messages: ClaudeJsonMessage[];
+  isProcessing: boolean;
+  inputBuffer: string; // Buffer for partial JSON lines
+  // Streaming stats
+  toolUseCount: number;
+  streamingTokens: number;
+  startTime: number | null;
+}
+
 interface WindowState {
   width?: number;
   height?: number;
@@ -69,6 +125,7 @@ interface AppSettings {
 
 // State
 const sessions: Map<string, Session> = new Map();
+const chatSessions: Map<string, ChatSession> = new Map();
 let activeSessionId: string | null = null;
 let searchQuery = "";
 let currentSort: SortOption = "custom";
@@ -94,6 +151,7 @@ let isResizingSidebar = false;
 // Agent commands
 const AGENT_COMMANDS: Record<string, string> = {
   claude: "claude --dangerously-skip-permissions",
+  "claude-json": "claude --print --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions",
   codex: "codex --full-auto",
   aider: "aider",
   shell: "$SHELL",
@@ -358,6 +416,7 @@ function getPtyDimensions(terminalCols: number, terminalRows: number): { cols: n
 // DOM Elements
 let sessionListEl: HTMLElement;
 let terminalContainerEl: HTMLElement;
+let chatContainerEl: HTMLElement;
 let emptyStateEl: HTMLElement;
 let newSessionModal: HTMLElement;
 let sessionNameInput: HTMLInputElement;
@@ -385,6 +444,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Get DOM elements
   sessionListEl = document.getElementById("session-list")!;
   terminalContainerEl = document.getElementById("terminal-container")!;
+  chatContainerEl = document.getElementById("chat-container")!;
   emptyStateEl = document.getElementById("empty-state")!;
   newSessionModal = document.getElementById("new-session-modal")!;
   sessionNameInput = document.getElementById("session-name") as HTMLInputElement;
@@ -583,6 +643,86 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   });
 
+  // Listen for Claude session ID detection (for PTY/terminal sessions)
+  // The backend scans ~/.claude/projects/ after starting Claude to find the actual session ID
+  await listen<{ session_id: string; claude_session_id: string }>("claude-session-detected", async (event) => {
+    const { session_id, claude_session_id } = event.payload;
+    const session = sessions.get(session_id);
+    if (session && session.agentType === "claude") {
+      console.log(`[Claude Session Detected] session=${session_id}, claude_id=${claude_session_id}`);
+      session.claudeSessionId = claude_session_id;
+      session.hasBeenStarted = true;
+      // DB is already updated by backend, but we keep the local state in sync
+    }
+  });
+
+  // JSON process event listeners (for claude-json sessions)
+  await listen<{ session_id: string; data: string }>("json-process-output", (event) => {
+    const { session_id, data } = event.payload;
+    processChatOutput(session_id, data);
+  });
+
+  await listen<{ session_id: string }>("json-process-started", (event) => {
+    const session = sessions.get(event.payload.session_id);
+    if (session) {
+      session.isRunning = true;
+      const chatSession = chatSessions.get(event.payload.session_id);
+      if (chatSession) {
+        chatSession.statusEl.textContent = "Connected";
+        chatSession.statusEl.className = "chat-status connected";
+      }
+      renderSessionList();
+      updateStartBanner();
+    }
+  });
+
+  await listen<{ session_id: string; exit_code?: number }>("json-process-exit", async (event) => {
+    const session = sessions.get(event.payload.session_id);
+    if (session) {
+      session.isRunning = false;
+      const chatSession = chatSessions.get(event.payload.session_id);
+      if (chatSession) {
+        chatSession.statusEl.textContent = `Process exited (${event.payload.exit_code ?? "unknown"})`;
+        chatSession.statusEl.className = "chat-status";
+        chatSession.isProcessing = false;
+        chatSession.sendBtn.disabled = false;
+        const thinkingEl = chatSession.containerEl.querySelector(".chat-thinking") as HTMLElement;
+        if (thinkingEl) thinkingEl.style.display = "none";
+      }
+      renderSessionList();
+      updateStartBanner();
+
+      // Send notification if enabled and window is not focused
+      if (appSettings.notifications_enabled) {
+        try {
+          const win = getCurrentWindow();
+          const isFocused = await win.isFocused();
+          if (!isFocused) {
+            await showNotification(
+              "Process Completed",
+              `Chat session "${session.name}" has exited`
+            );
+          }
+        } catch (err) {
+          console.error("Failed to check focus or send notification:", err);
+        }
+      }
+    }
+  });
+
+  await listen<{ session_id: string; error: string }>("json-process-error", (event) => {
+    const chatSession = chatSessions.get(event.payload.session_id);
+    if (chatSession) {
+      chatSession.statusEl.textContent = `Error: ${event.payload.error}`;
+      chatSession.statusEl.className = "chat-status error";
+      addChatMessage(event.payload.session_id, {
+        type: "system",
+        subtype: "error",
+        result: event.payload.error,
+      });
+    }
+  });
+
   // Listen for remote client disconnect (restore desktop terminal size)
   await listen<string>("remote-client-disconnected", async (event) => {
     const sessionId = event.payload;
@@ -700,6 +840,33 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Listen for successful pairing (hide modal)
   await listen("device-paired", () => {
     hidePairingModal();
+  });
+
+  // Listen for MCP execute requests from the HTTP API
+  await listen<{ request_id: string; code: string }>("mcp-execute", async (event) => {
+    const { request_id, code } = event.payload;
+    let result: unknown;
+    try {
+      // Execute the JS code
+      const fn = new Function(code);
+      result = await fn();
+    } catch (e) {
+      result = { error: e instanceof Error ? e.message : String(e) };
+    }
+    // Send result back via HTTP
+    try {
+      const port = 3857; // TODO: get dynamically if needed
+      await fetch(`http://localhost:${port}/api/mcp/result`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          request_id,
+          result: typeof result === "string" ? result : JSON.stringify(result),
+        }),
+      });
+    } catch (e) {
+      console.error("Failed to send MCP result:", e);
+    }
   });
 
   // Pairing modal dismiss button
@@ -982,9 +1149,9 @@ async function createQuickSession() {
 
   const session: Session = {
     id: crypto.randomUUID(),
-    name: `Session ${sessions.size + 1}`,
-    agentType: "claude",
-    command: AGENT_COMMANDS.claude,
+    name: `Claude ${sessions.size + 1}`,
+    agentType: "claude-json",
+    command: AGENT_COMMANDS["claude-json"],
     workingDir: DEFAULT_WORKING_DIR,
     createdAt: new Date(),
     isRunning: false,
@@ -1005,8 +1172,8 @@ async function createQuickSession() {
 async function createQuickSessionWithAgent(agentType: Session["agentType"]) {
   const minSortOrder = Math.min(0, ...Array.from(sessions.values()).map(s => s.sortOrder));
 
-  // Generate a Claude session ID only for Claude sessions
-  const claudeSessionId = agentType === "claude" ? crypto.randomUUID() : undefined;
+  // Generate a Claude session ID for Claude sessions (both xterm and JSON)
+  const claudeSessionId = (agentType === "claude" || agentType === "claude-json") ? crypto.randomUUID() : undefined;
 
   const agentLabel = getAgentLabel(agentType);
   const session: Session = {
@@ -1142,11 +1309,20 @@ async function saveSessionFromModal() {
 }
 
 async function switchToSession(sessionId: string) {
-  // Hide current terminal if any
+  // Hide current session UI
   if (activeSessionId) {
     const currentSession = sessions.get(activeSessionId);
-    if (currentSession?.terminal) {
-      currentSession.terminal.element?.parentElement?.classList.add("hidden");
+    if (currentSession) {
+      if (isJsonAgent(currentSession.agentType)) {
+        // Hide chat session
+        const chatSession = chatSessions.get(activeSessionId);
+        if (chatSession) {
+          chatSession.containerEl.classList.remove("active");
+        }
+      } else if (currentSession.terminal) {
+        // Hide terminal
+        currentSession.terminal.element?.parentElement?.classList.add("hidden");
+      }
     }
   }
 
@@ -1154,6 +1330,20 @@ async function switchToSession(sessionId: string) {
   const session = sessions.get(sessionId);
   if (!session) return;
 
+  // Handle JSON (chat) sessions differently
+  if (isJsonAgent(session.agentType)) {
+    // Create or show chat UI
+    if (!chatSessions.has(sessionId)) {
+      await initializeChatView(session);
+    }
+    showChatSession(sessionId);
+    updateView();
+    updateStartBanner();
+    renderSessionList();
+    return;
+  }
+
+  // Terminal-based sessions
   // Create terminal view if it doesn't exist (but don't auto-start process)
   if (!session.terminal) {
     await initializeTerminalView(session);
@@ -1187,6 +1377,10 @@ async function switchToSession(sessionId: string) {
       }
     }, 50);
   }
+
+  // Hide chat container for terminal sessions
+  chatContainerEl.style.display = "none";
+  terminalContainerEl.style.display = "block";
 
   updateView();
   updateStartBanner();
@@ -1505,11 +1699,20 @@ function setupMobileTouchScroll(terminal: Terminal, wrapper: HTMLElement): void 
 }
 
 /**
- * Start the session process (spawn PTY).
+ * Start the session process (spawn PTY or JSON process).
  * Called when user explicitly starts a session or types in an inactive one.
  */
 async function startSessionProcess(session: Session) {
-  if (session.isRunning || !session.terminal) return;
+  if (session.isRunning) return;
+
+  // Handle JSON sessions differently
+  if (isJsonAgent(session.agentType)) {
+    await startJsonProcess(session);
+    return;
+  }
+
+  // Terminal-based sessions require terminal
+  if (!session.terminal) return;
 
   const terminal = session.terminal;
 
@@ -1536,18 +1739,62 @@ async function startSessionProcess(session: Session) {
   }
 }
 
+/**
+ * Start a JSON streaming process for chat-based sessions.
+ */
+async function startJsonProcess(session: Session) {
+  if (session.isRunning) return;
+
+  const chatSession = chatSessions.get(session.id);
+  if (!chatSession) return;
+
+  // For claude-json sessions, determine if we should resume
+  const shouldResume = session.hasBeenStarted === true && !!session.claudeSessionId;
+
+  chatSession.statusEl.textContent = "Starting...";
+  chatSession.statusEl.className = "chat-status";
+
+  try {
+    await invoke("spawn_json_process", {
+      sessionId: session.id,
+      command: session.command,
+      workingDir: session.workingDir || null,
+      claudeSessionId: session.claudeSessionId || null,
+      resumeSession: shouldResume,
+    });
+    // Note: isRunning will be set by the json-process-started event
+  } catch (err) {
+    chatSession.statusEl.textContent = `Error: ${err}`;
+    chatSession.statusEl.className = "chat-status error";
+    addChatMessage(session.id, {
+      type: "system",
+      subtype: "error",
+      result: `Failed to start process: ${err}`,
+    });
+  }
+}
+
 async function closeSession(sessionId: string) {
   const session = sessions.get(sessionId);
   if (!session) return;
 
-  // Kill PTY
-  invoke("kill_pty", { sessionId });
-
-  // Remove terminal DOM
-  const wrapper = terminalContainerEl.querySelector(`[data-session-id="${sessionId}"]`);
-  if (wrapper) {
-    session.terminal?.dispose();
-    wrapper.remove();
+  // Kill process (PTY or JSON)
+  if (isJsonAgent(session.agentType)) {
+    invoke("kill_json_process", { sessionId });
+    // Remove chat UI
+    const chatSession = chatSessions.get(sessionId);
+    if (chatSession) {
+      chatSession.containerEl.remove();
+      chatSessions.delete(sessionId);
+    }
+  } else {
+    invoke("kill_pty", { sessionId });
+    // Remove terminal DOM
+    const wrapper = terminalContainerEl.querySelector(`[data-session-id="${sessionId}"]`);
+    if (wrapper) {
+      session.terminal?.dispose();
+      wrapper.remove();
+    }
   }
 
   // Delete from database (including terminal buffer)
@@ -1768,6 +2015,7 @@ function updateView() {
 
 /**
  * Update the start banner visibility based on active session state.
+ * For chat sessions, uses the inline status instead of the global banner.
  */
 function updateStartBanner() {
   const startBanner = document.getElementById("start-session-banner");
@@ -1784,7 +2032,20 @@ function updateStartBanner() {
     return;
   }
 
-  // Show banner if session is not running
+  // For JSON chat sessions, use inline status instead of banner
+  if (isJsonAgent(session.agentType)) {
+    startBanner.style.display = "none";
+    const chatSession = chatSessions.get(activeSessionId);
+    if (chatSession && !session.isRunning) {
+      const statusText = session.hasBeenStarted ? "Session inactive" : "New session";
+      const actionText = session.hasBeenStarted ? "Press any key or click to resume" : "Press any key or click to start";
+      chatSession.statusEl.textContent = `${statusText} · ${actionText}`;
+      chatSession.statusEl.className = "chat-status inactive";
+    }
+    return;
+  }
+
+  // Show banner if session is not running (terminal sessions)
   if (!session.isRunning) {
     startBanner.style.display = "flex";
     const statusText = startBanner.querySelector(".banner-status");
@@ -1802,7 +2063,8 @@ function updateStartBanner() {
 
 function getAgentLabel(agentType: string): string {
   switch (agentType) {
-    case "claude": return "Claude";
+    case "claude": return "Claude (xterm)";
+    case "claude-json": return "Claude";
     case "aider": return "Aider";
     case "shell": return "Shell";
     case "custom": return "Custom";
@@ -1810,10 +2072,529 @@ function getAgentLabel(agentType: string): string {
   }
 }
 
+// Check if agent type uses JSON streaming (chat UI) vs terminal
+function isJsonAgent(agentType: string): boolean {
+  return agentType === "claude-json";
+}
+
+// ============================================
+// Chat UI Functions for JSON Sessions
+// ============================================
+
+/**
+ * Initialize chat UI for a JSON session
+ */
+async function initializeChatView(session: Session): Promise<ChatSession> {
+  // Create chat container for this session
+  const containerEl = document.createElement("div");
+  containerEl.className = "chat-session";
+  containerEl.dataset.sessionId = session.id;
+
+  containerEl.innerHTML = `
+    <div class="chat-messages"></div>
+    <div class="chat-thinking" style="display: none;">
+      <span>Claude is thinking</span>
+      <div class="dots">
+        <span class="dot"></span>
+        <span class="dot"></span>
+        <span class="dot"></span>
+      </div>
+    </div>
+    <div class="chat-input-container">
+      <textarea class="chat-input" placeholder="Type a message..." rows="1"></textarea>
+      <button class="chat-send-btn">Send</button>
+    </div>
+    <div class="chat-status">Ready</div>
+  `;
+
+  chatContainerEl.appendChild(containerEl);
+
+  const messagesEl = containerEl.querySelector(".chat-messages") as HTMLElement;
+  const inputEl = containerEl.querySelector(".chat-input") as HTMLTextAreaElement;
+  const sendBtn = containerEl.querySelector(".chat-send-btn") as HTMLButtonElement;
+  const statusEl = containerEl.querySelector(".chat-status") as HTMLElement;
+
+  const chatSession: ChatSession = {
+    messagesEl,
+    inputEl,
+    sendBtn,
+    statusEl,
+    containerEl,
+    messages: [],
+    isProcessing: false,
+    inputBuffer: "",
+    toolUseCount: 0,
+    streamingTokens: 0,
+    startTime: null,
+  };
+
+  // Auto-resize textarea
+  inputEl.addEventListener("input", () => {
+    inputEl.style.height = "auto";
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 150) + "px";
+  });
+
+  // Send on Enter (Shift+Enter for newline)
+  inputEl.addEventListener("keydown", (e) => {
+    // Start session if inactive and user types
+    const sess = sessions.get(session.id);
+    if (sess && !sess.isRunning && !e.ctrlKey && !e.metaKey && !e.altKey && e.key.length === 1) {
+      startSessionProcess(sess);
+    }
+
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendChatMessage(session.id);
+    }
+    // Ctrl+W to delete previous word
+    if (e.key === "w" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      const pos = inputEl.selectionStart || 0;
+      const text = inputEl.value;
+      // Find start of previous word
+      let wordStart = pos;
+      // Skip trailing spaces
+      while (wordStart > 0 && text[wordStart - 1] === " ") wordStart--;
+      // Skip word characters
+      while (wordStart > 0 && text[wordStart - 1] !== " ") wordStart--;
+      // Delete from wordStart to pos
+      inputEl.value = text.slice(0, wordStart) + text.slice(pos);
+      inputEl.selectionStart = inputEl.selectionEnd = wordStart;
+      inputEl.dispatchEvent(new Event("input")); // Trigger resize
+    }
+  });
+
+  // Send button click
+  sendBtn.addEventListener("click", () => sendChatMessage(session.id));
+
+  // Status click to start/resume inactive session
+  statusEl.addEventListener("click", () => {
+    const sess = sessions.get(session.id);
+    if (sess && !sess.isRunning && statusEl.classList.contains("inactive")) {
+      startSessionProcess(sess);
+    }
+  });
+
+  chatSessions.set(session.id, chatSession);
+
+  // Load existing messages if session has been used before
+  if (session.hasBeenStarted) {
+    await loadChatMessages(session.id, chatSession);
+  }
+
+  return chatSession;
+}
+
+/**
+ * Send a message in a chat session
+ */
+async function sendChatMessage(sessionId: string) {
+  const session = sessions.get(sessionId);
+  const chatSession = chatSessions.get(sessionId);
+  if (!session || !chatSession) return;
+
+  const message = chatSession.inputEl.value.trim();
+  if (!message || chatSession.isProcessing) return;
+
+  // Clear input
+  chatSession.inputEl.value = "";
+  chatSession.inputEl.style.height = "auto";
+
+  // Add user message to UI
+  addChatMessage(sessionId, { type: "user", result: message });
+
+  // Show thinking indicator and reset stats
+  chatSession.isProcessing = true;
+  chatSession.sendBtn.disabled = true;
+  chatSession.toolUseCount = 0;
+  chatSession.streamingTokens = 0;
+  chatSession.startTime = Date.now();
+  chatSession.statusEl.textContent = "Starting...";
+  chatSession.statusEl.className = "chat-status";
+  const thinkingEl = chatSession.containerEl.querySelector(".chat-thinking") as HTMLElement;
+  if (thinkingEl) thinkingEl.style.display = "flex";
+
+  // Start session if not running
+  if (!session.isRunning) {
+    try {
+      // Wait for the process-started event before continuing
+      const processReady = new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error("Process startup timed out"));
+        }, 30000); // 30 second timeout for slow startup
+
+        const unlisten = listen<{ session_id: string }>("json-process-started", (event) => {
+          if (event.payload.session_id === sessionId) {
+            clearTimeout(timeout);
+            unlisten.then(fn => fn());
+            resolve();
+          }
+        });
+
+        const unlistenError = listen<{ session_id: string; error: string }>("json-process-error", (event) => {
+          if (event.payload.session_id === sessionId) {
+            clearTimeout(timeout);
+            unlistenError.then(fn => fn());
+            reject(new Error(event.payload.error));
+          }
+        });
+      });
+
+      await startJsonProcess(session);
+      await processReady;
+    } catch (err) {
+      console.error("Failed to start session:", err);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      chatSession.statusEl.textContent = `Start failed: ${errMsg}`;
+      chatSession.statusEl.className = "chat-status error";
+      chatSession.isProcessing = false;
+      chatSession.sendBtn.disabled = false;
+      if (thinkingEl) thinkingEl.style.display = "none";
+      return;
+    }
+  }
+
+  chatSession.statusEl.textContent = "Thinking...";
+
+  // Send to process stdin as JSON
+  // Format: {"type":"user","message":{"role":"user","content":"..."}}
+  const jsonMessage = JSON.stringify({
+    type: "user",
+    message: {
+      role: "user",
+      content: message,
+    }
+  }) + "\n";
+
+  try {
+    await invoke("write_to_process", { sessionId, data: jsonMessage });
+  } catch (err) {
+    console.error("Failed to send message:", err);
+    const errMsg = err instanceof Error ? err.message : String(err);
+    chatSession.statusEl.textContent = `Send failed: ${errMsg}`;
+    chatSession.statusEl.className = "chat-status error";
+    chatSession.isProcessing = false;
+    chatSession.sendBtn.disabled = false;
+    if (thinkingEl) thinkingEl.style.display = "none";
+  }
+}
+
+/**
+ * Add a message to the chat UI
+ */
+function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
+  const chatSession = chatSessions.get(sessionId);
+  if (!chatSession) return;
+
+  chatSession.messages.push(message);
+
+  const messageEl = document.createElement("div");
+  messageEl.className = "chat-message";
+
+  if (message.type === "user") {
+    // Skip user messages with empty content (e.g., tool_result messages)
+    if (!message.result?.trim()) {
+      return;
+    }
+    messageEl.classList.add("user");
+    messageEl.textContent = message.result;
+  } else if (message.type === "assistant" && message.message?.content) {
+    messageEl.classList.add("assistant");
+    // Render assistant content and count tool uses
+    const content = message.message.content;
+    let html = "";
+    let hasToolUse = false;
+    for (const block of content) {
+      if (block.type === "text" && block.text) {
+        // Render markdown to HTML
+        const renderedMarkdown = marked.parse(block.text) as string;
+        html += `<div>${renderedMarkdown}</div>`;
+      } else if (block.type === "tool_use") {
+        hasToolUse = true;
+        chatSession.toolUseCount++;
+        messageEl.classList.remove("assistant");
+        messageEl.classList.add("tool-use");
+        html += `<div class="tool-name">${escapeHtml(block.name || "Tool")}</div>`;
+        if (block.input) {
+          html += `<pre><code>${escapeHtml(JSON.stringify(block.input, null, 2))}</code></pre>`;
+        }
+      }
+    }
+
+    // Add token usage details if available
+    const usage = message.message?.usage;
+    if (usage && !hasToolUse) {
+      const tokenParts: string[] = [];
+      if (usage.input_tokens) tokenParts.push(`in: ${usage.input_tokens}`);
+      if (usage.cache_read_input_tokens) tokenParts.push(`cache read: ${usage.cache_read_input_tokens}`);
+      if (usage.cache_creation_input_tokens) tokenParts.push(`cache write: ${usage.cache_creation_input_tokens}`);
+      if (usage.output_tokens) tokenParts.push(`out: ${usage.output_tokens}`);
+      if (tokenParts.length > 0) {
+        html += `<div class="token-usage">${tokenParts.join(" • ")}</div>`;
+      }
+    }
+
+    messageEl.innerHTML = html || "(empty response)";
+
+    // Update streaming status
+    if (chatSession.isProcessing && chatSession.startTime) {
+      const elapsed = Math.round((Date.now() - chatSession.startTime) / 1000);
+      const parts = ["Thinking..."];
+      if (chatSession.toolUseCount > 0) {
+        parts.push(`${chatSession.toolUseCount} tool${chatSession.toolUseCount > 1 ? "s" : ""}`);
+      }
+      parts.push(`${elapsed}s`);
+      chatSession.statusEl.textContent = parts.join(" · ");
+    }
+  } else if (message.type === "result") {
+    // Only show result messages if they're errors - normal results duplicate the assistant message
+    if (message.is_error && message.result) {
+      messageEl.classList.add("tool-result", "error");
+      messageEl.innerHTML = `<pre><code>${escapeHtml(message.result)}</code></pre>`;
+    } else {
+      // Skip rendering non-error results (they just duplicate assistant content)
+      return;
+    }
+  } else if (message.type === "system" && message.subtype === "init") {
+    messageEl.classList.add("system", "init-details");
+    // Build detailed init message
+    const details: string[] = [];
+    if (message.model) details.push(message.model);
+    if (message.cwd) details.push(message.cwd);
+
+    const meta: string[] = [];
+    if (message.permissionMode) meta.push(`permissions: ${message.permissionMode}`);
+    if (message.claude_code_version) meta.push(`CC v${message.claude_code_version}`);
+    if (message.session_id) meta.push(`session: ${message.session_id.slice(0, 8)}...`);
+
+    messageEl.innerHTML = `
+      <div class="init-header">Session initialized</div>
+      <div class="init-main">${details.join(" • ")}</div>
+      ${meta.length > 0 ? `<div class="init-meta">${meta.join(" • ")}</div>` : ""}
+    `;
+
+    // Capture session_id from init message
+    if (message.session_id) {
+      const session = sessions.get(sessionId);
+      if (session) {
+        session.claudeSessionId = message.session_id;
+        session.hasBeenStarted = true;
+        saveSessionToDb(session);
+      }
+    }
+  } else {
+    // Skip other message types for now
+    return;
+  }
+
+  chatSession.messagesEl.appendChild(messageEl);
+  chatSession.messagesEl.scrollTop = chatSession.messagesEl.scrollHeight;
+
+  // Save messages when user sends a message
+  if (message.type === "user") {
+    saveChatMessages(sessionId);
+  }
+}
+
+/**
+ * Process incoming JSON data for a chat session
+ */
+function processChatOutput(sessionId: string, data: string) {
+  const chatSession = chatSessions.get(sessionId);
+  if (!chatSession) return;
+
+  // Add to buffer and process complete lines
+  chatSession.inputBuffer += data;
+
+  const lines = chatSession.inputBuffer.split("\n");
+  // Keep last incomplete line in buffer
+  chatSession.inputBuffer = lines.pop() || "";
+
+  for (const line of lines) {
+    if (!line.trim()) continue;
+
+    try {
+      const message = JSON.parse(line) as ClaudeJsonMessage;
+      addChatMessage(sessionId, message);
+
+      // Check if response is complete
+      if (message.type === "result") {
+        chatSession.isProcessing = false;
+        chatSession.sendBtn.disabled = false;
+        const thinkingEl = chatSession.containerEl.querySelector(".chat-thinking") as HTMLElement;
+        if (thinkingEl) thinkingEl.style.display = "none";
+
+        // Update status with detailed usage info
+        const parts: string[] = ["Done"];
+
+        // Turns
+        if (message.num_turns && message.num_turns > 1) {
+          parts.push(`${message.num_turns} turns`);
+        }
+
+        // Tool uses
+        if (chatSession.toolUseCount > 0) {
+          parts.push(`${chatSession.toolUseCount} tool${chatSession.toolUseCount > 1 ? "s" : ""}`);
+        }
+
+        // Token breakdown from result
+        const usage = message.usage;
+        if (usage) {
+          const tokenDetails: string[] = [];
+          const totalIn = (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0);
+          if (totalIn > 0) tokenDetails.push(`${formatTokens(totalIn)} in`);
+          if (usage.output_tokens) tokenDetails.push(`${formatTokens(usage.output_tokens)} out`);
+          if (tokenDetails.length > 0) {
+            parts.push(tokenDetails.join("/"));
+          }
+        }
+
+        // Duration from API
+        if (message.duration_ms) {
+          const secs = (message.duration_ms / 1000).toFixed(1);
+          parts.push(`${secs}s`);
+        } else if (chatSession.startTime) {
+          const elapsed = Math.round((Date.now() - chatSession.startTime) / 1000);
+          parts.push(`${elapsed}s`);
+        }
+
+        // Cost
+        if (message.total_cost_usd && message.total_cost_usd > 0) {
+          parts.push(`$${message.total_cost_usd.toFixed(4)}`);
+        }
+
+        chatSession.statusEl.textContent = parts.join(" · ");
+        chatSession.statusEl.className = "chat-status connected";
+        chatSession.startTime = null;
+
+        // Save all messages when response is complete
+        saveChatMessages(sessionId);
+      }
+    } catch (err) {
+      console.warn("Failed to parse JSON line:", line, err);
+    }
+  }
+}
+
+/**
+ * Show chat session and hide terminal
+ */
+function showChatSession(sessionId: string) {
+  // Hide all chat sessions
+  chatContainerEl.querySelectorAll(".chat-session").forEach((el) => {
+    (el as HTMLElement).classList.remove("active");
+  });
+
+  // Show the active one
+  const chatSession = chatSessions.get(sessionId);
+  if (chatSession) {
+    chatSession.containerEl.classList.add("active");
+    chatContainerEl.style.display = "flex";
+    terminalContainerEl.style.display = "none";
+    chatSession.inputEl.focus();
+  }
+}
+
 function escapeHtml(text: string): string {
   const div = document.createElement("div");
   div.textContent = text;
   return div.innerHTML;
+}
+
+function formatTokens(tokens: number): string {
+  if (tokens >= 1000) {
+    return `${(tokens / 1000).toFixed(1)}k`;
+  }
+  return tokens.toString();
+}
+
+// Chat message persistence functions
+
+/**
+ * Save chat messages to the database (uses terminal_buffer table for storage)
+ */
+async function saveChatMessages(sessionId: string): Promise<void> {
+  const chatSession = chatSessions.get(sessionId);
+  if (!chatSession || chatSession.messages.length === 0) return;
+
+  try {
+    const bufferContent = JSON.stringify(chatSession.messages);
+    await invoke("save_terminal_buffer", {
+      sessionId,
+      bufferContent,
+    });
+  } catch (err) {
+    console.error("Failed to save chat messages:", err);
+  }
+}
+
+/**
+ * Load chat messages from the database and restore to UI
+ */
+async function loadChatMessages(sessionId: string, chatSession: ChatSession): Promise<void> {
+  try {
+    const bufferContent = await invoke<string | null>("load_terminal_buffer", { sessionId });
+    if (bufferContent) {
+      const messages = JSON.parse(bufferContent) as ClaudeJsonMessage[];
+      for (const msg of messages) {
+        chatSession.messages.push(msg);
+        renderChatMessage(chatSession, msg);
+      }
+    }
+  } catch (err) {
+    console.error("Failed to load chat messages:", err);
+  }
+}
+
+/**
+ * Render a single chat message to the UI (without adding to messages array)
+ */
+function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage): void {
+  const messageEl = document.createElement("div");
+  messageEl.className = "chat-message";
+
+  if (message.type === "user") {
+    // Skip user messages with empty content (e.g., tool_result messages)
+    if (!message.result?.trim()) {
+      return;
+    }
+    messageEl.classList.add("user");
+    messageEl.textContent = message.result;
+  } else if (message.type === "assistant" && message.message?.content) {
+    messageEl.classList.add("assistant");
+    const content = message.message.content;
+    let html = "";
+    for (const block of content) {
+      if (block.type === "text" && block.text) {
+        // Render markdown to HTML
+        const renderedMarkdown = marked.parse(block.text) as string;
+        html += `<div>${renderedMarkdown}</div>`;
+      } else if (block.type === "tool_use") {
+        messageEl.classList.remove("assistant");
+        messageEl.classList.add("tool-use");
+        html += `<div class="tool-name">${escapeHtml(block.name || "Tool")}</div>`;
+        if (block.input) {
+          html += `<pre><code>${escapeHtml(JSON.stringify(block.input, null, 2))}</code></pre>`;
+        }
+      }
+    }
+    messageEl.innerHTML = html || "(empty response)";
+  } else if (message.type === "result") {
+    if (message.is_error && message.result) {
+      messageEl.classList.add("tool-result", "error");
+      messageEl.innerHTML = `<pre><code>${escapeHtml(message.result)}</code></pre>`;
+    } else {
+      return; // Skip non-error results
+    }
+  } else if (message.type === "system" && message.subtype === "init") {
+    messageEl.classList.add("system");
+    messageEl.textContent = `Session started • ${message.model || "Claude"} • ${message.cwd || ""}`;
+  } else {
+    return; // Skip other message types
+  }
+
+  chatSession.messagesEl.appendChild(messageEl);
+  chatSession.messagesEl.scrollTop = chatSession.messagesEl.scrollHeight;
 }
 
 // Terminal buffer persistence functions
@@ -1920,7 +2701,17 @@ async function saveSettings(): Promise<void> {
 
 // About modal functions
 
-function showAboutModal(): void {
+async function showAboutModal(): Promise<void> {
+  // Update version dynamically from Tauri
+  try {
+    const version = await getVersion();
+    const versionEl = aboutModal.querySelector(".version");
+    if (versionEl) {
+      versionEl.textContent = `Version ${version}`;
+    }
+  } catch (err) {
+    console.warn("Failed to get app version:", err);
+  }
   aboutModal.classList.add("visible");
 }
 

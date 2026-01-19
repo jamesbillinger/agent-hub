@@ -37,6 +37,15 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 
+// MCP server module for Claude Code integration
+#[cfg(not(target_os = "ios"))]
+mod mcp;
+
+// Flag to track if MCP mode is enabled
+#[cfg(not(target_os = "ios"))]
+static MCP_MODE: Lazy<std::sync::atomic::AtomicBool> =
+    Lazy::new(|| std::sync::atomic::AtomicBool::new(false));
+
 #[cfg(not(target_os = "ios"))]
 struct PtySession {
     pair: PtyPair,
@@ -52,6 +61,23 @@ static PTY_SESSIONS: Lazy<Mutex<HashMap<String, Arc<Mutex<PtySession>>>>> =
 static PTY_BROADCASTERS: Lazy<Mutex<HashMap<String, broadcast::Sender<Vec<u8>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+// JSON process sessions (non-PTY, for streaming JSON communication)
+#[cfg(not(target_os = "ios"))]
+struct JsonProcess {
+    stdin: tokio::sync::mpsc::Sender<String>,
+    #[allow(dead_code)]
+    child_id: u32,
+}
+
+#[cfg(not(target_os = "ios"))]
+static JSON_PROCESSES: Lazy<Mutex<HashMap<String, JsonProcess>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+// Broadcast channels for JSON process output - used by WebSocket clients
+#[cfg(not(target_os = "ios"))]
+static JSON_BROADCASTERS: Lazy<Mutex<HashMap<String, broadcast::Sender<String>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 // Global AppHandle for web server to use
 static APP_HANDLE: Lazy<Mutex<Option<AppHandle>>> = Lazy::new(|| Mutex::new(None));
 
@@ -64,6 +90,10 @@ static PAIRING_REQUESTS: Lazy<Mutex<HashMap<String, PairingRequest>>> =
 
 // Authentication: Paired devices (token -> device info)
 static PAIRED_DEVICES: Lazy<Mutex<HashMap<String, PairedDevice>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+// MCP HTTP: Pending requests waiting for JS execution results
+static MCP_HTTP_RESULTS: Lazy<Mutex<HashMap<String, Option<String>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -362,6 +392,102 @@ fn update_session_claude_id(session_id: String, claude_session_id: String) -> Re
     Ok(())
 }
 
+/// Detect the actual Claude session ID by scanning the project folder for the newest session file.
+/// Claude creates session files at ~/.claude/projects/[project-path]/[session-id].jsonl
+/// The project-path is derived from the working directory by replacing / with - (and removing leading -)
+/// Only considers files modified after `min_time` to avoid matching old session files.
+#[cfg(not(target_os = "ios"))]
+fn detect_claude_session_id(
+    working_dir: &Option<std::path::PathBuf>,
+    min_time: std::time::SystemTime,
+) -> Option<String> {
+    // Get home directory
+    let home = dirs::home_dir()?;
+
+    // Build the claude projects path
+    let claude_projects = home.join(".claude").join("projects");
+    if !claude_projects.exists() {
+        return None;
+    }
+
+    // Resolve the working directory
+    let work_dir = working_dir.as_ref()
+        .map(|p| p.to_path_buf())
+        .or_else(|| dirs::home_dir())?;
+
+    // Convert path to Claude's folder naming convention: /Users/foo/bar -> -Users-foo-bar
+    let project_folder_name = work_dir.to_string_lossy()
+        .replace('/', "-")
+        .trim_start_matches('-')
+        .to_string();
+
+    // Full project folder path
+    let project_folder = claude_projects.join(format!("-{}", project_folder_name));
+    if !project_folder.exists() {
+        return None;
+    }
+
+    // Find the newest .jsonl file in the project folder that was created after min_time
+    let mut newest_session: Option<(String, std::time::SystemTime)> = None;
+
+    if let Ok(entries) = std::fs::read_dir(&project_folder) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            // Skip directories and non-jsonl files
+            if path.is_dir() {
+                continue;
+            }
+
+            if let Some(ext) = path.extension() {
+                if ext != "jsonl" {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+
+            // Get file stem (filename without extension) as the session ID
+            let session_id = match path.file_stem() {
+                Some(s) => s.to_string_lossy().to_string(),
+                None => continue,
+            };
+
+            // Skip if it doesn't look like a UUID
+            if session_id.len() != 36 || session_id.chars().filter(|c| *c == '-').count() != 4 {
+                continue;
+            }
+
+            // Get modification time
+            if let Ok(metadata) = entry.metadata() {
+                if let Ok(mtime) = metadata.modified() {
+                    // Only consider files modified after min_time
+                    if mtime <= min_time {
+                        continue;
+                    }
+
+                    match &newest_session {
+                        None => newest_session = Some((session_id, mtime)),
+                        Some((_, prev_mtime)) if mtime > *prev_mtime => {
+                            newest_session = Some((session_id, mtime));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    newest_session.map(|(id, _)| id)
+}
+
+/// Struct for emitting detected Claude session ID event
+#[derive(Clone, Serialize)]
+struct ClaudeSessionDetected {
+    session_id: String,         // Our internal session ID
+    claude_session_id: String,  // Claude's actual session ID
+}
+
 #[cfg(not(target_os = "ios"))]
 #[tauri::command]
 fn spawn_pty(
@@ -461,6 +587,9 @@ fn spawn_pty(
         cmd.cwd(dir);
     }
 
+    // Capture current time before spawning (for session ID detection)
+    let spawn_time = std::time::SystemTime::now();
+
     let _child = pair
         .slave
         .spawn_command(cmd)
@@ -481,6 +610,50 @@ fn spawn_pty(
     {
         let mut broadcasters = PTY_BROADCASTERS.lock();
         broadcasters.insert(session_id.clone(), tx.clone());
+    }
+
+    // For new Claude sessions (not resuming), spawn a thread to detect the actual session ID
+    // Claude creates its own session ID, so we need to scan the projects folder
+    let is_claude_command = cmd_str.contains("claude");
+    let is_new_session = !resume_session.unwrap_or(false);
+
+    if is_claude_command && is_new_session {
+        let app_for_detection = app.clone();
+        let session_id_for_detection = session_id.clone();
+        let work_dir_for_detection = work_dir.clone();
+
+        thread::spawn(move || {
+            // Wait for Claude to start and create its session file
+            // We poll multiple times with increasing delays to catch the session file
+            let delays_ms = [500, 1000, 2000, 3000, 5000];
+
+            for delay in delays_ms.iter() {
+                thread::sleep(std::time::Duration::from_millis(*delay));
+
+                // Only detect sessions created after we spawned the process
+                if let Some(detected_id) = detect_claude_session_id(&work_dir_for_detection, spawn_time) {
+                    // Update the database
+                    if let Err(e) = update_session_claude_id(
+                        session_id_for_detection.clone(),
+                        detected_id.clone(),
+                    ) {
+                        eprintln!("Failed to update session claude_id in DB: {}", e);
+                    }
+
+                    // Emit event to frontend
+                    let _ = app_for_detection.emit(
+                        "claude-session-detected",
+                        ClaudeSessionDetected {
+                            session_id: session_id_for_detection.clone(),
+                            claude_session_id: detected_id,
+                        },
+                    );
+
+                    // Successfully detected, stop polling
+                    break;
+                }
+            }
+        });
     }
 
     // Spawn reader thread
@@ -578,6 +751,218 @@ fn resize_pty(session_id: String, cols: u16, rows: u16) -> Result<(), String> {
 fn kill_pty(session_id: String) -> Result<(), String> {
     let mut sessions = PTY_SESSIONS.lock();
     sessions.remove(&session_id);
+    Ok(())
+}
+
+// ============================================
+// JSON Process Commands (for claude-json sessions)
+// ============================================
+
+/// Spawn a JSON streaming process (non-PTY)
+#[cfg(not(target_os = "ios"))]
+#[tauri::command]
+fn spawn_json_process(
+    app: AppHandle,
+    session_id: String,
+    command: String,
+    working_dir: Option<String>,
+    claude_session_id: Option<String>,
+    resume_session: Option<bool>,
+) -> Result<(), String> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::process::Command;
+
+    // Build the command with resume flag if needed
+    let mut cmd_str = command;
+    if let Some(ref claude_id) = claude_session_id {
+        if resume_session.unwrap_or(false) {
+            // Add --resume flag for existing sessions
+            if !cmd_str.contains("--resume") {
+                cmd_str = cmd_str.replace("claude ", &format!("claude --resume {} ", claude_id));
+            }
+        }
+    }
+
+    let work_dir = working_dir
+        .map(|d| shellexpand::tilde(&d).to_string())
+        .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
+
+    // Create channel for stdin
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<String>(100);
+
+    let session_id_clone = session_id.clone();
+    let app_clone = app.clone();
+
+    // Spawn the process in a tokio task
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+        rt.block_on(async move {
+            // Check for empty command
+            if cmd_str.trim().is_empty() {
+                let _ = app_clone.emit("json-process-error", serde_json::json!({
+                    "session_id": session_id_clone,
+                    "error": "Empty command"
+                }));
+                return;
+            }
+
+            // Use an interactive shell to ensure PATH includes user-installed tools like nvm
+            // GUI apps on macOS don't inherit the user's shell PATH
+            // -i sources ~/.zshrc (where nvm is typically configured)
+            // -l sources ~/.zprofile (login files)
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+
+            let mut child = match Command::new(&shell)
+                .args(&["-i", "-l", "-c", &cmd_str])
+                .current_dir(&work_dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = app_clone.emit("json-process-error", serde_json::json!({
+                        "session_id": session_id_clone,
+                        "error": format!("Failed to spawn process: {}", e)
+                    }));
+                    return;
+                }
+            };
+
+            let child_id = child.id().unwrap_or(0);
+
+            // Take ownership of stdin/stdout/stderr
+            let mut stdin = child.stdin.take().expect("Failed to get stdin");
+            let stdout = child.stdout.take().expect("Failed to get stdout");
+            let stderr = child.stderr.take().expect("Failed to get stderr");
+
+            // Create broadcast channel for WebSocket clients
+            let (broadcast_tx, _rx) = broadcast::channel::<String>(256);
+
+            // Store the process handle and broadcast channel
+            {
+                let mut processes = JSON_PROCESSES.lock();
+                processes.insert(session_id_clone.clone(), JsonProcess {
+                    stdin: stdin_tx.clone(),
+                    child_id,
+                });
+            }
+            {
+                let mut broadcasters = JSON_BROADCASTERS.lock();
+                broadcasters.insert(session_id_clone.clone(), broadcast_tx.clone());
+            }
+
+            // Notify that process started
+            let _ = app_clone.emit("json-process-started", serde_json::json!({
+                "session_id": session_id_clone
+            }));
+
+            // Spawn task to handle stdin
+            let session_id_stdin = session_id_clone.clone();
+            tokio::spawn(async move {
+                while let Some(data) = stdin_rx.recv().await {
+                    if let Err(e) = stdin.write_all(data.as_bytes()).await {
+                        eprintln!("Error writing to stdin for {}: {}", session_id_stdin, e);
+                        break;
+                    }
+                    if let Err(e) = stdin.flush().await {
+                        eprintln!("Error flushing stdin for {}: {}", session_id_stdin, e);
+                        break;
+                    }
+                }
+            });
+
+            // Spawn task to handle stdout
+            let app_stdout = app_clone.clone();
+            let session_id_stdout = session_id_clone.clone();
+            let broadcast_stdout = broadcast_tx.clone();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    let data = line + "\n";
+                    // Emit to Tauri (for desktop app)
+                    let _ = app_stdout.emit("json-process-output", serde_json::json!({
+                        "session_id": session_id_stdout,
+                        "data": &data
+                    }));
+                    // Broadcast to WebSocket clients (for mobile web)
+                    let _ = broadcast_stdout.send(data);
+                }
+            });
+
+            // Spawn task to handle stderr
+            let app_stderr = app_clone.clone();
+            let session_id_stderr = session_id_clone.clone();
+            let broadcast_stderr = broadcast_tx.clone();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    let data = line + "\n";
+                    // Emit to Tauri (for desktop app)
+                    let _ = app_stderr.emit("json-process-output", serde_json::json!({
+                        "session_id": session_id_stderr,
+                        "data": &data
+                    }));
+                    // Broadcast to WebSocket clients (for mobile web)
+                    let _ = broadcast_stderr.send(data);
+                }
+            });
+
+            // Wait for process to exit
+            match child.wait().await {
+                Ok(status) => {
+                    let _ = app_clone.emit("json-process-exit", serde_json::json!({
+                        "session_id": session_id_clone,
+                        "exit_code": status.code()
+                    }));
+                }
+                Err(e) => {
+                    let _ = app_clone.emit("json-process-error", serde_json::json!({
+                        "session_id": session_id_clone,
+                        "error": format!("Process error: {}", e)
+                    }));
+                }
+            }
+
+            // Clean up
+            {
+                let mut processes = JSON_PROCESSES.lock();
+                processes.remove(&session_id_clone);
+            }
+            {
+                let mut broadcasters = JSON_BROADCASTERS.lock();
+                broadcasters.remove(&session_id_clone);
+            }
+        });
+    });
+
+    Ok(())
+}
+
+/// Write data to a JSON process stdin
+#[cfg(not(target_os = "ios"))]
+#[tauri::command]
+fn write_to_process(session_id: String, data: String) -> Result<(), String> {
+    let processes = JSON_PROCESSES.lock();
+    if let Some(process) = processes.get(&session_id) {
+        process.stdin.try_send(data)
+            .map_err(|e| format!("Failed to send to stdin: {}", e))?;
+        Ok(())
+    } else {
+        Err("Process not found".to_string())
+    }
+}
+
+/// Kill a JSON process
+#[cfg(not(target_os = "ios"))]
+#[tauri::command]
+fn kill_json_process(session_id: String) -> Result<(), String> {
+    let mut processes = JSON_PROCESSES.lock();
+    processes.remove(&session_id);
+    // Note: This drops the stdin sender which should cause the process to eventually exit
+    // For force kill, we'd need to store the Child handle
     Ok(())
 }
 
@@ -726,6 +1111,13 @@ fn load_app_settings() -> Result<AppSettings, String> {
     let settings: AppSettings = serde_json::from_str(&json)
         .map_err(|e| format!("Failed to parse settings: {}", e))?;
     Ok(settings)
+}
+
+/// MCP callback - receives results from JS execution
+#[cfg(not(target_os = "ios"))]
+#[tauri::command]
+fn mcp_callback(request_id: String, result: String) {
+    mcp::resolve_mcp_request(request_id, result);
 }
 
 #[cfg(not(target_os = "ios"))]
@@ -1076,6 +1468,112 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
       min-height: 0;
     }
 
+    /* Chat container for JSON sessions */
+    #chat-container {
+      flex: 1;
+      display: none;
+      flex-direction: column;
+      min-height: 0;
+    }
+    #chat-container.active {
+      display: flex;
+    }
+    #chat-messages {
+      flex: 1;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+      padding: 12px;
+    }
+    .chat-msg {
+      margin-bottom: 12px;
+      padding: 10px 14px;
+      border-radius: 12px;
+      max-width: 85%;
+      word-wrap: break-word;
+    }
+    .chat-msg.user {
+      background: #0e9fd8;
+      color: white;
+      margin-left: auto;
+      border-bottom-right-radius: 4px;
+    }
+    .chat-msg.assistant {
+      background: #2a2a2a;
+      color: #e6e6e6;
+      border-bottom-left-radius: 4px;
+    }
+    .chat-msg.system {
+      background: transparent;
+      color: #808080;
+      font-size: 12px;
+      text-align: center;
+      max-width: 100%;
+      padding: 4px;
+    }
+    .chat-msg.tool-use {
+      background: #1e3a4c;
+      color: #4ec9b0;
+      font-size: 13px;
+    }
+    .chat-msg pre {
+      margin: 8px 0 0 0;
+      padding: 8px;
+      background: rgba(0,0,0,0.3);
+      border-radius: 6px;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      font-size: 12px;
+    }
+    .chat-msg code {
+      font-family: Menlo, Monaco, monospace;
+      font-size: 13px;
+    }
+    .chat-msg :not(pre) > code {
+      background: rgba(0,0,0,0.3);
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    .chat-msg p { margin: 0 0 8px 0; }
+    .chat-msg p:last-child { margin-bottom: 0; }
+    #chat-input-container {
+      display: flex;
+      gap: 8px;
+      padding: 8px 12px;
+      padding-bottom: max(8px, env(safe-area-inset-bottom));
+      background: #252526;
+      border-top: 1px solid #3c3c3c;
+    }
+    #chat-input {
+      flex: 1;
+      padding: 10px 14px;
+      border: 1px solid #3c3c3c;
+      border-radius: 20px;
+      background: #1a1a1a;
+      color: #e6e6e6;
+      font-size: 16px;
+      resize: none;
+      min-height: 40px;
+      max-height: 120px;
+      font-family: inherit;
+    }
+    #chat-input:focus {
+      outline: none;
+      border-color: #0e9fd8;
+    }
+    #chat-send {
+      padding: 10px 16px;
+      background: #0e9fd8;
+      color: white;
+      border: none;
+      border-radius: 20px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    #chat-send:disabled {
+      background: #555;
+    }
+
     /* Paste indicator (shows on long-press) */
     #paste-indicator {
       position: absolute;
@@ -1234,7 +1732,8 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
       <div class="form-group">
         <label for="new-session-agent">Agent Type</label>
         <select id="new-session-agent">
-          <option value="claude">Claude Code</option>
+          <option value="claude-json">Claude</option>
+          <option value="claude">Claude (xterm)</option>
           <option value="aider">Aider</option>
           <option value="shell">Shell</option>
           <option value="custom">Custom</option>
@@ -1281,6 +1780,13 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         <div id="terminal-container">
           <div id="touch-overlay"></div>
           <div id="paste-indicator">Paste</div>
+        </div>
+        <div id="chat-container">
+          <div id="chat-messages"></div>
+          <div id="chat-input-container">
+            <textarea id="chat-input" placeholder="Type a message..." rows="1"></textarea>
+            <button id="chat-send">Send</button>
+          </div>
         </div>
         <div id="status" class="disconnected">Disconnected</div>
       </div>
@@ -1693,6 +2199,11 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         }
       }
 
+      // Check if session uses JSON chat interface
+      function isJsonSession(session) {
+        return session.agent_type === 'claude-json';
+      }
+
       async function openSession(sessionId, autoStart = false) {
         currentSessionId = sessionId;
         const session = sessionsData.find(s => s.id === sessionId);
@@ -1701,16 +2212,36 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         sessionTitle.textContent = session.name;
         showSessionView(sessionId);
 
-        if (session.running) {
-          startBtn.style.display = 'none';
-          connectWebSocket(sessionId);
-        } else if (autoStart) {
-          // Auto-start newly created sessions
-          startBtn.style.display = 'none';
-          await startCurrentSession();
+        // Toggle between terminal and chat UI based on session type
+        const terminalContainer = document.getElementById('terminal-container');
+        const chatContainer = document.getElementById('chat-container');
+
+        if (isJsonSession(session)) {
+          terminalContainer.style.display = 'none';
+          chatContainer.classList.add('active');
+          if (session.running) {
+            startBtn.style.display = 'none';
+            connectChatWebSocket(sessionId);
+          } else if (autoStart) {
+            startBtn.style.display = 'none';
+            await startCurrentSession();
+          } else {
+            startBtn.style.display = 'inline-block';
+            await loadChatHistory(sessionId);
+          }
         } else {
-          startBtn.style.display = 'inline-block';
-          await showBuffer(sessionId);
+          chatContainer.classList.remove('active');
+          terminalContainer.style.display = 'block';
+          if (session.running) {
+            startBtn.style.display = 'none';
+            connectWebSocket(sessionId);
+          } else if (autoStart) {
+            startBtn.style.display = 'none';
+            await startCurrentSession();
+          } else {
+            startBtn.style.display = 'inline-block';
+            await showBuffer(sessionId);
+          }
         }
       }
 
@@ -1773,8 +2304,156 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         });
       }
 
+      // Chat functions for JSON sessions
+      const chatMessages = document.getElementById('chat-messages');
+      const chatInput = document.getElementById('chat-input');
+      const chatSend = document.getElementById('chat-send');
+      let chatWs = null;
+      let isProcessing = false;
+
+      async function loadChatHistory(sessionId) {
+        chatMessages.innerHTML = '';
+        status.textContent = 'Loading chat history...';
+        status.className = 'disconnected';
+        try {
+          const res = await authFetch(`/api/sessions/${sessionId}/buffer`);
+          const data = await res.json();
+          if (data.buffer) {
+            try {
+              const messages = JSON.parse(data.buffer);
+              messages.forEach(msg => renderChatMessage(msg));
+              chatMessages.scrollTop = chatMessages.scrollHeight;
+              status.textContent = 'Viewing chat history (tap Start to resume)';
+            } catch (e) {
+              status.textContent = 'Chat history format error';
+            }
+          } else {
+            status.textContent = 'No chat history - tap Start to begin';
+          }
+        } catch (e) {
+          status.textContent = 'Failed to load chat history';
+        }
+      }
+
+      function connectChatWebSocket(sessionId) {
+        if (chatWs) chatWs.close();
+        chatMessages.innerHTML = '';
+
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        chatWs = new WebSocket(`${protocol}//${location.host}/api/ws/${sessionId}`);
+
+        chatWs.onopen = () => {
+          status.textContent = 'Connected';
+          status.className = 'connected';
+          chatSend.disabled = false;
+        };
+        chatWs.onclose = () => {
+          status.textContent = 'Disconnected';
+          status.className = 'disconnected';
+          isProcessing = false;
+          chatSend.disabled = false;
+        };
+        chatWs.onmessage = (e) => {
+          if (typeof e.data === 'string') {
+            try {
+              const msg = JSON.parse(e.data);
+              renderChatMessage(msg);
+              chatMessages.scrollTop = chatMessages.scrollHeight;
+              if (msg.type === 'result') {
+                isProcessing = false;
+                chatSend.disabled = false;
+                status.textContent = 'Done';
+                status.className = 'connected';
+              }
+            } catch (err) {
+              console.warn('Failed to parse message:', e.data);
+            }
+          }
+        };
+      }
+
+      function renderChatMessage(msg) {
+        const div = document.createElement('div');
+        div.className = 'chat-msg';
+
+        if (msg.type === 'user') {
+          if (!msg.result?.trim()) return; // Skip empty
+          div.classList.add('user');
+          div.textContent = msg.result;
+        } else if (msg.type === 'assistant' && msg.message?.content) {
+          div.classList.add('assistant');
+          let html = '';
+          for (const block of msg.message.content) {
+            if (block.type === 'text' && block.text) {
+              // Simple markdown: code blocks, inline code, bold
+              let text = escapeHtml(block.text);
+              // Code blocks
+              text = text.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
+              // Inline code
+              text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
+              // Bold
+              text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+              // Paragraphs
+              text = text.split('\n\n').map(p => '<p>' + p + '</p>').join('');
+              html += text;
+            } else if (block.type === 'tool_use') {
+              div.classList.remove('assistant');
+              div.classList.add('tool-use');
+              html += '<strong>' + escapeHtml(block.name || 'Tool') + '</strong>';
+              if (block.input) {
+                html += '<pre><code>' + escapeHtml(JSON.stringify(block.input, null, 2)) + '</code></pre>';
+              }
+            }
+          }
+          div.innerHTML = html || '(empty)';
+        } else if (msg.type === 'system' && msg.subtype === 'init') {
+          div.classList.add('system');
+          div.textContent = 'Session started • ' + (msg.model || 'Claude');
+        } else if (msg.type === 'result' && msg.is_error) {
+          div.classList.add('system');
+          div.style.color = '#f14c4c';
+          div.textContent = 'Error: ' + msg.result;
+        } else {
+          return; // Skip other types
+        }
+        chatMessages.appendChild(div);
+      }
+
+      function sendChatMessage() {
+        const text = chatInput.value.trim();
+        if (!text || isProcessing || !chatWs || chatWs.readyState !== WebSocket.OPEN) return;
+
+        // Show user message
+        renderChatMessage({ type: 'user', result: text });
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+        chatInput.value = '';
+
+        // Send to server
+        isProcessing = true;
+        chatSend.disabled = true;
+        status.textContent = 'Thinking...';
+        status.className = '';
+
+        const jsonMsg = JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: text }
+        }) + '\n';
+        chatWs.send(jsonMsg);
+      }
+
+      chatSend.addEventListener('click', sendChatMessage);
+      chatInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          sendChatMessage();
+        }
+      });
+
       async function startCurrentSession() {
         if (!currentSessionId) return;
+        const session = sessionsData.find(s => s.id === currentSessionId);
+        if (!session) return;
+
         startBtn.disabled = true;
         startBtn.textContent = 'Starting...';
         try {
@@ -1784,7 +2463,12 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
             await new Promise(r => setTimeout(r, 100));
             await loadSessions();
             startBtn.style.display = 'none';
-            connectWebSocket(currentSessionId);
+            // Use appropriate connection for session type
+            if (isJsonSession(session)) {
+              connectChatWebSocket(currentSessionId);
+            } else {
+              connectWebSocket(currentSessionId);
+            }
           } else {
             status.textContent = 'Failed to start session';
           }
@@ -2246,10 +2930,16 @@ async fn api_start_session(
     if let Some(err) = check_auth(&headers) {
         return err.into_response();
     }
-    // Check if already running
+    // Check if already running (PTY or JSON)
     {
-        let broadcasters = PTY_BROADCASTERS.lock();
-        if broadcasters.contains_key(&session_id) {
+        let pty_broadcasters = PTY_BROADCASTERS.lock();
+        if pty_broadcasters.contains_key(&session_id) {
+            return Json(serde_json::json!({ "status": "already_running" })).into_response();
+        }
+    }
+    {
+        let json_broadcasters = JSON_BROADCASTERS.lock();
+        if json_broadcasters.contains_key(&session_id) {
             return Json(serde_json::json!({ "status": "already_running" })).into_response();
         }
     }
@@ -2274,25 +2964,54 @@ async fn api_start_session(
         return (StatusCode::INTERNAL_SERVER_ERROR, "App not initialized").into_response();
     };
 
-    // Spawn PTY (use default terminal size, will be resized on connect)
-    // Only resume if we have a saved Claude session ID
-    let should_resume = session.claude_session_id.is_some();
-    match spawn_pty(
-        app.clone(),
-        session.id.clone(),
-        Some(session.command),
-        Some(session.working_dir),
-        120,  // default cols
-        30,   // default rows
-        session.claude_session_id,
-        Some(should_resume),
-    ) {
-        Ok(()) => {
-            // Notify desktop app that session was started remotely
-            let _ = app.emit("remote-session-started", session.id.clone());
-            Json(serde_json::json!({ "status": "started", "session_id": session.id })).into_response()
+    // Check if this is a JSON session (claude-json)
+    let is_json_session = session.agent_type == "claude-json";
+
+    if is_json_session {
+        // Check if JSON process already running
+        {
+            let broadcasters = JSON_BROADCASTERS.lock();
+            if broadcasters.contains_key(&session_id) {
+                return Json(serde_json::json!({ "status": "already_running" })).into_response();
+            }
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+
+        // Spawn JSON process for chat sessions
+        let should_resume = session.claude_session_id.is_some();
+        match spawn_json_process(
+            app.clone(),
+            session.id.clone(),
+            session.command,
+            Some(session.working_dir),
+            session.claude_session_id,
+            Some(should_resume),
+        ) {
+            Ok(()) => {
+                let _ = app.emit("remote-session-started", session.id.clone());
+                Json(serde_json::json!({ "status": "started", "session_id": session.id })).into_response()
+            }
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        }
+    } else {
+        // Spawn PTY for terminal sessions (use default terminal size, will be resized on connect)
+        let should_resume = session.claude_session_id.is_some();
+        match spawn_pty(
+            app.clone(),
+            session.id.clone(),
+            Some(session.command),
+            Some(session.working_dir),
+            120,  // default cols
+            30,   // default rows
+            session.claude_session_id,
+            Some(should_resume),
+        ) {
+            Ok(()) => {
+                // Notify desktop app that session was started remotely
+                let _ = app.emit("remote-session-started", session.id.clone());
+                Json(serde_json::json!({ "status": "started", "session_id": session.id })).into_response()
+            }
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        }
     }
 }
 
@@ -2311,7 +3030,105 @@ async fn api_start_session(
     }))).into_response()
 }
 
-// WebSocket handler for PTY streaming
+// POST /api/mcp/execute - Execute JS in the webview and return result
+// This allows external MCP bridges to control the UI via HTTP
+#[cfg(not(target_os = "ios"))]
+async fn api_mcp_execute(
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let code = match body.get("code").and_then(|v| v.as_str()) {
+        Some(c) => c.to_string(),
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "missing_code",
+            "message": "Request body must contain 'code' field with JS to execute"
+        }))).into_response(),
+    };
+
+    let timeout_ms = body.get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5000);
+
+    // Generate unique request ID
+    let request_id = uuid::Uuid::new_v4().to_string();
+
+    // Register the pending request
+    {
+        let mut results = MCP_HTTP_RESULTS.lock();
+        results.insert(request_id.clone(), None);
+    }
+
+    // Emit event to frontend to execute the JS
+    let app_opt = APP_HANDLE.lock().clone();
+    if let Some(app) = app_opt {
+        let _ = app.emit("mcp-execute", serde_json::json!({
+            "request_id": request_id,
+            "code": code
+        }));
+    } else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "error": "app_not_ready",
+            "message": "App handle not available"
+        }))).into_response();
+    }
+
+    // Poll for result with timeout
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+
+    loop {
+        {
+            let mut results = MCP_HTTP_RESULTS.lock();
+            if let Some(result_opt) = results.get(&request_id) {
+                if let Some(result) = result_opt {
+                    let result = result.clone();
+                    results.remove(&request_id);
+                    return Json(serde_json::json!({
+                        "success": true,
+                        "result": result
+                    })).into_response();
+                }
+            }
+        }
+
+        if start.elapsed() > timeout {
+            // Clean up and return timeout
+            let mut results = MCP_HTTP_RESULTS.lock();
+            results.remove(&request_id);
+            return (StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({
+                "error": "timeout",
+                "message": format!("JS execution timed out after {}ms", timeout_ms)
+            }))).into_response();
+        }
+
+        // Sleep briefly before polling again
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+// POST /api/mcp/result - Frontend calls this to return JS execution result
+#[cfg(not(target_os = "ios"))]
+async fn api_mcp_result(
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let request_id = match body.get("request_id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => return (StatusCode::BAD_REQUEST, "missing request_id").into_response(),
+    };
+
+    let result = body.get("result")
+        .map(|v| if v.is_string() { v.as_str().unwrap().to_string() } else { v.to_string() })
+        .unwrap_or_else(|| "null".to_string());
+
+    let mut results = MCP_HTTP_RESULTS.lock();
+    if results.contains_key(&request_id) {
+        results.insert(request_id, Some(result));
+        Json(serde_json::json!({ "success": true })).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "request not found").into_response()
+    }
+}
+
+// WebSocket handler for PTY and JSON streaming
 #[cfg(not(target_os = "ios"))]
 async fn ws_handler(
     Path(session_id): Path<String>,
@@ -2323,68 +3140,115 @@ async fn ws_handler(
 #[cfg(not(target_os = "ios"))]
 async fn handle_ws(socket: WebSocket, session_id: String) {
     let (mut sender, mut receiver) = socket.split();
-    let session_id_for_emit = session_id.clone();
+    let session_id_clone = session_id.clone();
 
-    // Get broadcast receiver for this session
-    let rx = {
-        let broadcasters = PTY_BROADCASTERS.lock();
-        broadcasters.get(&session_id).map(|tx| tx.subscribe())
+    // Check if this is a JSON session or PTY session
+    let is_json_session = {
+        let processes = JSON_PROCESSES.lock();
+        processes.contains_key(&session_id)
     };
 
-    let Some(mut rx) = rx else {
-        let _ = sender.send(Message::Text("Session not found or not running".into())).await;
-        return;
-    };
+    if is_json_session {
+        // Handle JSON session
+        let rx = {
+            let broadcasters = JSON_BROADCASTERS.lock();
+            broadcasters.get(&session_id).map(|tx| tx.subscribe())
+        };
 
-    // Spawn task to forward PTY output to WebSocket
-    let send_task = tokio::spawn(async move {
-        while let Ok(data) = rx.recv().await {
-            if sender.send(Message::Binary(data)).await.is_err() {
-                break;
+        let Some(mut rx) = rx else {
+            let _ = sender.send(Message::Text("JSON session not found or not running".into())).await;
+            return;
+        };
+
+        // Spawn task to forward JSON output to WebSocket
+        let send_task = tokio::spawn(async move {
+            while let Ok(data) = rx.recv().await {
+                if sender.send(Message::Text(data)).await.is_err() {
+                    break;
+                }
             }
-        }
-    });
+        });
 
-    // Handle incoming messages from WebSocket (user input)
-    let recv_task = tokio::spawn(async move {
-        while let Some(Ok(msg)) = receiver.next().await {
-            match msg {
-                Message::Text(text) => {
-                    // Check if it's a control message (JSON)
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if json.get("type").and_then(|v| v.as_str()) == Some("resize") {
-                            if let (Some(cols), Some(rows)) = (
-                                json.get("cols").and_then(|v| v.as_u64()),
-                                json.get("rows").and_then(|v| v.as_u64()),
-                            ) {
-                                let _ = resize_pty(session_id.clone(), cols as u16, rows as u16);
+        // Handle incoming messages from WebSocket (user input for JSON process)
+        let recv_task = tokio::spawn(async move {
+            while let Some(Ok(msg)) = receiver.next().await {
+                match msg {
+                    Message::Text(text) => {
+                        // For JSON sessions, forward text directly to stdin
+                        let _ = write_to_process(session_id_clone.clone(), text);
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        tokio::select! {
+            _ = send_task => {},
+            _ = recv_task => {},
+        }
+    } else {
+        // Handle PTY session (existing logic)
+        let rx = {
+            let broadcasters = PTY_BROADCASTERS.lock();
+            broadcasters.get(&session_id).map(|tx| tx.subscribe())
+        };
+
+        let Some(mut rx) = rx else {
+            let _ = sender.send(Message::Text("Session not found or not running".into())).await;
+            return;
+        };
+
+        // Spawn task to forward PTY output to WebSocket
+        let send_task = tokio::spawn(async move {
+            while let Ok(data) = rx.recv().await {
+                if sender.send(Message::Binary(data)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Handle incoming messages from WebSocket (user input)
+        let recv_task = tokio::spawn(async move {
+            while let Some(Ok(msg)) = receiver.next().await {
+                match msg {
+                    Message::Text(text) => {
+                        // Check if it's a control message (JSON)
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if json.get("type").and_then(|v| v.as_str()) == Some("resize") {
+                                if let (Some(cols), Some(rows)) = (
+                                    json.get("cols").and_then(|v| v.as_u64()),
+                                    json.get("rows").and_then(|v| v.as_u64()),
+                                ) {
+                                    let _ = resize_pty(session_id_clone.clone(), cols as u16, rows as u16);
+                                }
                             }
+                        } else {
+                            // Regular text input
+                            let _ = write_pty(session_id_clone.clone(), text);
                         }
-                    } else {
-                        // Regular text input
-                        let _ = write_pty(session_id.clone(), text);
                     }
-                }
-                Message::Binary(data) => {
-                    if let Ok(text) = String::from_utf8(data) {
-                        let _ = write_pty(session_id.clone(), text);
+                    Message::Binary(data) => {
+                        if let Ok(text) = String::from_utf8(data) {
+                            let _ = write_pty(session_id_clone.clone(), text);
+                        }
                     }
+                    Message::Close(_) => break,
+                    _ => {}
                 }
-                Message::Close(_) => break,
-                _ => {}
             }
-        }
-    });
+        });
 
-    // Wait for either task to finish
-    tokio::select! {
-        _ = send_task => {},
-        _ = recv_task => {},
+        // Wait for either task to finish
+        tokio::select! {
+            _ = send_task => {},
+            _ = recv_task => {},
+        }
     }
 
     // Mobile client disconnected - notify desktop to restore its size
     if let Some(app) = APP_HANDLE.lock().as_ref() {
-        let _ = app.emit("remote-client-disconnected", session_id_for_emit);
+        let _ = app.emit("remote-client-disconnected", session_id);
     }
 }
 
@@ -2418,6 +3282,9 @@ fn start_web_server() {
                 .route("/api/sessions/:session_id/buffer", get(api_get_buffer))
                 .route("/api/sessions/:session_id/start", axum::routing::post(api_start_session))
                 .route("/api/ws/:session_id", get(ws_handler))
+                // MCP HTTP endpoints for external control
+                .route("/api/mcp/execute", axum::routing::post(api_mcp_execute))
+                .route("/api/mcp/result", axum::routing::post(api_mcp_result))
                 .layer(CorsLayer::permissive());
 
             // Try ports starting from WEB_PORT_BASE until we find one available
@@ -2605,6 +3472,19 @@ fn setup_app(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // Start web server for remote access
     start_web_server();
 
+    // Start MCP server if --mcp flag was passed
+    if MCP_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        let app_handle = app.handle().clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime for MCP");
+            rt.block_on(async {
+                if let Err(e) = mcp::start_mcp_server(app_handle).await {
+                    eprintln!("MCP server error: {}", e);
+                }
+            });
+        });
+    }
+
     Ok(())
 }
 
@@ -2627,6 +3507,12 @@ fn setup_app(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(not(target_os = "ios"))]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Check for --mcp flag to enable MCP server mode
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--mcp") {
+        MCP_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
@@ -2639,6 +3525,9 @@ pub fn run() {
             write_pty,
             resize_pty,
             kill_pty,
+            spawn_json_process,
+            write_to_process,
+            kill_json_process,
             load_sessions,
             save_session,
             delete_session,
@@ -2651,7 +3540,8 @@ pub fn run() {
             load_window_state,
             save_app_settings,
             load_app_settings,
-            get_web_server_port
+            get_web_server_port,
+            mcp_callback
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

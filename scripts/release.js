@@ -12,6 +12,7 @@ const __dirname = path.dirname(__filename);
 const rootDir = path.join(__dirname, '..');
 const packageJsonPath = path.join(rootDir, 'package.json');
 const tauriConfPath = path.join(rootDir, 'src-tauri', 'tauri.conf.json');
+const cargoTomlPath = path.join(rootDir, 'src-tauri', 'Cargo.toml');
 
 // Parse command line arguments
 const args = process.argv.slice(2);
@@ -85,10 +86,16 @@ function performRelease() {
   fs.writeFileSync(tauriConfPath, JSON.stringify(tauriConf, null, 2) + '\n');
   console.log(`Updated tauri.conf.json to ${newVersion}`);
 
+  // Update Cargo.toml
+  let cargoToml = fs.readFileSync(cargoTomlPath, 'utf8');
+  cargoToml = cargoToml.replace(/^version = ".*"$/m, `version = "${newVersion}"`);
+  fs.writeFileSync(cargoTomlPath, cargoToml);
+  console.log(`Updated Cargo.toml to ${newVersion}`);
+
   // Git operations
   try {
     // Commit version bump
-    execSync(`git add package.json src-tauri/tauri.conf.json`, { cwd: rootDir, stdio: 'inherit' });
+    execSync(`git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml`, { cwd: rootDir, stdio: 'inherit' });
     execSync(`git commit -m "chore: bump version to ${newVersion}"`, { cwd: rootDir, stdio: 'inherit' });
     console.log('Committed version bump');
 

@@ -17,7 +17,8 @@
             <button id="new-session-btn">+ New</button>
             <button id="new-session-dropdown-btn" title="Create with different agent">▾</button>
             <div id="new-session-menu" class="dropdown-menu">
-              <button data-agent="claude">Claude Code</button>
+              <button data-agent="claude-json">Claude</button>
+              <button data-agent="claude">Claude (xterm)</button>
               <button data-agent="codex">Codex (OpenAI)</button>
               <button data-agent="aider">Aider</button>
               <button data-agent="shell">Shell</button>
@@ -45,6 +46,8 @@
       <!-- Main terminal area -->
       <div id="main">
         <div id="terminal-container"></div>
+        <!-- Chat container for JSON-based sessions -->
+        <div id="chat-container" style="display: none;"></div>
         <div id="start-session-banner">
           <div class="banner-content">
             <span class="banner-status">Session inactive</span>
@@ -54,7 +57,7 @@
         <div id="empty-state">
           <div class="icon">⌘</div>
           <h2>No Active Session</h2>
-          <p>Create a new session to get started with Claude Code or another agent.</p>
+          <p>Create a new session to get started with Claude or another agent.</p>
           <button id="empty-new-session-btn">Create Session</button>
         </div>
       </div>
@@ -71,7 +74,8 @@
         <div class="form-group">
           <label for="agent-type">Agent Type</label>
           <select id="agent-type">
-            <option value="claude">Claude Code</option>
+            <option value="claude-json">Claude</option>
+            <option value="claude">Claude (xterm)</option>
             <option value="codex">Codex (OpenAI)</option>
             <option value="aider">Aider</option>
             <option value="shell">Shell</option>
@@ -147,7 +151,8 @@
           <div class="form-group">
             <label for="settings-default-agent">Default Agent Type</label>
             <select id="settings-default-agent">
-              <option value="claude">Claude Code</option>
+              <option value="claude-json">Claude</option>
+              <option value="claude">Claude (xterm)</option>
               <option value="codex">Codex (OpenAI)</option>
               <option value="aider">Aider</option>
               <option value="shell">Shell</option>
@@ -169,7 +174,7 @@
               <input type="checkbox" id="settings-bell-notifications" checked />
               Show notifications on terminal bell
             </label>
-            <p class="form-hint">Triggered when Claude Code needs input or completes a task.</p>
+            <p class="form-hint">Triggered when Claude needs input or completes a task.</p>
           </div>
           <div class="form-group checkbox-group">
             <label for="settings-bounce-dock">
@@ -218,7 +223,7 @@
     <div id="about-modal">
       <div class="modal-content about-modal-content">
         <h2>Agent Hub</h2>
-        <p class="version">Version 0.1.0</p>
+        <p class="version">Version ...</p>
         <p class="description">A terminal session manager for AI coding agents.</p>
         <p class="copyright">Built with Tauri + xterm.js</p>
         <div class="modal-actions">
