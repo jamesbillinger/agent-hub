@@ -35,3 +35,9 @@ src-tauri/Cargo.lock
 
 # Backup files
 *.bak
+
+# Local development files
+.mcp.json
+SESSION_NOTES.md
+TAURI_MCP_DEBUG_NOTES.md
+tauri-mcp-wrapper.sh
