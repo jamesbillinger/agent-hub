@@ -2531,6 +2531,19 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
         saveSessionToDb(session);
       }
     }
+
+    // Insert init message before the most recent user message (race condition fix)
+    // Find the last user message element that doesn't have an init before it
+    const userMessages = chatSession.messagesEl.querySelectorAll(".chat-message.user");
+    if (userMessages.length > 0) {
+      const lastUserMsg = userMessages[userMessages.length - 1];
+      const prevSibling = lastUserMsg.previousElementSibling;
+      // Only insert before user message if there's no init already there
+      if (!prevSibling || !prevSibling.classList.contains("init-details")) {
+        chatSession.messagesEl.insertBefore(messageEl, lastUserMsg);
+        return; // Early return - we've already inserted
+      }
+    }
   } else {
     // Skip other message types for now
     return;
