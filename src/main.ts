@@ -57,7 +57,7 @@ interface PtyOutput {
 // JSON streaming message types from Claude
 interface ClaudeJsonMessage {
   type: "system" | "user" | "assistant" | "result";
-  subtype?: "init" | "success" | "error";
+  subtype?: "init" | "success" | "error" | "resumed" | "stopped";
   session_id?: string;
   message?: {
     id: string;
@@ -768,6 +768,9 @@ document.addEventListener("DOMContentLoaded", async () => {
         chatSession.sendBtn.disabled = false;
         const thinkingEl = chatSession.containerEl.querySelector(".chat-thinking") as HTMLElement;
         if (thinkingEl) thinkingEl.style.display = "none";
+
+        // Add session stopped event
+        addSessionEvent(event.payload.session_id, "stopped");
       }
       renderSessionList();
       updateStartBanner();
@@ -1946,16 +1949,28 @@ async function startJsonProcess(session: Session) {
   chatSession.statusEl.textContent = "Starting...";
   chatSession.statusEl.className = "chat-status";
 
-  // Insert a placeholder init message immediately at the top
+  // Check if this is a resume (session already has an init message)
   const existingInit = chatSession.messagesEl.querySelector(".init-details");
+  const isResume = existingInit !== null;
+
   if (!existingInit) {
+    // First time - insert a placeholder init message at the top
     const initPlaceholder = document.createElement("div");
     initPlaceholder.className = "chat-message system init-details";
     initPlaceholder.innerHTML = `
       <div class="init-header">Session starting...</div>
       <div class="init-main">${session.workingDir || "~"}</div>
     `;
-    chatSession.messagesEl.appendChild(initPlaceholder);
+    // Insert at the beginning, not end
+    const firstChild = chatSession.messagesEl.firstChild;
+    if (firstChild) {
+      chatSession.messagesEl.insertBefore(initPlaceholder, firstChild);
+    } else {
+      chatSession.messagesEl.appendChild(initPlaceholder);
+    }
+  } else {
+    // Resuming - add a session resumed event
+    addSessionEvent(session.id, "resumed");
   }
 
   try {
@@ -2855,13 +2870,62 @@ async function sendChatMessage(sessionId: string) {
 }
 
 /**
+ * Add a session event (resumed, stopped) to the chat
+ */
+function addSessionEvent(sessionId: string, eventType: "resumed" | "stopped") {
+  const chatSession = chatSessions.get(sessionId);
+  if (!chatSession) return;
+
+  const timestamp = new Date().toLocaleTimeString();
+  const eventText = eventType === "resumed" ? "Session resumed" : "Session stopped";
+
+  // Create event message
+  const eventMessage: ClaudeJsonMessage = {
+    type: "system",
+    subtype: eventType,
+    result: `--- ${eventText} (${timestamp}) ---`,
+  };
+
+  chatSession.messages.push(eventMessage);
+
+  // Render the event
+  const eventEl = document.createElement("div");
+  eventEl.className = "chat-message system session-event";
+  eventEl.textContent = `--- ${eventText} ---`;
+  chatSession.messagesEl.appendChild(eventEl);
+
+  // Save messages
+  saveChatMessages(sessionId);
+}
+
+/**
  * Add a message to the chat UI
  */
 function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
   const chatSession = chatSessions.get(sessionId);
   if (!chatSession) return;
 
-  chatSession.messages.push(message);
+  // For init messages, only save the first one - ignore subsequent ones
+  if (message.type === "system" && message.subtype === "init") {
+    const hasInit = chatSession.messages.some(
+      m => m.type === "system" && m.subtype === "init"
+    );
+    if (hasInit) {
+      // Already have an init, ignore this one but still capture session_id
+      if (message.session_id) {
+        const session = sessions.get(sessionId);
+        if (session) {
+          session.claudeSessionId = message.session_id;
+          saveSessionToDb(session);
+        }
+      }
+      return; // Don't render or save duplicate init
+    }
+    // First init - insert at beginning
+    chatSession.messages.unshift(message);
+  } else {
+    chatSession.messages.push(message);
+  }
 
   const messageEl = document.createElement("div");
   messageEl.className = "chat-message";
@@ -3161,7 +3225,26 @@ async function loadChatMessages(sessionId: string, chatSession: ChatSession): Pr
     const bufferContent = await invoke<string | null>("load_terminal_buffer", { sessionId });
     if (bufferContent) {
       const messages = JSON.parse(bufferContent) as ClaudeJsonMessage[];
+
+      // Find the most recent init message and filter out duplicates
+      let latestInit: ClaudeJsonMessage | null = null;
+      const nonInitMessages: ClaudeJsonMessage[] = [];
+
       for (const msg of messages) {
+        if (msg.type === "system" && msg.subtype === "init") {
+          latestInit = msg; // Keep the last one (most recent)
+        } else {
+          nonInitMessages.push(msg);
+        }
+      }
+
+      // Add init first (if any), then other messages
+      if (latestInit) {
+        chatSession.messages.push(latestInit);
+        renderChatMessage(chatSession, latestInit);
+      }
+
+      for (const msg of nonInitMessages) {
         chatSession.messages.push(msg);
         renderChatMessage(chatSession, msg);
       }
@@ -3227,6 +3310,26 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
       <div class="init-main">${details.join(" • ")}</div>
       ${meta.length > 0 ? `<div class="init-meta">${meta.join(" • ")}</div>` : ""}
     `;
+
+    // Insert init at the beginning, or update existing
+    const existingInit = chatSession.messagesEl.querySelector(".init-details") as HTMLElement;
+    if (existingInit) {
+      existingInit.innerHTML = messageEl.innerHTML;
+      return;
+    } else {
+      const firstChild = chatSession.messagesEl.firstChild;
+      if (firstChild) {
+        chatSession.messagesEl.insertBefore(messageEl, firstChild);
+      } else {
+        chatSession.messagesEl.appendChild(messageEl);
+      }
+      return;
+    }
+  } else if (message.type === "system" && (message.subtype === "resumed" || message.subtype === "stopped")) {
+    // Session event (resumed/stopped)
+    messageEl.classList.add("system", "session-event");
+    const eventText = message.subtype === "resumed" ? "Session resumed" : "Session stopped";
+    messageEl.textContent = `--- ${eventText} ---`;
   } else {
     return; // Skip other message types
   }

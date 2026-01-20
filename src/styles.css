@@ -1091,6 +1091,12 @@ body.resizing-sidebar {
   padding: 4px 12px;
 }
 
+.chat-message.system.session-event {
+  color: var(--text-dim);
+  font-size: 11px;
+  margin: 8px 0;
+}
+
 .chat-message.system.init-details {
   background: var(--bg-tertiary);
   border-radius: 8px;
