@@ -44,16 +44,18 @@
       <div id="sidebar">
         <div id="sidebar-header">
           <h1>Sessions</h1>
-          <div id="new-session-group">
-            <button id="new-session-btn">+ New</button>
-            <button id="new-session-dropdown-btn" title="Create with different agent">▾</button>
-            <div id="new-session-menu" class="dropdown-menu">
-              <button data-agent="claude-json">Claude</button>
-              <button data-agent="claude">Claude (xterm)</button>
-              <button data-agent="codex">Codex (OpenAI)</button>
-              <button data-agent="aider">Aider</button>
-              <button data-agent="shell">Shell</button>
-              <button data-agent="custom">Custom...</button>
+          <div id="header-buttons">
+            <div id="new-session-group">
+              <button id="new-session-btn">+ New</button>
+              <button id="new-session-dropdown-btn" title="Create with different agent">▾</button>
+              <div id="new-session-menu" class="dropdown-menu">
+                <button data-agent="claude-json">Claude</button>
+                <button data-agent="claude">Claude (xterm)</button>
+                <button data-agent="codex">Codex (OpenAI)</button>
+                <button data-agent="aider">Aider</button>
+                <button data-agent="shell">Shell</button>
+                <button data-agent="custom">Custom...</button>
+              </div>
             </div>
           </div>
         </div>
@@ -76,15 +78,16 @@
 
       <!-- Main terminal area -->
       <div id="main">
-        <div id="terminal-container"></div>
-        <!-- Chat container for JSON-based sessions -->
-        <div id="chat-container" style="display: none;"></div>
-        <div id="start-session-banner">
-          <div class="banner-content">
-            <span class="banner-status">Session inactive</span>
-            <span class="banner-action">Press any key or click to resume</span>
+        <div id="terminal-container">
+          <div id="start-session-banner">
+            <div class="banner-content">
+              <span class="banner-status">Session inactive</span>
+              <span class="banner-action">Press any key or click to resume</span>
+            </div>
           </div>
         </div>
+        <!-- Chat container for JSON-based sessions -->
+        <div id="chat-container" style="display: none;"></div>
         <div id="empty-state">
           <div class="icon">⌘</div>
           <h2>No Active Session</h2>
@@ -271,5 +274,6 @@
         </div>
       </div>
     </div>
+
   </body>
 </html>

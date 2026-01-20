@@ -13,6 +13,10 @@ const packageJsonPath = path.join(rootDir, 'package.json');
 const tauriConfPath = path.join(rootDir, 'src-tauri', 'tauri.conf.json');
 const cargoTomlPath = path.join(rootDir, 'src-tauri', 'Cargo.toml');
 
+// Parse args
+const args = process.argv.slice(2);
+const noInstall = args.includes('--no-install') || args.includes('--build-only');
+
 // Read current version
 const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
 const currentVersion = packageJson.version;
@@ -50,31 +54,39 @@ try {
   process.exit(1);
 }
 
-// Install to Applications
 const appSource = path.join(rootDir, 'src-tauri', 'target', 'release', 'bundle', 'macos', 'Agent Hub.app');
 const appDest = '/Applications/Agent Hub.app';
 
-console.log(`\n📲 Installing to Applications...`);
+if (noInstall) {
+  console.log(`\n✅ Release ${newVersion} built (--no-install)!\n`);
+  console.log(`   App bundle: ${appSource}`);
+  console.log(`   DMG: src-tauri/target/release/bundle/dmg/`);
+  console.log(`\n   To install manually:`);
+  console.log(`   ditto "${appSource}" "${appDest}"\n`);
+} else {
+  // Install to Applications
+  console.log(`\n📲 Installing to Applications...`);
 
-// Kill running app
-try {
-  execSync('pkill -f "Agent Hub"', { stdio: 'ignore' });
-  execSync('sleep 1');
-} catch (e) {
-  // App might not be running, that's fine
+  // Kill running app
+  try {
+    execSync('pkill -f "Agent Hub"', { stdio: 'ignore' });
+    execSync('sleep 1');
+  } catch (e) {
+    // App might not be running, that's fine
+  }
+
+  // Remove old and copy new
+  try {
+    execSync(`rm -rf "${appDest}"`);
+    execSync(`ditto "${appSource}" "${appDest}"`);
+    console.log(`✓ Installed to ${appDest}`);
+  } catch (e) {
+    console.error(`\n❌ Failed to install. You can manually run:`);
+    console.error(`   ditto "${appSource}" "${appDest}"`);
+    process.exit(1);
+  }
+
+  console.log(`\n✅ Release ${newVersion} complete!\n`);
+  console.log(`   App installed to: ${appDest}`);
+  console.log(`   DMG available at: src-tauri/target/release/bundle/dmg/\n`);
 }
-
-// Remove old and copy new
-try {
-  execSync(`rm -rf "${appDest}"`);
-  execSync(`ditto "${appSource}" "${appDest}"`);
-  console.log(`✓ Installed to ${appDest}`);
-} catch (e) {
-  console.error(`\n❌ Failed to install. You can manually run:`);
-  console.error(`   ditto "${appSource}" "${appDest}"`);
-  process.exit(1);
-}
-
-console.log(`\n✅ Release ${newVersion} complete!\n`);
-console.log(`   App installed to: ${appDest}`);
-console.log(`   DMG available at: src-tauri/target/release/bundle/dmg/\n`);

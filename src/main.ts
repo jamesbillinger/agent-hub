@@ -133,6 +133,17 @@ interface AppSettings {
   remote_pin?: string | null;
 }
 
+// Recently closed session for undo functionality
+interface RecentlyClosedSession {
+  id: string;
+  name: string;
+  agentType: "claude" | "claude-json" | "codex" | "aider" | "shell" | "custom";
+  command: string;
+  workingDir: string;
+  claudeSessionId?: string;
+  closedAt: Date;
+}
+
 // State
 const sessions: Map<string, Session> = new Map();
 const chatSessions: Map<string, ChatSession> = new Map();
@@ -162,6 +173,9 @@ let isResizingSidebar = false;
 type MobileView = "list" | "session";
 let currentMobileView: MobileView = "list";
 let isMobileLayout = false;
+
+// Recently closed sessions (for undo close) - loaded from database
+let recentlyClosed: RecentlyClosedSession[] = [];
 
 // Agent commands
 const AGENT_COMMANDS: Record<string, string> = {
@@ -574,7 +588,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     });
   });
 
-  // Close dropdown when clicking outside
+  // Close dropdowns when clicking outside
   document.addEventListener("click", () => {
     dropdownMenu.classList.remove("visible");
   });
@@ -952,6 +966,12 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // Keyboard shortcuts (bubbling phase)
   document.addEventListener("keydown", (e) => {
+    // Cmd+Shift+T or Ctrl+Shift+T to reopen recently closed session
+    if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "t") {
+      e.preventDefault();
+      reopenLastClosedSession();
+      return;
+    }
     // Cmd+T or Ctrl+T for new session
     if ((e.metaKey || e.ctrlKey) && e.key === "t") {
       e.preventDefault();
@@ -969,12 +989,17 @@ document.addEventListener("DOMContentLoaded", async () => {
       e.preventDefault();
       showSettingsModal();
     }
-    // Cmd+W to close current session
+    // Cmd+W to close current session (but not when typing in an input)
     if ((e.metaKey || e.ctrlKey) && e.key === "w") {
-      e.preventDefault();
-      if (activeSessionId) {
-        closeSession(activeSessionId);
+      const activeEl = document.activeElement;
+      const isTyping = activeEl instanceof HTMLInputElement || activeEl instanceof HTMLTextAreaElement;
+      if (!isTyping) {
+        e.preventDefault();
+        if (activeSessionId) {
+          closeSession(activeSessionId);
+        }
       }
+      // Let the chat input handle its own Ctrl+W for word deletion
     }
     // Cmd+B to toggle sidebar
     if ((e.metaKey || e.ctrlKey) && e.key === "b") {
@@ -1123,6 +1148,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // Load saved sessions from database
   await loadSavedSessions();
+  await loadRecentlyClosed();
 
   // Initial render
   renderSessionList();
@@ -1900,6 +1926,18 @@ async function startJsonProcess(session: Session) {
   chatSession.statusEl.textContent = "Starting...";
   chatSession.statusEl.className = "chat-status";
 
+  // Insert a placeholder init message immediately at the top
+  const existingInit = chatSession.messagesEl.querySelector(".init-details");
+  if (!existingInit) {
+    const initPlaceholder = document.createElement("div");
+    initPlaceholder.className = "chat-message system init-details";
+    initPlaceholder.innerHTML = `
+      <div class="init-header">Session starting...</div>
+      <div class="init-main">${session.workingDir || "~"}</div>
+    `;
+    chatSession.messagesEl.appendChild(initPlaceholder);
+  }
+
   try {
     await invoke("spawn_json_process", {
       sessionId: session.id,
@@ -1923,6 +1961,19 @@ async function startJsonProcess(session: Session) {
 async function closeSession(sessionId: string) {
   const session = sessions.get(sessionId);
   if (!session) return;
+
+  // Save to recently closed database before deleting
+  const closedSession: RecentlyClosedSession = {
+    id: session.id,
+    name: session.name,
+    agentType: session.agentType,
+    command: session.command,
+    workingDir: session.workingDir,
+    claudeSessionId: session.claudeSessionId,
+    closedAt: new Date(),
+  };
+  await saveRecentlyClosed(closedSession);
+  await loadRecentlyClosed(); // Refresh the list from database
 
   // Kill process (PTY or JSON)
   if (isJsonAgent(session.agentType)) {
@@ -1961,6 +2012,92 @@ async function closeSession(sessionId: string) {
   }
 
   renderSessionList();
+}
+
+// Recently closed functions
+function reopenLastClosedSession() {
+  if (recentlyClosed.length > 0) {
+    restoreRecentlyClosed(0);
+  }
+}
+
+async function restoreRecentlyClosed(index: number) {
+  const closed = recentlyClosed[index];
+  if (!closed) return;
+
+  // Remove from database
+  await invoke("delete_recently_closed", { sessionId: closed.id });
+  await loadRecentlyClosed(); // Refresh the list from database
+
+  // Calculate sort order
+  const minSortOrder = Math.min(0, ...Array.from(sessions.values()).map(s => s.sortOrder));
+
+  // Create the session with the saved settings
+  const session: Session = {
+    id: crypto.randomUUID(),
+    name: closed.name,
+    agentType: closed.agentType,
+    command: closed.command,
+    workingDir: closed.workingDir,
+    createdAt: new Date(),
+    isRunning: false,
+    claudeSessionId: closed.claudeSessionId, // Preserve for --resume
+    hasBeenStarted: false,
+    sortOrder: minSortOrder - 1,
+  };
+
+  sessions.set(session.id, session);
+  await saveSessionToDb(session);
+  await switchToSession(session.id);
+  await startSessionProcess(session);
+  renderSessionList();
+}
+
+// Database helpers for recently closed sessions
+async function saveRecentlyClosed(session: RecentlyClosedSession): Promise<void> {
+  await invoke("save_recently_closed", {
+    session: {
+      id: session.id,
+      name: session.name,
+      agent_type: session.agentType,
+      command: session.command,
+      working_dir: session.workingDir,
+      claude_session_id: session.claudeSessionId || null,
+      closed_at: session.closedAt.toISOString(),
+    },
+  });
+}
+
+async function loadRecentlyClosed(): Promise<void> {
+  try {
+    const data = await invoke<Array<{
+      id: string;
+      name: string;
+      agent_type: string;
+      command: string;
+      working_dir: string;
+      claude_session_id: string | null;
+      closed_at: string;
+    }>>("get_recently_closed");
+
+    recentlyClosed = data.map((d) => ({
+      id: d.id,
+      name: d.name,
+      agentType: d.agent_type as RecentlyClosedSession["agentType"],
+      command: d.command,
+      workingDir: d.working_dir,
+      claudeSessionId: d.claude_session_id || undefined,
+      closedAt: new Date(d.closed_at),
+    }));
+
+    // Update the History menu with recently closed sessions
+    await invoke("update_history_menu", {
+      sessions: data,
+    });
+  } catch (err) {
+    console.error("Failed to load recently closed sessions:", err);
+    recentlyClosed = [];
+  }
 }
 
 async function renameSession(sessionId: string, newName: string) {
@@ -2143,11 +2280,22 @@ function startRenaming(sessionId: string, nameEl: HTMLElement) {
 
 function updateView() {
   const hasActiveSession = activeSessionId !== null;
+  const activeSession = activeSessionId ? sessions.get(activeSessionId) : null;
+  const isJsonSession = activeSession && isJsonAgent(activeSession.agentType);
+
   emptyStateEl.style.display = hasActiveSession ? "none" : "flex";
-  terminalContainerEl.style.display = hasActiveSession ? "block" : "none";
+
+  // Show terminal container only for terminal sessions, hide for JSON/chat sessions
+  if (isJsonSession) {
+    terminalContainerEl.style.display = "none";
+    chatContainerEl.style.display = "flex";
+  } else {
+    terminalContainerEl.style.display = hasActiveSession ? "block" : "none";
+    chatContainerEl.style.display = "none";
+  }
 
   // Update terminal container to position properly
-  if (hasActiveSession) {
+  if (hasActiveSession && !isJsonSession) {
     terminalContainerEl.style.position = "relative";
   }
 
@@ -2335,6 +2483,85 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
 }
 
 /**
+ * Handle slash commands in chat
+ * Returns true if the command was handled, false to pass through to Claude
+ */
+async function handleSlashCommand(sessionId: string, command: string): Promise<boolean> {
+  const session = sessions.get(sessionId);
+  const chatSession = chatSessions.get(sessionId);
+  if (!session || !chatSession) return false;
+
+  const parts = command.slice(1).split(/\s+/);
+  const cmd = parts[0].toLowerCase();
+  const args = parts.slice(1).join(" ");
+
+  switch (cmd) {
+    case "help":
+      addChatMessage(sessionId, {
+        type: "system",
+        result: `**Available Commands:**
+• \`/help\` - Show this help message
+• \`/clear\` - Clear chat display (keeps conversation in Claude's context)
+• \`/resume\` - Resume an inactive session
+• \`/compact [instructions]\` - Compact conversation context
+• \`/cost\` - Show token usage and cost
+• \`/status\` - Show session status
+• \`/context\` - Show context usage
+
+Other commands like \`/memory\`, \`/config\`, \`/review\` are passed to Claude.`,
+      });
+      return true;
+
+    case "clear":
+      // Clear the chat display (but not Claude's context)
+      chatSession.messagesEl.innerHTML = "";
+      chatSession.messages = [];
+      addChatMessage(sessionId, {
+        type: "system",
+        result: "Chat display cleared. Claude still remembers the conversation.",
+      });
+      return true;
+
+    case "resume":
+      if (!session.isRunning) {
+        addChatMessage(sessionId, { type: "system", result: "Resuming session..." });
+        await startSessionProcess(session);
+      } else {
+        addChatMessage(sessionId, { type: "system", result: "Session is already running." });
+      }
+      return true;
+
+    case "status":
+      const statusInfo = [
+        `**Session:** ${session.name}`,
+        `**Agent:** ${session.agentType}`,
+        `**Running:** ${session.isRunning ? "Yes" : "No"}`,
+        `**Working Dir:** ${session.workingDir}`,
+        session.claudeSessionId ? `**Claude Session:** ${session.claudeSessionId}` : null,
+      ].filter(Boolean).join("\n");
+      addChatMessage(sessionId, { type: "system", result: statusInfo });
+      return true;
+
+    // These commands are passed through to Claude
+    case "compact":
+    case "cost":
+    case "context":
+    case "memory":
+    case "config":
+    case "review":
+    case "permissions":
+    case "vim":
+    case "terminal-setup":
+      // Pass these to Claude - return false so they're sent as messages
+      return false;
+
+    default:
+      // Unknown command - let Claude handle it
+      return false;
+  }
+}
+
+/**
  * Send a message in a chat session
  */
 async function sendChatMessage(sessionId: string) {
@@ -2344,6 +2571,17 @@ async function sendChatMessage(sessionId: string) {
 
   const message = chatSession.inputEl.value.trim();
   if (!message || chatSession.isProcessing) return;
+
+  // Handle slash commands
+  if (message.startsWith("/")) {
+    const handled = await handleSlashCommand(sessionId, message);
+    if (handled) {
+      chatSession.inputEl.value = "";
+      chatSession.inputEl.style.height = "auto";
+      return;
+    }
+    // If not handled, send as regular message (Claude may handle it)
+  }
 
   // Clear input
   chatSession.inputEl.value = "";
@@ -2463,10 +2701,7 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
         chatSession.toolUseCount++;
         messageEl.classList.remove("assistant");
         messageEl.classList.add("tool-use");
-        html += `<div class="tool-name">${escapeHtml(block.name || "Tool")}</div>`;
-        if (block.input) {
-          html += `<pre><code>${escapeHtml(JSON.stringify(block.input, null, 2))}</code></pre>`;
-        }
+        html += `<span class="tool-indicator">→ ${escapeHtml(block.name || "Tool")}</span>`;
       }
     }
 
@@ -2514,7 +2749,7 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
     const meta: string[] = [];
     if (message.permissionMode) meta.push(`permissions: ${message.permissionMode}`);
     if (message.claude_code_version) meta.push(`CC v${message.claude_code_version}`);
-    if (message.session_id) meta.push(`session: ${message.session_id.slice(0, 8)}...`);
+    if (message.session_id) meta.push(`session: ${message.session_id}`);
 
     messageEl.innerHTML = `
       <div class="init-header">Session initialized</div>
@@ -2532,18 +2767,28 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
       }
     }
 
-    // Insert init message before the most recent user message (race condition fix)
-    // Find the last user message element that doesn't have an init before it
-    const userMessages = chatSession.messagesEl.querySelectorAll(".chat-message.user");
-    if (userMessages.length > 0) {
-      const lastUserMsg = userMessages[userMessages.length - 1];
-      const prevSibling = lastUserMsg.previousElementSibling;
-      // Only insert before user message if there's no init already there
-      if (!prevSibling || !prevSibling.classList.contains("init-details")) {
-        chatSession.messagesEl.insertBefore(messageEl, lastUserMsg);
-        return; // Early return - we've already inserted
+    // Insert or update init message at the very beginning
+    const existingInit = chatSession.messagesEl.querySelector(".init-details") as HTMLElement;
+    if (existingInit) {
+      // Update existing placeholder with real init data
+      existingInit.innerHTML = messageEl.innerHTML;
+      return; // Early return - we've updated the existing
+    } else {
+      // No init yet - insert at the beginning
+      const firstChild = chatSession.messagesEl.firstChild;
+      if (firstChild) {
+        chatSession.messagesEl.insertBefore(messageEl, firstChild);
+      } else {
+        chatSession.messagesEl.appendChild(messageEl);
       }
+      return; // Early return - we've inserted
     }
+  } else if (message.type === "system" && message.result) {
+    // Plain system messages (e.g., from slash commands)
+    messageEl.classList.add("system");
+    // Render markdown
+    const renderedMarkdown = marked.parse(message.result) as string;
+    messageEl.innerHTML = renderedMarkdown;
   } else {
     // Skip other message types for now
     return;
@@ -2579,8 +2824,15 @@ function processChatOutput(sessionId: string, data: string) {
   // Keep last incomplete line in buffer
   chatSession.inputBuffer = lines.pop() || "";
 
-  for (const line of lines) {
+  for (let line of lines) {
     if (!line.trim()) continue;
+
+    // Strip iTerm2 shell integration escape codes that may prefix the JSON
+    // These look like: ]1337;RemoteHost=...]1337;CurrentDir=...{"type":...}
+    const jsonStart = line.indexOf("{");
+    if (jsonStart > 0) {
+      line = line.substring(jsonStart);
+    }
 
     try {
       const message = JSON.parse(line) as ClaudeJsonMessage;
@@ -2753,10 +3005,7 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
       } else if (block.type === "tool_use") {
         messageEl.classList.remove("assistant");
         messageEl.classList.add("tool-use");
-        html += `<div class="tool-name">${escapeHtml(block.name || "Tool")}</div>`;
-        if (block.input) {
-          html += `<pre><code>${escapeHtml(JSON.stringify(block.input, null, 2))}</code></pre>`;
-        }
+        html += `<span class="tool-indicator">→ ${escapeHtml(block.name || "Tool")}</span>`;
       }
     }
     messageEl.innerHTML = html || "(empty response)";
@@ -3006,7 +3255,13 @@ function handleMenuEvent(eventId: string): void {
       showAboutModal();
       break;
     default:
-      // Unknown menu event - ignore silently
+      // Handle recently closed menu items (recent_0, recent_1, etc.)
+      if (eventId.startsWith("recent_")) {
+        const index = parseInt(eventId.replace("recent_", ""), 10);
+        if (!isNaN(index)) {
+          restoreRecentlyClosed(index);
+        }
+      }
   }
 }
 

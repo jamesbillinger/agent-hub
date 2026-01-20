@@ -81,6 +81,10 @@ static JSON_BROADCASTERS: Lazy<Mutex<HashMap<String, broadcast::Sender<String>>>
 // Global AppHandle for web server to use
 static APP_HANDLE: Lazy<Mutex<Option<AppHandle>>> = Lazy::new(|| Mutex::new(None));
 
+// History menu submenu for dynamic updates
+#[cfg(not(target_os = "ios"))]
+static HISTORY_MENU: Lazy<Mutex<Option<Submenu<tauri::Wry>>>> = Lazy::new(|| Mutex::new(None));
+
 // Web server port - determined at runtime with failover
 static WEB_SERVER_PORT: Lazy<Mutex<Option<u16>>> = Lazy::new(|| Mutex::new(None));
 
@@ -248,6 +252,20 @@ fn init_db() -> rusqlite::Result<Connection> {
         [],
     )?;
 
+    // Create recently_closed table for undo close functionality
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS recently_closed (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            agent_type TEXT NOT NULL,
+            command TEXT NOT NULL,
+            working_dir TEXT NOT NULL,
+            claude_session_id TEXT,
+            closed_at TEXT NOT NULL
+        )",
+        [],
+    )?;
+
     Ok(conn)
 }
 
@@ -385,6 +403,126 @@ fn delete_session(session_id: String) -> Result<(), String> {
     let conn = init_db().map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RecentlyClosedData {
+    id: String,
+    name: String,
+    agent_type: String,
+    command: String,
+    working_dir: String,
+    claude_session_id: Option<String>,
+    closed_at: String,
+}
+
+#[tauri::command]
+fn save_recently_closed(session: RecentlyClosedData) -> Result<(), String> {
+    let conn = init_db().map_err(|e| e.to_string())?;
+
+    // Insert the newly closed session
+    conn.execute(
+        "INSERT OR REPLACE INTO recently_closed (id, name, agent_type, command, working_dir, claude_session_id, closed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            session.id,
+            session.name,
+            session.agent_type,
+            session.command,
+            session.working_dir,
+            session.claude_session_id,
+            session.closed_at,
+        ],
+    ).map_err(|e| e.to_string())?;
+
+    // Keep only the 10 most recent entries
+    conn.execute(
+        "DELETE FROM recently_closed WHERE id NOT IN (
+            SELECT id FROM recently_closed ORDER BY closed_at DESC LIMIT 10
+        )",
+        [],
+    ).map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+#[tauri::command]
+fn get_recently_closed() -> Result<Vec<RecentlyClosedData>, String> {
+    let conn = init_db().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT id, name, agent_type, command, working_dir, claude_session_id, closed_at FROM recently_closed ORDER BY closed_at DESC")
+        .map_err(|e| e.to_string())?;
+
+    let sessions: Vec<RecentlyClosedData> = stmt
+        .query_map([], |row| {
+            Ok(RecentlyClosedData {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                agent_type: row.get(2)?,
+                command: row.get(3)?,
+                working_dir: row.get(4)?,
+                claude_session_id: row.get(5)?,
+                closed_at: row.get(6)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(sessions)
+}
+
+#[tauri::command]
+fn delete_recently_closed(session_id: String) -> Result<(), String> {
+    let conn = init_db().map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM recently_closed WHERE id = ?1", params![session_id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Update the History menu with recently closed sessions
+#[cfg(not(target_os = "ios"))]
+#[tauri::command]
+fn update_history_menu(sessions: Vec<RecentlyClosedData>) -> Result<(), String> {
+    let app_handle = APP_HANDLE.lock();
+    let app = app_handle.as_ref().ok_or("App handle not available")?;
+
+    let history_menu_guard = HISTORY_MENU.lock();
+    let history_menu = history_menu_guard.as_ref().ok_or("History menu not available")?;
+
+    // Remove all existing items
+    if let Ok(items) = history_menu.items() {
+        for item in items {
+            let _ = history_menu.remove(&item);
+        }
+    }
+
+    if sessions.is_empty() {
+        // Add placeholder when no sessions
+        let no_recent = MenuItem::with_id(app, "no_recent", "No Recently Closed", false, None::<&str>)
+            .map_err(|e| e.to_string())?;
+        history_menu.append(&no_recent).map_err(|e| e.to_string())?;
+    } else {
+        // Add each session as a menu item
+        for (index, session) in sessions.iter().enumerate() {
+            let id = format!("recent_{}", index);
+            let label = &session.name;
+            // Add keyboard shortcut for first item (Cmd+Shift+T)
+            let accel = if index == 0 { Some("CmdOrCtrl+Shift+T") } else { None };
+            let item = MenuItem::with_id(app, &id, label, true, accel)
+                .map_err(|e| e.to_string())?;
+            history_menu.append(&item).map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
+// Stub for iOS - no menu support
+#[cfg(target_os = "ios")]
+#[tauri::command]
+fn update_history_menu(_sessions: Vec<RecentlyClosedData>) -> Result<(), String> {
     Ok(())
 }
 
@@ -1151,12 +1289,16 @@ fn create_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let hide_text = format!("Hide {}", APP_NAME);
     let quit_text = format!("Quit {}", APP_NAME);
 
+    let settings = MenuItem::with_id(app, "settings", "Settings...", true, Some("CmdOrCtrl+,"))?;
+
     let app_menu = Submenu::with_items(
         app,
         APP_NAME,
         true,
         &[
             &PredefinedMenuItem::about(app, Some(&about_text), None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &settings,
             &PredefinedMenuItem::separator(app)?,
             &PredefinedMenuItem::services(app, Some("Services"))?,
             &PredefinedMenuItem::separator(app)?,
@@ -1171,7 +1313,6 @@ fn create_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     // File menu
     let new_session = MenuItem::with_id(app, "new_session", "New Session", true, Some("CmdOrCtrl+T"))?;
     let close_session = MenuItem::with_id(app, "close_session", "Close Session", true, Some("CmdOrCtrl+W"))?;
-    let settings = MenuItem::with_id(app, "settings", "Settings...", true, Some("CmdOrCtrl+,"))?;
 
     let file_menu = Submenu::with_items(
         app,
@@ -1180,8 +1321,6 @@ fn create_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         &[
             &new_session,
             &close_session,
-            &PredefinedMenuItem::separator(app)?,
-            &settings,
         ],
     )?;
 
@@ -1243,6 +1382,21 @@ fn create_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         ],
     )?;
 
+    // History menu - starts with "No Recently Closed" placeholder
+    let no_recent = MenuItem::with_id(app, "no_recent", "No Recently Closed", false, None::<&str>)?;
+
+    let history_menu = Submenu::with_items(
+        app,
+        "History",
+        true,
+        &[
+            &no_recent,
+        ],
+    )?;
+
+    // Store history menu for dynamic updates
+    *HISTORY_MENU.lock() = Some(history_menu.clone());
+
     // Window menu
     let window_menu = Submenu::with_items(
         app,
@@ -1277,6 +1431,7 @@ fn create_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             &file_menu,
             &edit_menu,
             &view_menu,
+            &history_menu,
             &session_menu,
             &window_menu,
             &help_menu,
@@ -3736,7 +3891,12 @@ fn setup_app(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             "about" => {
                 let _ = app.emit("menu-event", "about");
             }
-            _ => {}
+            _ => {
+                // Handle recently closed items (recent_0, recent_1, etc.)
+                if id.starts_with("recent_") {
+                    let _ = app.emit("menu-event", id);
+                }
+            }
         }
     });
 
@@ -3810,6 +3970,10 @@ pub fn run() {
             delete_session,
             update_session_claude_id,
             update_session_orders,
+            save_recently_closed,
+            get_recently_closed,
+            delete_recently_closed,
+            update_history_menu,
             save_terminal_buffer,
             load_terminal_buffer,
             delete_terminal_buffer,
@@ -3843,6 +4007,10 @@ pub fn run() {
             delete_session,
             update_session_claude_id,
             update_session_orders,
+            save_recently_closed,
+            get_recently_closed,
+            delete_recently_closed,
+            update_history_menu,
             save_terminal_buffer,
             load_terminal_buffer,
             delete_terminal_buffer,
