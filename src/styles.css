@@ -1074,6 +1074,8 @@ body.resizing-sidebar {
   background: var(--accent-primary);
   color: white;
   border-bottom-right-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .chat-message.assistant {
