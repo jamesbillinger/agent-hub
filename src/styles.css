@@ -1128,14 +1128,15 @@ body.resizing-sidebar {
   font-family: 'Menlo', 'Monaco', monospace;
 }
 
+/* Tool use - flat style like system messages */
 .chat-message.tool-use {
-  align-self: flex-start;
-  background: var(--bg-tertiary);
-  padding: 4px 8px;
-  border-radius: 4px;
+  align-self: center;
+  background: transparent;
+  padding: 4px 12px;
+  border-radius: 0;
   font-size: 11px;
   font-family: 'Menlo', 'Monaco', monospace;
-  color: var(--text-secondary);
+  color: var(--text-muted);
   max-width: 100%;
   overflow-x: auto;
 }
@@ -1146,9 +1147,14 @@ body.resizing-sidebar {
 }
 
 .chat-message.tool-use .tool-input {
-  color: var(--text-muted);
+  display: block;
+  color: var(--text-dim);
   white-space: pre-wrap;
-  word-break: break-all;
+  word-break: break-word;
+  margin-top: 2px;
+  padding-left: 8px;
+  border-left: 2px solid var(--border-color);
+  font-size: 10px;
 }
 
 .chat-message.tool-result {
@@ -1244,6 +1250,123 @@ body.resizing-sidebar {
   border-top: 1px solid var(--border-color);
 }
 
+
+/* Attachments preview area */
+.chat-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 16px;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border-color);
+}
+
+.chat-attachments:empty {
+  display: none;
+  padding: 0;
+  border-top: none;
+}
+
+.attachment-preview {
+  position: relative;
+  max-width: 120px;
+  max-height: 80px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--border-color);
+}
+
+.attachment-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.attachment-preview .attachment-remove {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.7);
+  color: white;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.attachment-preview .attachment-remove:hover {
+  background: rgba(0, 0, 0, 0.9);
+}
+
+/* Text paste preview */
+.text-paste-preview {
+  flex: 1 1 100%;
+  background: var(--bg-tertiary);
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--border-color);
+}
+
+.paste-preview-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--bg-hover);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.paste-preview-info {
+  flex: 1;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: 'Menlo', 'Monaco', monospace;
+}
+
+.paste-preview-expand,
+.paste-preview-remove {
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  border: none;
+  cursor: pointer;
+  font-size: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.paste-preview-expand:hover,
+.paste-preview-remove:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.paste-preview-content,
+.paste-preview-full {
+  margin: 0;
+  padding: 8px 10px;
+  font-size: 11px;
+  font-family: 'Menlo', 'Monaco', monospace;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.paste-preview-content.collapsed {
+  max-height: 60px;
+  overflow: hidden;
+}
 
 .chat-input-container {
   display: flex;

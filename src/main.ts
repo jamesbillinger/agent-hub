@@ -95,6 +95,13 @@ interface ClaudeJsonMessage {
   };
 }
 
+// Pending image attachment
+interface PendingImage {
+  mediaType: string;
+  base64Data: string;
+  previewEl?: HTMLElement;
+}
+
 // Chat UI state for JSON sessions
 interface ChatSession {
   messagesEl: HTMLElement;
@@ -102,9 +109,11 @@ interface ChatSession {
   sendBtn: HTMLButtonElement;
   statusEl: HTMLElement;
   containerEl: HTMLElement;
+  attachmentsEl: HTMLElement; // Preview area for pending images
   messages: ClaudeJsonMessage[];
   isProcessing: boolean;
   inputBuffer: string; // Buffer for partial JSON lines
+  pendingImages: PendingImage[]; // Images waiting to be sent
   // Streaming stats
   toolUseCount: number;
   streamingTokens: number;
@@ -2408,6 +2417,7 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
         <span class="dot"></span>
       </div>
     </div>
+    <div class="chat-attachments"></div>
     <div class="chat-input-container">
       <textarea class="chat-input" placeholder="Type a message..." rows="1"></textarea>
       <button class="chat-send-btn">Send</button>
@@ -2421,6 +2431,7 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
   const inputEl = containerEl.querySelector(".chat-input") as HTMLTextAreaElement;
   const sendBtn = containerEl.querySelector(".chat-send-btn") as HTMLButtonElement;
   const statusEl = containerEl.querySelector(".chat-status") as HTMLElement;
+  const attachmentsEl = containerEl.querySelector(".chat-attachments") as HTMLElement;
 
   const chatSession: ChatSession = {
     messagesEl,
@@ -2428,9 +2439,11 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
     sendBtn,
     statusEl,
     containerEl,
+    attachmentsEl,
     messages: [],
     isProcessing: false,
     inputBuffer: "",
+    pendingImages: [],
     toolUseCount: 0,
     streamingTokens: 0,
     startTime: null,
@@ -2469,6 +2482,126 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
       inputEl.value = text.slice(0, wordStart) + text.slice(pos);
       inputEl.selectionStart = inputEl.selectionEnd = wordStart;
       inputEl.dispatchEvent(new Event("input")); // Trigger resize
+    }
+  });
+
+  // Handle paste events for images and long text
+  inputEl.addEventListener("paste", async (e) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+
+    // Check for images first
+    for (const item of items) {
+      if (item.type.startsWith("image/")) {
+        e.preventDefault();
+        const file = item.getAsFile();
+        if (!file) continue;
+
+        // Read as base64
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = reader.result as string;
+          // Extract base64 data (remove "data:image/png;base64," prefix)
+          const base64Match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+          if (!base64Match) return;
+
+          const mediaType = base64Match[1];
+          const base64Data = base64Match[2];
+
+          // Create preview element
+          const previewEl = document.createElement("div");
+          previewEl.className = "attachment-preview";
+          previewEl.innerHTML = `
+            <img src="${dataUrl}" alt="Attached image" />
+            <button class="attachment-remove" title="Remove">×</button>
+          `;
+
+          // Remove button handler
+          const removeBtn = previewEl.querySelector(".attachment-remove")!;
+          removeBtn.addEventListener("click", () => {
+            const idx = chatSession.pendingImages.findIndex(img => img.previewEl === previewEl);
+            if (idx >= 0) {
+              chatSession.pendingImages.splice(idx, 1);
+            }
+            previewEl.remove();
+          });
+
+          chatSession.attachmentsEl.appendChild(previewEl);
+          chatSession.pendingImages.push({ mediaType, base64Data, previewEl });
+        };
+        reader.readAsDataURL(file);
+        return; // Don't process text if pasting image
+      }
+    }
+
+    // Check for long text paste (>500 chars or >10 lines)
+    const pastedText = e.clipboardData?.getData("text");
+    if (pastedText) {
+      const lineCount = pastedText.split("\n").length;
+      const charCount = pastedText.length;
+
+      if (charCount > 500 || lineCount > 10) {
+        e.preventDefault();
+
+        // Get current cursor position
+        const cursorPos = inputEl.selectionStart || 0;
+        const beforeCursor = inputEl.value.slice(0, cursorPos);
+        const afterCursor = inputEl.value.slice(inputEl.selectionEnd || cursorPos);
+
+        // Insert the full text but collapse the view
+        const fullText = beforeCursor + pastedText + afterCursor;
+        inputEl.value = fullText;
+
+        // Create a collapsed preview in attachments area
+        const previewEl = document.createElement("div");
+        previewEl.className = "text-paste-preview";
+
+        // Show first few lines as preview
+        const previewLines = pastedText.split("\n").slice(0, 3);
+        const previewText = previewLines.join("\n") + (lineCount > 3 ? "\n..." : "");
+
+        previewEl.innerHTML = `
+          <div class="paste-preview-header">
+            <span class="paste-preview-info">${lineCount} lines, ${charCount.toLocaleString()} chars</span>
+            <button class="paste-preview-expand" title="Expand">▼</button>
+            <button class="paste-preview-remove" title="Remove">×</button>
+          </div>
+          <pre class="paste-preview-content collapsed">${escapeHtml(previewText)}</pre>
+          <pre class="paste-preview-full" style="display: none;">${escapeHtml(pastedText)}</pre>
+        `;
+
+        // Expand/collapse handler
+        const expandBtn = previewEl.querySelector(".paste-preview-expand") as HTMLButtonElement;
+        const contentEl = previewEl.querySelector(".paste-preview-content") as HTMLElement;
+        const fullEl = previewEl.querySelector(".paste-preview-full") as HTMLElement;
+        let isExpanded = false;
+
+        expandBtn.addEventListener("click", () => {
+          isExpanded = !isExpanded;
+          if (isExpanded) {
+            contentEl.style.display = "none";
+            fullEl.style.display = "block";
+            expandBtn.textContent = "▲";
+          } else {
+            contentEl.style.display = "block";
+            fullEl.style.display = "none";
+            expandBtn.textContent = "▼";
+          }
+        });
+
+        // Remove handler - clear the input
+        const removeBtn = previewEl.querySelector(".paste-preview-remove") as HTMLButtonElement;
+        removeBtn.addEventListener("click", () => {
+          inputEl.value = beforeCursor + afterCursor;
+          inputEl.dispatchEvent(new Event("input"));
+          previewEl.remove();
+        });
+
+        chatSession.attachmentsEl.appendChild(previewEl);
+
+        // Collapse the textarea to a reasonable height
+        inputEl.style.height = "40px";
+      }
     }
   });
 
@@ -2596,7 +2729,8 @@ async function sendChatMessage(sessionId: string) {
   if (!session || !chatSession) return;
 
   const message = chatSession.inputEl.value.trim();
-  if (!message || chatSession.isProcessing) return;
+  // Allow sending if there's text OR images attached
+  if ((!message && chatSession.pendingImages.length === 0) || chatSession.isProcessing) return;
 
   // Handle slash commands
   if (message.startsWith("/")) {
@@ -2669,13 +2803,41 @@ async function sendChatMessage(sessionId: string) {
 
   chatSession.statusEl.textContent = "Thinking...";
 
+  // Build message content - either string or array with images
+  let messageContent: string | Array<{type: string; text?: string; source?: {type: string; media_type: string; data: string}}>;
+
+  if (chatSession.pendingImages.length > 0) {
+    // Build content array with images and text
+    messageContent = [];
+    for (const img of chatSession.pendingImages) {
+      messageContent.push({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: img.mediaType,
+          data: img.base64Data,
+        }
+      });
+    }
+    if (message) {
+      messageContent.push({ type: "text", text: message });
+    }
+    // Clear attachments
+    chatSession.pendingImages = [];
+    chatSession.attachmentsEl.innerHTML = "";
+  } else {
+    messageContent = message;
+    // Clear any text paste preview
+    chatSession.attachmentsEl.innerHTML = "";
+  }
+
   // Send to process stdin as JSON
   // Format: {"type":"user","message":{"role":"user","content":"..."}}
   const jsonMessage = JSON.stringify({
     type: "user",
     message: {
       role: "user",
-      content: message,
+      content: messageContent,
     }
   }) + "\n";
 
@@ -2727,8 +2889,9 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
         chatSession.toolUseCount++;
         messageEl.classList.remove("assistant");
         messageEl.classList.add("tool-use");
-        const inputJson = JSON.stringify(block.input || {});
-        html += `<span class="tool-name">${escapeHtml(block.name || "Tool")}</span> <span class="tool-input">${escapeHtml(inputJson)}</span>`;
+        // Format JSON with indentation for readability
+        const inputJson = JSON.stringify(block.input || {}, null, 2);
+        html += `<span class="tool-name">${escapeHtml(block.name || "Tool")}</span>\n<span class="tool-input">${escapeHtml(inputJson)}</span>`;
       }
     }
 
@@ -2799,7 +2962,6 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
     if (existingInit) {
       // Update existing placeholder with real init data
       existingInit.innerHTML = messageEl.innerHTML;
-      return; // Early return - we've updated the existing
     } else {
       // No init yet - insert at the beginning
       const firstChild = chatSession.messagesEl.firstChild;
@@ -2808,8 +2970,10 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
       } else {
         chatSession.messagesEl.appendChild(messageEl);
       }
-      return; // Early return - we've inserted
     }
+    // Save init message so it persists across restarts
+    saveChatMessages(sessionId);
+    return;
   } else if (message.type === "system" && message.result) {
     // Plain system messages (e.g., from slash commands)
     messageEl.classList.add("system");
@@ -3033,8 +3197,9 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
       } else if (block.type === "tool_use") {
         messageEl.classList.remove("assistant");
         messageEl.classList.add("tool-use");
-        const inputJson = JSON.stringify(block.input || {});
-        html += `<span class="tool-name">${escapeHtml(block.name || "Tool")}</span> <span class="tool-input">${escapeHtml(inputJson)}</span>`;
+        // Format JSON with indentation for readability
+        const inputJson = JSON.stringify(block.input || {}, null, 2);
+        html += `<span class="tool-name">${escapeHtml(block.name || "Tool")}</span>\n<span class="tool-input">${escapeHtml(inputJson)}</span>`;
       }
     }
     messageEl.innerHTML = html || "(empty response)";
@@ -3046,8 +3211,22 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
       return; // Skip non-error results
     }
   } else if (message.type === "system" && message.subtype === "init") {
-    messageEl.classList.add("system");
-    messageEl.textContent = `Session started • ${message.model || "Claude"} • ${message.cwd || ""}`;
+    messageEl.classList.add("system", "init-details");
+    // Build detailed init message (same as live rendering)
+    const details: string[] = [];
+    if (message.model) details.push(message.model);
+    if (message.cwd) details.push(message.cwd);
+
+    const meta: string[] = [];
+    if (message.permissionMode) meta.push(`permissions: ${message.permissionMode}`);
+    if (message.claude_code_version) meta.push(`CC v${message.claude_code_version}`);
+    if (message.session_id) meta.push(`session: ${message.session_id}`);
+
+    messageEl.innerHTML = `
+      <div class="init-header">Session initialized</div>
+      <div class="init-main">${details.join(" • ")}</div>
+      ${meta.length > 0 ? `<div class="init-meta">${meta.join(" • ")}</div>` : ""}
+    `;
   } else {
     return; // Skip other message types
   }
