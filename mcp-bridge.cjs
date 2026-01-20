@@ -131,23 +131,26 @@ function executeJs(code, timeoutMs = 5000) {
 // Tool implementations
 const toolHandlers = {
   async take_screenshot() {
-    const js = `return {
+    // Use parentheses to make object literal an expression
+    const js = `({
       width: window.innerWidth,
       height: window.innerHeight,
       title: document.title,
       url: window.location.href,
       bodyText: document.body.innerText.substring(0, 8000)
-    };`;
+    })`;
     return executeJs(js);
   },
 
   async execute_js({ code }) {
-    const js = `return (function() { ${code} })();`;
+    // Wrap in IIFE without return - eval returns the result of the expression
+    const js = `(function() { ${code} })()`;
     return executeJs(js, 10000);
   },
 
   async get_ui_state() {
-    const js = `return {
+    // Use parentheses to make object literal an expression
+    const js = `({
       title: document.title,
       url: window.location.href,
       viewport: { width: window.innerWidth, height: window.innerHeight },
@@ -173,27 +176,29 @@ const toolHandlers = {
         href: a.href
       })),
       text: document.body.innerText.substring(0, 5000)
-    };`;
+    })`;
     return executeJs(js);
   },
 
   async click_element({ selector }) {
     const escaped = selector.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"');
-    const js = `
+    // Wrap in IIFE - return inside IIFE is valid
+    const js = `(function() {
       const el = document.querySelector("${escaped}");
       if (!el) {
         return { success: false, error: 'Element not found: ${escaped}' };
       }
       el.click();
       return { success: true, clicked: '${escaped}', tagName: el.tagName, text: (el.textContent || '').trim().substring(0, 50) };
-    `;
+    })()`;
     return executeJs(js);
   },
 
   async type_text({ selector, text }) {
     const escapedSel = selector.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"');
     const escapedText = text.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"').replace(/\n/g, '\\n');
-    const js = `
+    // Wrap in IIFE - return inside IIFE is valid
+    const js = `(function() {
       const el = document.querySelector("${escapedSel}");
       if (!el) {
         return { success: false, error: 'Element not found: ${escapedSel}' };
@@ -203,13 +208,14 @@ const toolHandlers = {
       el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
       return { success: true, selector: '${escapedSel}', typedLength: ${text.length} };
-    `;
+    })()`;
     return executeJs(js);
   },
 
   async wait_for_element({ selector, timeout_ms = 5000 }) {
     const escaped = selector.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"');
-    const js = `
+    // Wrap in async IIFE for await support
+    const js = `(async function() {
       const start = Date.now();
       while (Date.now() - start < ${timeout_ms}) {
         const el = document.querySelector("${escaped}");
@@ -219,25 +225,27 @@ const toolHandlers = {
         await new Promise(r => setTimeout(r, 100));
       }
       return { success: false, found: false, selector: '${escaped}', error: 'Timeout after ${timeout_ms}ms' };
-    `;
+    })()`;
     return executeJs(js, timeout_ms + 1000);
   },
 
   async get_text({ selector }) {
     const escaped = selector.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"');
-    const js = `
+    // Wrap in IIFE - return inside IIFE is valid
+    const js = `(function() {
       const el = document.querySelector("${escaped}");
       if (!el) {
         return { success: false, error: 'Element not found: ${escaped}' };
       }
       const text = (el.textContent || el.innerText || '').trim();
       return { success: true, selector: '${escaped}', text: text.substring(0, 5000), length: text.length };
-    `;
+    })()`;
     return executeJs(js);
   },
 
   async list_elements() {
-    const js = `
+    // Wrap in IIFE - return inside IIFE is valid
+    const js = `(function() {
       const elements = [];
       document.querySelectorAll('button').forEach((el, i) => {
         const text = (el.textContent || '').trim().substring(0, 50);
@@ -278,7 +286,7 @@ const toolHandlers = {
         }
       });
       return { elements: elements, count: elements.length };
-    `;
+    })()`;
     return executeJs(js);
   }
 };

@@ -624,6 +624,13 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (e.target === aboutModal) hideAboutModal();
   });
 
+  // Claude sessions modal event listeners
+  const claudeSessionsModalEl = document.getElementById("claude-sessions-modal")!;
+  document.getElementById("claude-sessions-cancel")!.addEventListener("click", hideClaudeSessionsModal);
+  claudeSessionsModalEl.addEventListener("click", (e) => {
+    if (e.target === claudeSessionsModalEl) hideClaudeSessionsModal();
+  });
+
   // Start session banner click handler
   document.getElementById("start-session-banner")!.addEventListener("click", async () => {
     if (activeSessionId) {
@@ -911,9 +918,13 @@ document.addEventListener("DOMContentLoaded", async () => {
     const { request_id, code } = event.payload;
     let result: unknown;
     try {
-      // Execute the JS code
-      const fn = new Function(code);
-      result = await fn();
+      // Execute the JS code using eval to properly return expression values
+      // eslint-disable-next-line no-eval
+      result = eval(code);
+      // Handle async results
+      if (result instanceof Promise) {
+        result = await result;
+      }
     } catch (e) {
       result = { error: e instanceof Error ? e.message : String(e) };
     }
@@ -2499,16 +2510,22 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
     case "help":
       addChatMessage(sessionId, {
         type: "system",
-        result: `**Available Commands:**
+        result: `**App Commands (handled locally):**
 • \`/help\` - Show this help message
 • \`/clear\` - Clear chat display (keeps conversation in Claude's context)
-• \`/resume\` - Resume an inactive session
+• \`/restart\` - Restart an inactive session process
+• \`/status\` - Show session status
+
+**Claude Commands (passed through):**
 • \`/compact [instructions]\` - Compact conversation context
 • \`/cost\` - Show token usage and cost
-• \`/status\` - Show session status
 • \`/context\` - Show context usage
+• \`/review\` - Review code changes
+• \`/init\` - Reinitialize session
 
-Other commands like \`/memory\`, \`/config\`, \`/review\` are passed to Claude.`,
+**Not available in JSON mode:**
+• \`/resume\` - Use Session > Browse Claude Sessions menu instead
+• \`/memory\`, \`/config\` - Interactive only`,
       });
       return true;
 
@@ -2522,9 +2539,9 @@ Other commands like \`/memory\`, \`/config\`, \`/review\` are passed to Claude.`
       });
       return true;
 
-    case "resume":
+    case "restart":
       if (!session.isRunning) {
-        addChatMessage(sessionId, { type: "system", result: "Resuming session..." });
+        addChatMessage(sessionId, { type: "system", result: "Restarting session..." });
         await startSessionProcess(session);
       } else {
         addChatMessage(sessionId, { type: "system", result: "Session is already running." });
@@ -2542,18 +2559,27 @@ Other commands like \`/memory\`, \`/config\`, \`/review\` are passed to Claude.`
       addChatMessage(sessionId, { type: "system", result: statusInfo });
       return true;
 
-    // These commands are passed through to Claude
+    // These commands work in JSON mode and are passed through to Claude
     case "compact":
     case "cost":
     case "context":
-    case "memory":
-    case "config":
     case "review":
-    case "permissions":
-    case "vim":
-    case "terminal-setup":
+    case "init":
+    case "pr-comments":
+    case "release-notes":
+    case "security-review":
       // Pass these to Claude - return false so they're sent as messages
       return false;
+
+    // These commands don't work in JSON mode - show helpful message
+    case "resume":
+    case "memory":
+    case "config":
+      addChatMessage(sessionId, {
+        type: "system",
+        result: `\`/${cmd}\` requires interactive mode and doesn't work in Agent Hub. See Session menu for alternatives.`,
+      });
+      return true;
 
     default:
       // Unknown command - let Claude handle it
@@ -2701,7 +2727,8 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
         chatSession.toolUseCount++;
         messageEl.classList.remove("assistant");
         messageEl.classList.add("tool-use");
-        html += `<span class="tool-indicator">→ ${escapeHtml(block.name || "Tool")}</span>`;
+        const inputJson = JSON.stringify(block.input || {});
+        html += `<span class="tool-name">${escapeHtml(block.name || "Tool")}</span> <span class="tool-input">${escapeHtml(inputJson)}</span>`;
       }
     }
 
@@ -2801,13 +2828,14 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
 
   // Only auto-scroll if was already at bottom (or user message)
   if (wasAtBottom || message.type === "user") {
-    chatSession.messagesEl.scrollTop = chatSession.messagesEl.scrollHeight;
+    // Use requestAnimationFrame to ensure DOM is painted before scrolling
+    requestAnimationFrame(() => {
+      chatSession.messagesEl.scrollTop = chatSession.messagesEl.scrollHeight;
+    });
   }
 
-  // Save messages when user sends a message
-  if (message.type === "user") {
-    saveChatMessages(sessionId);
-  }
+  // Save messages after every message for safety
+  saveChatMessages(sessionId);
 }
 
 /**
@@ -3005,7 +3033,8 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
       } else if (block.type === "tool_use") {
         messageEl.classList.remove("assistant");
         messageEl.classList.add("tool-use");
-        html += `<span class="tool-indicator">→ ${escapeHtml(block.name || "Tool")}</span>`;
+        const inputJson = JSON.stringify(block.input || {});
+        html += `<span class="tool-name">${escapeHtml(block.name || "Tool")}</span> <span class="tool-input">${escapeHtml(inputJson)}</span>`;
       }
     }
     messageEl.innerHTML = html || "(empty response)";
@@ -3073,9 +3102,17 @@ async function deleteTerminalBuffer(sessionId: string): Promise<void> {
 async function saveAllTerminalBuffers(): Promise<void> {
   const savePromises: Promise<void>[] = [];
 
+  // Save xterm terminal buffers
   for (const session of sessions.values()) {
     if (session.terminal && session.serializeAddon) {
       savePromises.push(saveTerminalBuffer(session));
+    }
+  }
+
+  // Save chat session messages
+  for (const [sessionId, chatSession] of chatSessions.entries()) {
+    if (chatSession.messages.length > 0) {
+      savePromises.push(saveChatMessages(sessionId));
     }
   }
 
@@ -3149,6 +3186,107 @@ async function showAboutModal(): Promise<void> {
 
 function hideAboutModal(): void {
   aboutModal.classList.remove("visible");
+}
+
+// Claude Sessions Browser Modal
+
+interface ClaudeSessionInfo {
+  session_id: string;
+  modified: number;
+  first_message: string;
+  project: string;
+}
+
+async function showClaudeSessionsModal(): Promise<void> {
+  const claudeSessionsModal = document.getElementById("claude-sessions-modal")!;
+  const claudeSessionsList = document.getElementById("claude-sessions-list")!;
+
+  claudeSessionsModal.classList.add("visible");
+  claudeSessionsList.innerHTML = '<p class="loading">Loading sessions...</p>';
+
+  // Get the active session's working directory
+  let workingDir: string | null = null;
+  if (activeSessionId) {
+    const session = sessions.get(activeSessionId);
+    if (session?.workingDir) {
+      workingDir = session.workingDir;
+    }
+  }
+
+  try {
+    const sessions_list = await invoke<ClaudeSessionInfo[]>("list_claude_sessions", {
+      workingDir,
+    });
+
+    if (sessions_list.length === 0) {
+      claudeSessionsList.innerHTML = '<p class="no-sessions">No Claude sessions found for this project.</p>';
+      return;
+    }
+
+    claudeSessionsList.innerHTML = "";
+    for (const session of sessions_list) {
+      const item = document.createElement("div");
+      item.className = "claude-session-item";
+
+      const date = new Date(session.modified * 1000);
+      const dateStr = date.toLocaleDateString() + " " + date.toLocaleTimeString();
+
+      item.innerHTML = `
+        <div class="session-date">${escapeHtml(dateStr)}</div>
+        <div class="session-preview">${escapeHtml(session.first_message || "(No preview)")}</div>
+        <div class="session-id">${escapeHtml(session.session_id)}</div>
+      `;
+
+      item.addEventListener("click", () => {
+        resumeClaudeSession(session.session_id, session.project);
+      });
+
+      claudeSessionsList.appendChild(item);
+    }
+  } catch (err) {
+    console.error("Failed to load Claude sessions:", err);
+    claudeSessionsList.innerHTML = `<p class="no-sessions">Error loading sessions: ${err}</p>`;
+  }
+}
+
+function hideClaudeSessionsModal(): void {
+  const claudeSessionsModal = document.getElementById("claude-sessions-modal")!;
+  claudeSessionsModal.classList.remove("visible");
+}
+
+async function resumeClaudeSession(claudeSessionId: string, project: string): Promise<void> {
+  hideClaudeSessionsModal();
+
+  // Create a new Agent Hub session that resumes the Claude session
+  const newSession: Session = {
+    id: crypto.randomUUID(),
+    name: `Resumed: ${claudeSessionId.substring(0, 8)}...`,
+    agentType: "claude-json",
+    command: `claude --print --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions --resume ${claudeSessionId}`,
+    workingDir: project,
+    createdAt: new Date(),
+    claudeSessionId: claudeSessionId,
+    sortOrder: sessions.size,
+    isRunning: false,
+  };
+
+  sessions.set(newSession.id, newSession);
+
+  // Save to database
+  const data: SessionData = {
+    id: newSession.id,
+    name: newSession.name,
+    agent_type: newSession.agentType,
+    command: newSession.command,
+    working_dir: newSession.workingDir,
+    created_at: newSession.createdAt.toISOString(),
+    claude_session_id: newSession.claudeSessionId || null,
+    sort_order: newSession.sortOrder,
+  };
+  await invoke("save_session", { session: data });
+
+  renderSessionList();
+  await switchToSession(newSession.id);
 }
 
 // Pairing modal functions
@@ -3250,6 +3388,9 @@ function handleMenuEvent(eventId: string): void {
       break;
     case "prev_session":
       cycleSessions("prev");
+      break;
+    case "browse_claude_sessions":
+      showClaudeSessionsModal();
       break;
     case "about":
       showAboutModal();

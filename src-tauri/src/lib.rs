@@ -537,6 +537,113 @@ fn update_session_claude_id(session_id: String, claude_session_id: String) -> Re
     Ok(())
 }
 
+/// List Claude sessions for a given working directory
+#[cfg(not(target_os = "ios"))]
+#[tauri::command]
+fn list_claude_sessions(working_dir: Option<String>) -> Result<Vec<ClaudeSessionInfo>, String> {
+    use std::io::{BufRead, BufReader};
+
+    let home = dirs::home_dir().ok_or("Could not find home directory")?;
+    let claude_projects = home.join(".claude").join("projects");
+
+    if !claude_projects.exists() {
+        return Ok(vec![]);
+    }
+
+    // Resolve working directory
+    let work_dir = working_dir
+        .map(|s| std::path::PathBuf::from(shellexpand::tilde(&s).to_string()))
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default());
+
+    // Convert to Claude's folder naming convention
+    let project_folder_name = work_dir.to_string_lossy()
+        .replace('/', "-")
+        .trim_start_matches('-')
+        .to_string();
+
+    let project_folder = claude_projects.join(format!("-{}", project_folder_name));
+    if !project_folder.exists() {
+        return Ok(vec![]);
+    }
+
+    let mut sessions = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&project_folder) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            if path.is_dir() || path.extension().map(|e| e != "jsonl").unwrap_or(true) {
+                continue;
+            }
+
+            let session_id = match path.file_stem() {
+                Some(s) => s.to_string_lossy().to_string(),
+                None => continue,
+            };
+
+            // Skip if not a UUID
+            if session_id.len() != 36 || session_id.chars().filter(|c| *c == '-').count() != 4 {
+                continue;
+            }
+
+            // Get modification time
+            let modified = entry.metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            // Read first user message for preview
+            let mut first_message = String::new();
+            if let Ok(file) = std::fs::File::open(&path) {
+                let reader = BufReader::new(file);
+                for line in reader.lines().take(50) {
+                    if let Ok(line) = line {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                            if json.get("type").and_then(|t| t.as_str()) == Some("user") {
+                                if let Some(msg) = json.get("message")
+                                    .and_then(|m| m.get("content"))
+                                    .and_then(|c| c.as_str())
+                                {
+                                    first_message = msg.chars().take(100).collect();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            sessions.push(ClaudeSessionInfo {
+                session_id,
+                modified,
+                first_message,
+                project: work_dir.to_string_lossy().to_string(),
+            });
+        }
+    }
+
+    // Sort by modified time descending (newest first)
+    sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+
+    Ok(sessions)
+}
+
+#[cfg(target_os = "ios")]
+#[tauri::command]
+fn list_claude_sessions(_working_dir: Option<String>) -> Result<Vec<ClaudeSessionInfo>, String> {
+    Ok(vec![])
+}
+
+#[derive(serde::Serialize)]
+struct ClaudeSessionInfo {
+    session_id: String,
+    modified: u64,
+    first_message: String,
+    project: String,
+}
+
 /// Detect the actual Claude session ID by scanning the project folder for the newest session file.
 /// Claude creates session files at ~/.claude/projects/[project-path]/[session-id].jsonl
 /// The project-path is derived from the working directory by replacing / with - (and removing leading -)
@@ -1365,6 +1472,7 @@ fn create_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let rename_session = MenuItem::with_id(app, "rename_session", "Rename Session", true, Some("CmdOrCtrl+I"))?;
     let duplicate_session = MenuItem::with_id(app, "duplicate_session", "Duplicate Session", true, Some("CmdOrCtrl+Shift+D"))?;
     let reset_session_id = MenuItem::with_id(app, "reset_session_id", "Reset Session ID", true, None::<&str>)?;
+    let browse_claude_sessions = MenuItem::with_id(app, "browse_claude_sessions", "Browse Claude Sessions...", true, Some("CmdOrCtrl+Shift+R"))?;
     let next_session = MenuItem::with_id(app, "next_session", "Next Session", true, Some("Ctrl+Tab"))?;
     let prev_session = MenuItem::with_id(app, "prev_session", "Previous Session", true, Some("Ctrl+Shift+Tab"))?;
 
@@ -1376,6 +1484,8 @@ fn create_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             &rename_session,
             &duplicate_session,
             &reset_session_id,
+            &PredefinedMenuItem::separator(app)?,
+            &browse_claude_sessions,
             &PredefinedMenuItem::separator(app)?,
             &next_session,
             &prev_session,
@@ -3882,6 +3992,9 @@ fn setup_app(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             "reset_session_id" => {
                 let _ = app.emit("menu-event", "reset_session_id");
             }
+            "browse_claude_sessions" => {
+                let _ = app.emit("menu-event", "browse_claude_sessions");
+            }
             "next_session" => {
                 let _ = app.emit("menu-event", "next_session");
             }
@@ -3969,6 +4082,7 @@ pub fn run() {
             save_session,
             delete_session,
             update_session_claude_id,
+            list_claude_sessions,
             update_session_orders,
             save_recently_closed,
             get_recently_closed,
@@ -4006,6 +4120,7 @@ pub fn run() {
             save_session,
             delete_session,
             update_session_claude_id,
+            list_claude_sessions,
             update_session_orders,
             save_recently_closed,
             get_recently_closed,

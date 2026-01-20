@@ -736,8 +736,88 @@ body.resizing-sidebar {
 }
 
 #settings-modal.visible,
-#about-modal.visible {
+#about-modal.visible,
+#claude-sessions-modal.visible {
   display: flex;
+}
+
+#claude-sessions-modal {
+  display: none;
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--bg-modal-overlay);
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.claude-sessions-modal-content {
+  width: 600px;
+  max-height: 70vh;
+}
+
+.claude-sessions-modal-content .description {
+  color: var(--text-muted);
+  margin-bottom: 16px;
+}
+
+#claude-sessions-list {
+  max-height: 400px;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  margin-bottom: 16px;
+}
+
+#claude-sessions-list .loading {
+  padding: 20px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+#claude-sessions-list .no-sessions {
+  padding: 20px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.claude-session-item {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.claude-session-item:last-child {
+  border-bottom: none;
+}
+
+.claude-session-item:hover {
+  background: var(--bg-hover);
+}
+
+.claude-session-item .session-date {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.claude-session-item .session-preview {
+  font-size: 13px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.claude-session-item .session-id {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: 'Menlo', 'Monaco', monospace;
+  margin-top: 4px;
 }
 
 .settings-modal-content {
@@ -1050,15 +1130,25 @@ body.resizing-sidebar {
 
 .chat-message.tool-use {
   align-self: flex-start;
-  background: transparent;
-  padding: 2px 0;
-  font-size: 12px;
-  color: var(--text-muted);
+  background: var(--bg-tertiary);
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: 'Menlo', 'Monaco', monospace;
+  color: var(--text-secondary);
+  max-width: 100%;
+  overflow-x: auto;
 }
 
-.chat-message.tool-use .tool-indicator {
-  font-family: 'Menlo', 'Monaco', monospace;
+.chat-message.tool-use .tool-name {
+  color: var(--accent-blue);
+  font-weight: 500;
+}
+
+.chat-message.tool-use .tool-input {
   color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .chat-message.tool-result {

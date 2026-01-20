@@ -115,18 +115,26 @@ impl McpServer {
             pending.insert(request_id.clone(), tx);
         }
 
-        // Wrap the JS to call back with result
-        let wrapped_js = format!(r#"
-            (async function() {{
-                try {{
-                    const result = await (async function() {{ {js_code} }})();
-                    const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
-                    window.__TAURI__.core.invoke('mcp_callback', {{ requestId: '{}', result: resultStr }});
-                }} catch (e) {{
-                    window.__TAURI__.core.invoke('mcp_callback', {{ requestId: '{}', result: JSON.stringify({{ error: e.message }}) }});
-                }}
-            }})();
-        "#, request_id, request_id);
+        // Encode js_code as base64 to avoid any escaping issues
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, js_code);
+
+        // Build the JS: decode base64, wrap in async function, execute, send result via callback
+        // The code is wrapped in an async IIFE so return statements work properly
+        let wrapped_js = [
+            "(async () => {",
+            "try {",
+            &format!("const __mcpEncoded = '{}';", encoded),
+            "const __mcpCode = atob(__mcpEncoded);",
+            // Create async function from decoded code, then call it
+            "const __mcpAsyncFn = new Function('return (async function() {' + __mcpCode + '})');",
+            "const __mcpResult = await __mcpAsyncFn()();",
+            "const __mcpStr = __mcpResult === undefined ? 'null' : (typeof __mcpResult === 'string' ? __mcpResult : JSON.stringify(__mcpResult));",
+            &format!("window.__TAURI__.core.invoke('mcp_callback', {{ requestId: '{}', result: __mcpStr }});", request_id),
+            "} catch (__mcpErr) {",
+            &format!("window.__TAURI__.core.invoke('mcp_callback', {{ requestId: '{}', result: JSON.stringify({{ error: __mcpErr.message }}) }});", request_id),
+            "}",
+            "})();",
+        ].join("\n");
 
         // Execute the JS
         window.eval(&wrapped_js).map_err(|e| format!("Failed to execute JS: {}", e))?;
@@ -367,7 +375,19 @@ impl McpServer {
     }
 
     async fn tool_execute_js(&self, code: &str) -> Result<String, String> {
-        let js = format!("return (function() {{ {} }})();", code);
+        let trimmed = code.trim();
+        // If code doesn't have a return statement, wrap as return expression
+        let has_return = trimmed.contains("return ") ||
+                         trimmed.contains("return;") ||
+                         trimmed.ends_with("return");
+
+        let js = if has_return {
+            code.to_string()
+        } else {
+            // Wrap expression in return so we get the value
+            format!("return ({});", code)
+        };
+
         self.eval_with_result(&js, 10000).await
     }
 
