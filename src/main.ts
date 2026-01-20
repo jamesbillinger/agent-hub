@@ -102,6 +102,13 @@ interface PendingImage {
   previewEl?: HTMLElement;
 }
 
+// Pending pasted text block
+interface PastedTextBlock {
+  id: number;
+  text: string;
+  lineCount: number;
+}
+
 // Chat UI state for JSON sessions
 interface ChatSession {
   messagesEl: HTMLElement;
@@ -114,6 +121,8 @@ interface ChatSession {
   isProcessing: boolean;
   inputBuffer: string; // Buffer for partial JSON lines
   pendingImages: PendingImage[]; // Images waiting to be sent
+  pastedTextBlocks: PastedTextBlock[]; // Pasted text blocks (like CC)
+  pasteBlockCounter: number; // Counter for paste block IDs
   // Streaming stats
   toolUseCount: number;
   streamingTokens: number;
@@ -2470,6 +2479,8 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
     isProcessing: false,
     inputBuffer: "",
     pendingImages: [],
+    pastedTextBlocks: [],
+    pasteBlockCounter: 0,
     toolUseCount: 0,
     streamingTokens: 0,
     startTime: null,
@@ -2560,7 +2571,7 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
       }
     }
 
-    // Check for long text paste (>500 chars or >10 lines)
+    // Check for long text paste (>500 chars or >10 lines) - use inline placeholder like CC
     const pastedText = e.clipboardData?.getData("text");
     if (pastedText) {
       const lineCount = pastedText.split("\n").length;
@@ -2569,64 +2580,31 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
       if (charCount > 500 || lineCount > 10) {
         e.preventDefault();
 
-        // Get current cursor position
+        // Increment block counter and create placeholder
+        chatSession.pasteBlockCounter++;
+        const blockId = chatSession.pasteBlockCounter;
+        const placeholder = `[Pasted text #${blockId} +${lineCount} lines]`;
+
+        // Store the actual text
+        chatSession.pastedTextBlocks.push({
+          id: blockId,
+          text: pastedText,
+          lineCount,
+        });
+
+        // Insert placeholder at cursor position
         const cursorPos = inputEl.selectionStart || 0;
         const beforeCursor = inputEl.value.slice(0, cursorPos);
         const afterCursor = inputEl.value.slice(inputEl.selectionEnd || cursorPos);
 
-        // Insert the full text but collapse the view
-        const fullText = beforeCursor + pastedText + afterCursor;
-        inputEl.value = fullText;
+        inputEl.value = beforeCursor + placeholder + afterCursor;
 
-        // Create a collapsed preview in attachments area
-        const previewEl = document.createElement("div");
-        previewEl.className = "text-paste-preview";
+        // Position cursor after the placeholder
+        const newCursorPos = cursorPos + placeholder.length;
+        inputEl.selectionStart = inputEl.selectionEnd = newCursorPos;
 
-        // Show first few lines as preview
-        const previewLines = pastedText.split("\n").slice(0, 3);
-        const previewText = previewLines.join("\n") + (lineCount > 3 ? "\n..." : "");
-
-        previewEl.innerHTML = `
-          <div class="paste-preview-header">
-            <span class="paste-preview-info">${lineCount} lines, ${charCount.toLocaleString()} chars</span>
-            <button class="paste-preview-expand" title="Expand">▼</button>
-            <button class="paste-preview-remove" title="Remove">×</button>
-          </div>
-          <pre class="paste-preview-content collapsed">${escapeHtml(previewText)}</pre>
-          <pre class="paste-preview-full" style="display: none;">${escapeHtml(pastedText)}</pre>
-        `;
-
-        // Expand/collapse handler
-        const expandBtn = previewEl.querySelector(".paste-preview-expand") as HTMLButtonElement;
-        const contentEl = previewEl.querySelector(".paste-preview-content") as HTMLElement;
-        const fullEl = previewEl.querySelector(".paste-preview-full") as HTMLElement;
-        let isExpanded = false;
-
-        expandBtn.addEventListener("click", () => {
-          isExpanded = !isExpanded;
-          if (isExpanded) {
-            contentEl.style.display = "none";
-            fullEl.style.display = "block";
-            expandBtn.textContent = "▲";
-          } else {
-            contentEl.style.display = "block";
-            fullEl.style.display = "none";
-            expandBtn.textContent = "▼";
-          }
-        });
-
-        // Remove handler - clear the input
-        const removeBtn = previewEl.querySelector(".paste-preview-remove") as HTMLButtonElement;
-        removeBtn.addEventListener("click", () => {
-          inputEl.value = beforeCursor + afterCursor;
-          inputEl.dispatchEvent(new Event("input"));
-          previewEl.remove();
-        });
-
-        chatSession.attachmentsEl.appendChild(previewEl);
-
-        // Collapse the textarea to a reasonable height
-        inputEl.style.height = "40px";
+        // Trigger resize
+        inputEl.dispatchEvent(new Event("input"));
       }
     }
   });
@@ -2754,7 +2732,14 @@ async function sendChatMessage(sessionId: string) {
   const chatSession = chatSessions.get(sessionId);
   if (!session || !chatSession) return;
 
-  const message = chatSession.inputEl.value.trim();
+  let message = chatSession.inputEl.value.trim();
+
+  // Expand pasted text placeholders
+  for (const block of chatSession.pastedTextBlocks) {
+    const placeholder = `[Pasted text #${block.id} +${block.lineCount} lines]`;
+    message = message.replace(placeholder, block.text);
+  }
+
   // Allow sending if there's text OR images attached
   if ((!message && chatSession.pendingImages.length === 0) || chatSession.isProcessing) return;
 
@@ -2769,9 +2754,10 @@ async function sendChatMessage(sessionId: string) {
     // If not handled, send as regular message (Claude may handle it)
   }
 
-  // Clear input
+  // Clear input and pasted text blocks
   chatSession.inputEl.value = "";
   chatSession.inputEl.style.height = "auto";
+  chatSession.pastedTextBlocks = [];
 
   // Add user message to UI
   addChatMessage(sessionId, { type: "user", result: message });
