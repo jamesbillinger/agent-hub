@@ -2891,7 +2891,7 @@ function addSessionEvent(sessionId: string, eventType: "resumed" | "stopped") {
   // Render the event
   const eventEl = document.createElement("div");
   eventEl.className = "chat-message system session-event";
-  eventEl.textContent = `--- ${eventText} ---`;
+  eventEl.textContent = `--- ${eventText} (${timestamp}) ---`;
   chatSession.messagesEl.appendChild(eventEl);
 
   // Save messages
@@ -3326,10 +3326,9 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
       return;
     }
   } else if (message.type === "system" && (message.subtype === "resumed" || message.subtype === "stopped")) {
-    // Session event (resumed/stopped)
+    // Session event (resumed/stopped) - use saved result which includes timestamp
     messageEl.classList.add("system", "session-event");
-    const eventText = message.subtype === "resumed" ? "Session resumed" : "Session stopped";
-    messageEl.textContent = `--- ${eventText} ---`;
+    messageEl.textContent = message.result || `--- Session ${message.subtype} ---`;
   } else {
     return; // Skip other message types
   }
