@@ -1062,6 +1062,17 @@ document.addEventListener("DOMContentLoaded", async () => {
       e.preventDefault();
       cycleSessions(e.key === "]" ? "next" : "prev");
     }
+    // Ctrl+V (not Cmd+V) = paste image (like Claude Code)
+    if (e.ctrlKey && !e.metaKey && e.key === "v") {
+      // Only handle for chat sessions
+      if (activeSessionId) {
+        const chatSession = chatSessions.get(activeSessionId);
+        if (chatSession) {
+          e.preventDefault();
+          pasteImageFromClipboard(activeSessionId);
+        }
+      }
+    }
   });
 
   // Save terminal buffers before window closes
@@ -2866,6 +2877,61 @@ async function sendChatMessage(sessionId: string) {
     chatSession.isProcessing = false;
     chatSession.sendBtn.disabled = false;
     if (thinkingEl) thinkingEl.style.display = "none";
+  }
+}
+
+/**
+ * Paste image from clipboard (Ctrl+V)
+ */
+async function pasteImageFromClipboard(sessionId: string) {
+  const chatSession = chatSessions.get(sessionId);
+  if (!chatSession) return;
+
+  try {
+    const clipboardItems = await navigator.clipboard.read();
+    for (const item of clipboardItems) {
+      // Find image type
+      const imageType = item.types.find(t => t.startsWith("image/"));
+      if (imageType) {
+        const blob = await item.getType(imageType);
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = reader.result as string;
+          const base64Match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+          if (!base64Match) return;
+
+          const mediaType = base64Match[1];
+          const base64Data = base64Match[2];
+
+          // Create preview element
+          const previewEl = document.createElement("div");
+          previewEl.className = "attachment-preview";
+          previewEl.innerHTML = `
+            <img src="${dataUrl}" alt="Attached image" />
+            <button class="attachment-remove" title="Remove">×</button>
+          `;
+
+          // Remove button handler
+          const removeBtn = previewEl.querySelector(".attachment-remove")!;
+          removeBtn.addEventListener("click", () => {
+            const idx = chatSession.pendingImages.findIndex(img => img.previewEl === previewEl);
+            if (idx >= 0) {
+              chatSession.pendingImages.splice(idx, 1);
+            }
+            previewEl.remove();
+          });
+
+          chatSession.attachmentsEl.appendChild(previewEl);
+          chatSession.pendingImages.push({ mediaType, base64Data, previewEl });
+
+          // Focus the input
+          chatSession.inputEl.focus();
+        };
+        reader.readAsDataURL(blob);
+      }
+    }
+  } catch (err) {
+    console.error("Failed to read clipboard:", err);
   }
 }
 
