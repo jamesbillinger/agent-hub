@@ -39,7 +39,40 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Import Apple Developer Certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # Create a temporary keychain
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          # Create keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import certificate
+          echo "$APPLE_CERTIFICATE" | base64 --decode > $RUNNER_TEMP/certificate.p12
+          security import $RUNNER_TEMP/certificate.p12 \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          # Allow codesign to access the keychain
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Add keychain to search list
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain
+
       - name: Build Tauri app (Apple Silicon)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: npm run tauri build -- --target aarch64-apple-darwin
 
       - name: List build outputs
@@ -51,13 +84,37 @@ jobs:
           echo "=== DMG bundle ==="
           ls -la src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/
 
-      - name: Create DMG with Applications symlink
+      - name: Notarize app
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Find the .app bundle
+          APP_PATH=$(find src-tauri/target/aarch64-apple-darwin/release/bundle/macos -name "*.app" | head -1)
+          echo "Notarizing: $APP_PATH"
+
+          # Create a zip for notarization
+          ditto -c -k --keepParent "$APP_PATH" "$RUNNER_TEMP/app.zip"
+
+          # Submit for notarization
+          xcrun notarytool submit "$RUNNER_TEMP/app.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          # Staple the notarization ticket to the app
+          xcrun stapler staple "$APP_PATH"
+          echo "Notarization complete!"
+
+      - name: Re-create DMG with notarized app
         run: |
           VERSION=${{ steps.get-version.outputs.version }}
           APP_PATH=$(find src-tauri/target/aarch64-apple-darwin/release/bundle/macos -name "*.app" | head -1)
           DMG_PATH="src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/Agent-Hub_${VERSION}_aarch64.dmg"
 
-          # Remove old DMG if it exists
+          # Remove old DMG
           rm -f "$DMG_PATH"
 
           # Create a staging directory with app and Applications symlink
@@ -65,7 +122,7 @@ jobs:
           rm -rf "$DMG_STAGING"
           mkdir -p "$DMG_STAGING"
 
-          # Copy the app
+          # Copy the notarized app
           cp -R "$APP_PATH" "$DMG_STAGING/"
 
           # Create Applications symlink for drag-to-install
@@ -74,8 +131,66 @@ jobs:
           # Create new DMG with both app and Applications folder
           hdiutil create -volname "Agent Hub" -srcfolder "$DMG_STAGING" -ov -format UDZO "$DMG_PATH"
 
-          echo "Created DMG at: $DMG_PATH"
+          echo "Created notarized DMG at: $DMG_PATH"
           ls -la src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/
+
+      - name: Re-create tar.gz for updater with notarized app
+        run: |
+          VERSION=${{ steps.get-version.outputs.version }}
+          APP_PATH=$(find src-tauri/target/aarch64-apple-darwin/release/bundle/macos -name "*.app" | head -1)
+          APP_NAME=$(basename "$APP_PATH")
+          TAR_PATH="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Agent-Hub.app.tar.gz"
+
+          # Create new tar.gz
+          cd "$(dirname "$APP_PATH")"
+          tar -czf "Agent-Hub.app.tar.gz" "$APP_NAME"
+
+          echo "Created updater bundle at: $TAR_PATH"
+
+      - name: Re-sign updater bundle
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          TAR_FILE="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Agent-Hub.app.tar.gz"
+
+          # Use Tauri CLI to sign (handles key format properly)
+          npx @tauri-apps/cli signer sign "$TAR_FILE" \
+            --private-key "$TAURI_SIGNING_PRIVATE_KEY" \
+            --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+
+          echo "Signed updater bundle"
+          ls -la src-tauri/target/aarch64-apple-darwin/release/bundle/macos/
+
+      - name: Generate latest.json for updater
+        run: |
+          VERSION=${{ steps.get-version.outputs.version }}
+
+          # Find the signature file
+          SIG_FILE="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Agent-Hub.app.tar.gz.minisig"
+          if [ -f "$SIG_FILE" ]; then
+            SIGNATURE=$(cat "$SIG_FILE")
+          else
+            echo "Warning: No signature file found at $SIG_FILE"
+            SIGNATURE=""
+          fi
+
+          cat > latest.json << EOF
+          {
+            "version": "$VERSION",
+            "notes": "See release notes on GitHub",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": "$SIGNATURE",
+                "url": "https://github.com/${{ github.repository }}/releases/download/v$VERSION/Agent-Hub.app.tar.gz"
+              }
+            }
+          }
+          EOF
+
+          echo "Generated latest.json:"
+          cat latest.json
 
       - name: Create Release and Upload Assets
         env:
@@ -83,7 +198,7 @@ jobs:
         run: |
           VERSION=${{ steps.get-version.outputs.version }}
 
-          # Create release
+          # Create release (--latest ensures this becomes the "Latest" release)
           gh release create "v$VERSION" \
             --title "Agent Hub v$VERSION" \
             --generate-notes \
@@ -91,10 +206,33 @@ jobs:
             --latest
 
           # Upload DMG
-          DMG_FILE="src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/Agent-Hub_${VERSION}_aarch64.dmg"
-          if [ -f "$DMG_FILE" ]; then
+          DMG_FILE=$(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -name "*.dmg" | head -1)
+          if [ -n "$DMG_FILE" ]; then
             gh release upload "v$VERSION" "$DMG_FILE"
           fi
 
+          # Upload tar.gz (updater bundle)
+          TAR_FILE="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Agent-Hub.app.tar.gz"
+          if [ -f "$TAR_FILE" ]; then
+            gh release upload "v$VERSION" "$TAR_FILE"
+          fi
+
+          # Upload signature
+          SIG_FILE="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Agent-Hub.app.tar.gz.minisig"
+          if [ -f "$SIG_FILE" ]; then
+            gh release upload "v$VERSION" "$SIG_FILE"
+          fi
+
+          # Upload latest.json
+          gh release upload "v$VERSION" latest.json
+
           echo "Release v$VERSION created and assets uploaded!"
           echo "https://github.com/${{ github.repository }}/releases/tag/v$VERSION"
+
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          if [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi

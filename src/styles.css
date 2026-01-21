@@ -1138,15 +1138,21 @@ body.resizing-sidebar {
 
 /* Tool use - flat style like system messages */
 .chat-message.tool-use {
-  align-self: center;
+  align-self: stretch;
   background: transparent;
-  padding: 4px 12px;
+  padding: 4px 0;
   border-radius: 0;
   font-size: 11px;
   font-family: 'Menlo', 'Monaco', monospace;
   color: var(--text-muted);
+  width: 100%;
   max-width: 100%;
-  overflow-x: auto;
+}
+
+.chat-message.tool-use .tool-call {
+  padding: 4px 12px;
+  margin: 2px 0;
+  text-align: left;
 }
 
 .chat-message.tool-use .tool-name {
@@ -1163,6 +1169,88 @@ body.resizing-sidebar {
   padding-left: 8px;
   border-left: 2px solid var(--border-color);
   font-size: 10px;
+}
+
+/* Improved tool display styles */
+.chat-message.tool-use .tool-path {
+  color: var(--text-secondary);
+  margin-left: 6px;
+  font-family: 'Menlo', 'Monaco', monospace;
+  font-size: 12px;
+}
+
+.chat-message.tool-use .tool-detail {
+  color: var(--text-dim);
+  font-size: 11px;
+  margin-left: 4px;
+}
+
+.chat-message.tool-use .tool-desc {
+  color: var(--text-secondary);
+  margin-left: 6px;
+  font-style: italic;
+}
+
+.chat-message.tool-use .tool-command {
+  display: block;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  padding: 6px 8px;
+  margin: 4px 0;
+  border-radius: 4px;
+  font-family: 'Menlo', 'Monaco', monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+
+.chat-message.tool-use .tool-pattern {
+  color: var(--accent-orange);
+  font-family: 'Menlo', 'Monaco', monospace;
+  font-size: 12px;
+  margin-left: 6px;
+}
+
+.chat-message.tool-use .tool-query {
+  color: var(--text-secondary);
+  margin-left: 6px;
+}
+
+.chat-message.tool-use .tool-url {
+  color: var(--accent-blue);
+  margin-left: 6px;
+  font-size: 11px;
+  text-decoration: none;
+  word-break: break-all;
+}
+
+.chat-message.tool-use .tool-url:hover {
+  text-decoration: underline;
+}
+
+.chat-message.tool-use .tool-diff {
+  margin-top: 4px;
+  font-family: 'Menlo', 'Monaco', monospace;
+  font-size: 11px;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.chat-message.tool-use .diff-old {
+  background: rgba(248, 81, 73, 0.15);
+  color: #f85149;
+  padding: 2px 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chat-message.tool-use .diff-new {
+  background: rgba(63, 185, 80, 0.15);
+  color: #3fb950;
+  padding: 2px 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .chat-message.tool-result {
@@ -1486,6 +1574,102 @@ body.resizing-sidebar {
     transform: scale(1);
     opacity: 1;
   }
+}
+
+/* ============================================
+   Todos Panel (TodoWrite tracking)
+   ============================================ */
+
+.chat-todos {
+  display: none;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  padding: 8px 12px;
+  font-size: 12px;
+}
+
+.todos-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.todos-title {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.todos-progress {
+  color: var(--text-muted);
+  font-family: 'Menlo', 'Monaco', monospace;
+  font-size: 11px;
+}
+
+.todo-current {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--bg-tertiary);
+  border-radius: 6px;
+  margin-bottom: 6px;
+}
+
+.todo-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--accent-blue);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: todo-spin 0.8s linear infinite;
+}
+
+@keyframes todo-spin {
+  to { transform: rotate(360deg); }
+}
+
+.todo-text {
+  color: var(--text-primary);
+  flex: 1;
+}
+
+.todos-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.todo-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+  color: var(--text-muted);
+}
+
+.todo-item.completed {
+  color: var(--accent-green);
+}
+
+.todo-item.completed .todo-content {
+  text-decoration: line-through;
+  opacity: 0.7;
+}
+
+.todo-item.in_progress {
+  color: var(--accent-blue);
+}
+
+.todo-icon {
+  width: 16px;
+  text-align: center;
+  font-size: 11px;
+}
+
+.todo-content {
+  flex: 1;
+  font-size: 11px;
 }
 
 /* ============================================

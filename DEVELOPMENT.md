@@ -45,6 +45,51 @@ This single command:
 
 The DMG is also available at `src-tauri/target/release/bundle/dmg/`
 
+### GitHub Actions Release (CI)
+
+To create a release via GitHub Actions:
+
+```bash
+# Create a release branch with the version number
+git checkout -b release/0.1.29
+git push -u origin release/0.1.29
+```
+
+The workflow will:
+1. Build for Apple Silicon (aarch64)
+2. Sign with your Apple Developer certificate
+3. Notarize with Apple
+4. Create GitHub release with DMG
+5. Generate updater artifacts (tar.gz + signature + latest.json)
+
+#### Required GitHub Secrets
+
+Copy these from the pplsi-sidebar repository or generate new ones:
+
+| Secret | Description |
+|--------|-------------|
+| `APPLE_CERTIFICATE` | Base64-encoded .p12 certificate |
+| `APPLE_CERTIFICATE_PASSWORD` | Password for the .p12 certificate |
+| `APPLE_SIGNING_IDENTITY` | Certificate name (e.g., "Developer ID Application: Name (TEAMID)") |
+| `APPLE_ID` | Apple ID email for notarization |
+| `APPLE_PASSWORD` | App-specific password for notarization |
+| `APPLE_TEAM_ID` | Your Apple Developer Team ID |
+| `TAURI_SIGNING_PRIVATE_KEY` | Private key for Tauri updater signing |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Password for the private key (optional) |
+
+The Tauri signing keypair is stored at:
+- Private: `~/.tauri/agent-hub.key`
+- Public: Already configured in `tauri.conf.json`
+
+### Auto-Updates
+
+The app checks for updates from:
+```
+https://github.com/jamesbillinger/agent-hub/releases/latest/download/latest.json
+```
+
+When a new release is available, the updater plugin will notify and can auto-install.
+
 ### Manual Build (without version bump)
 
 ```bash

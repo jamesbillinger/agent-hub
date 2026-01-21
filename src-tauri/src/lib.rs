@@ -2178,7 +2178,8 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
     // Navigation functions
     function showSessionsList() {
       navContainer.classList.remove('show-session');
-      if (ws) ws.close();
+      // Don't close WebSockets - keep them alive for background updates
+      // if (ws) ws.close();
       history.replaceState(null, '', window.location.pathname);
     }
 
@@ -2371,6 +2372,9 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
     let currentSessionId = null;
     let dataHandler = null;
     let resizeHandler = null;
+
+    // Per-session state management (keeps connections alive across navigation)
+    const sessionStates = new Map(); // sessionId -> { chatWs, messages: [], isProcessing }
 
     function initMainApp() {
       if (term) return;
@@ -2580,6 +2584,15 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
     }
 
     function initSessionHandlers() {
+      // Check if a session has an active WebSocket connection
+      function isSessionConnected(sessionId) {
+        const state = sessionStates.get(sessionId);
+        if (!state) return false;
+        // Check chat WebSocket for JSON sessions
+        if (state.chatWs && state.chatWs.readyState === WebSocket.OPEN) return true;
+        return false;
+      }
+
       // Render sessions list
       function renderSessionsList() {
         if (sessionsData.length === 0) {
@@ -2593,16 +2606,19 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           return;
         }
 
-        sessionList.innerHTML = sessionsData.map(s => `
+        sessionList.innerHTML = sessionsData.map(s => {
+          // Use actual connection state OR API running state
+          const isRunning = s.running || isSessionConnected(s.id);
+          return `
           <div class="session-item" data-id="${s.id}">
-            <div class="session-status ${s.running ? 'running' : 'stopped'}"></div>
+            <div class="session-status ${isRunning ? 'running' : 'stopped'}"></div>
             <div class="session-info">
               <div class="session-name">${escapeHtml(s.name)}</div>
               <div class="session-meta">${s.agent_type}${s.working_dir ? ' • ' + s.working_dir : ''}</div>
             </div>
             <span class="session-chevron">›</span>
           </div>
-        `).join('');
+        `}).join('');
 
         // Add click handlers
         sessionList.querySelectorAll('.session-item').forEach(item => {
@@ -2632,9 +2648,19 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
       }
 
       async function openSession(sessionId, autoStart = false) {
+        // Save current input value before switching
+        if (currentSessionId) {
+          const prevState = getSessionState(currentSessionId);
+          prevState.inputValue = chatInput.value;
+        }
+
         currentSessionId = sessionId;
         const session = sessionsData.find(s => s.id === sessionId);
         if (!session) return;
+
+        // Restore input value for new session
+        const newState = getSessionState(sessionId);
+        chatInput.value = newState.inputValue || '';
 
         sessionTitle.textContent = session.name;
         showSessionView(sessionId);
@@ -2643,11 +2669,23 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         const terminalContainer = document.getElementById('terminal-container');
         const chatContainer = document.getElementById('chat-container');
 
+        // Check actual connection state, not just API data
+        const isConnected = isSessionConnected(sessionId);
+        const isRunning = session.running || isConnected;
+
         if (isJsonSession(session)) {
           terminalContainer.style.display = 'none';
           chatContainer.classList.add('active');
-          if (session.running) {
+          if (isConnected) {
+            // Already connected - just show existing state
             startBtn.style.display = 'none';
+            renderSessionMessages(sessionId);
+            status.textContent = 'Connected';
+            status.className = 'connected';
+            chatSend.disabled = false;
+          } else if (isRunning) {
+            startBtn.style.display = 'none';
+            await loadChatHistory(sessionId);
             connectChatWebSocket(sessionId);
           } else if (autoStart) {
             startBtn.style.display = 'none';
@@ -2732,24 +2770,57 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
       }
 
       // Chat functions for JSON sessions
-      const chatMessages = document.getElementById('chat-messages');
+      const chatMessagesContainer = document.getElementById('chat-messages');
       const chatInput = document.getElementById('chat-input');
       const chatSend = document.getElementById('chat-send');
-      let chatWs = null;
-      let isProcessing = false;
+
+      function getSessionState(sessionId) {
+        if (!sessionStates.has(sessionId)) {
+          sessionStates.set(sessionId, {
+            chatWs: null,
+            messages: [],
+            isProcessing: false,
+            inputValue: ''
+          });
+        }
+        return sessionStates.get(sessionId);
+      }
+
+      function renderSessionMessages(sessionId) {
+        const state = getSessionState(sessionId);
+        chatMessagesContainer.innerHTML = '';
+        state.messages.forEach(msg => {
+          const div = createMessageElement(msg);
+          if (div) chatMessagesContainer.appendChild(div);
+        });
+        chatMessagesContainer.scrollTop = chatMessagesContainer.scrollHeight;
+      }
 
       async function loadChatHistory(sessionId) {
-        chatMessages.innerHTML = '';
+        const state = getSessionState(sessionId);
         status.textContent = 'Loading chat history...';
         status.className = 'disconnected';
+
+        // If we already have messages cached, just render them
+        if (state.messages.length > 0) {
+          renderSessionMessages(sessionId);
+          if (state.chatWs && state.chatWs.readyState === WebSocket.OPEN) {
+            status.textContent = 'Connected';
+            status.className = 'connected';
+          } else {
+            status.textContent = 'Viewing chat history (tap Start to resume)';
+          }
+          return;
+        }
+
         try {
           const res = await authFetch(`/api/sessions/${sessionId}/buffer`);
           const data = await res.json();
           if (data.buffer) {
             try {
               const messages = JSON.parse(data.buffer);
-              messages.forEach(msg => renderChatMessage(msg));
-              chatMessages.scrollTop = chatMessages.scrollHeight;
+              state.messages = messages;
+              renderSessionMessages(sessionId);
               status.textContent = 'Viewing chat history (tap Start to resume)';
             } catch (e) {
               status.textContent = 'Chat history format error';
@@ -2763,34 +2834,55 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
       }
 
       function connectChatWebSocket(sessionId) {
-        if (chatWs) chatWs.close();
-        chatMessages.innerHTML = '';
+        const state = getSessionState(sessionId);
 
-        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        chatWs = new WebSocket(`${protocol}//${location.host}/api/ws/${sessionId}`);
-
-        chatWs.onopen = () => {
+        // If already connected, just update UI
+        if (state.chatWs && state.chatWs.readyState === WebSocket.OPEN) {
           status.textContent = 'Connected';
           status.className = 'connected';
           chatSend.disabled = false;
+          return;
+        }
+
+        // Close old connection if exists
+        if (state.chatWs) state.chatWs.close();
+
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        state.chatWs = new WebSocket(`${protocol}//${location.host}/api/ws/${sessionId}`);
+
+        state.chatWs.onopen = () => {
+          if (currentSessionId === sessionId) {
+            status.textContent = 'Connected';
+            status.className = 'connected';
+            chatSend.disabled = false;
+          }
         };
-        chatWs.onclose = () => {
-          status.textContent = 'Disconnected';
-          status.className = 'disconnected';
-          isProcessing = false;
-          chatSend.disabled = false;
+        state.chatWs.onclose = () => {
+          if (currentSessionId === sessionId) {
+            status.textContent = 'Disconnected';
+            status.className = 'disconnected';
+            state.isProcessing = false;
+            chatSend.disabled = false;
+          }
         };
-        chatWs.onmessage = (e) => {
+        state.chatWs.onmessage = (e) => {
           if (typeof e.data === 'string') {
             try {
               const msg = JSON.parse(e.data);
-              renderChatMessage(msg);
-              chatMessages.scrollTop = chatMessages.scrollHeight;
-              if (msg.type === 'result') {
-                isProcessing = false;
-                chatSend.disabled = false;
-                status.textContent = 'Done';
-                status.className = 'connected';
+              state.messages.push(msg);
+              // Only update UI if this is the currently viewed session
+              if (currentSessionId === sessionId) {
+                const div = createMessageElement(msg);
+                if (div) {
+                  chatMessagesContainer.appendChild(div);
+                  chatMessagesContainer.scrollTop = chatMessagesContainer.scrollHeight;
+                }
+                if (msg.type === 'result') {
+                  state.isProcessing = false;
+                  chatSend.disabled = false;
+                  status.textContent = 'Done';
+                  status.className = 'connected';
+                }
               }
             } catch (err) {
               console.warn('Failed to parse message:', e.data);
@@ -2799,12 +2891,12 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         };
       }
 
-      function renderChatMessage(msg) {
+      function createMessageElement(msg) {
         const div = document.createElement('div');
         div.className = 'chat-msg';
 
         if (msg.type === 'user') {
-          if (!msg.result?.trim()) return; // Skip empty
+          if (!msg.result?.trim()) return null; // Skip empty
           div.classList.add('user');
           div.textContent = msg.result;
         } else if (msg.type === 'assistant' && msg.message?.content) {
@@ -2841,22 +2933,96 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           div.style.color = '#f14c4c';
           div.textContent = 'Error: ' + msg.result;
         } else {
-          return; // Skip other types
+          return null; // Skip other types
         }
-        chatMessages.appendChild(div);
+        return div;
       }
 
-      function sendChatMessage() {
+      async function sendChatMessage() {
+        if (!currentSessionId) return;
+        const state = getSessionState(currentSessionId);
         const text = chatInput.value.trim();
-        if (!text || isProcessing || !chatWs || chatWs.readyState !== WebSocket.OPEN) return;
+        if (!text || state.isProcessing) return;
+
+        // Auto-start if not connected
+        if (!state.chatWs || state.chatWs.readyState !== WebSocket.OPEN) {
+          // Store the message we want to send
+          const pendingMessage = text;
+          chatInput.value = '';
+          state.inputValue = '';
+
+          // Show user message immediately
+          const userMsg = { type: 'user', result: pendingMessage };
+          state.messages.push(userMsg);
+          const div = createMessageElement(userMsg);
+          if (div) {
+            chatMessagesContainer.appendChild(div);
+            chatMessagesContainer.scrollTop = chatMessagesContainer.scrollHeight;
+          }
+
+          state.isProcessing = true;
+          chatSend.disabled = true;
+          status.textContent = 'Starting session...';
+          status.className = '';
+
+          // Start the session
+          try {
+            const res = await authFetch(`/api/sessions/${currentSessionId}/start`, { method: 'POST' });
+            const data = await res.json();
+            if (data.status === 'started' || data.status === 'already_running') {
+              await loadSessions();
+              startBtn.style.display = 'none';
+
+              // Connect and wait for WebSocket to open
+              await new Promise((resolve, reject) => {
+                connectChatWebSocket(currentSessionId);
+                const checkInterval = setInterval(() => {
+                  const newState = getSessionState(currentSessionId);
+                  if (newState.chatWs && newState.chatWs.readyState === WebSocket.OPEN) {
+                    clearInterval(checkInterval);
+                    resolve();
+                  }
+                }, 100);
+                // Timeout after 10 seconds
+                setTimeout(() => {
+                  clearInterval(checkInterval);
+                  reject(new Error('Connection timeout'));
+                }, 10000);
+              });
+
+              // Now send the pending message
+              const jsonMsg = JSON.stringify({
+                type: 'user',
+                message: { role: 'user', content: pendingMessage }
+              }) + '\n';
+              state.chatWs.send(jsonMsg);
+              status.textContent = 'Thinking...';
+            } else {
+              status.textContent = 'Failed to start session';
+              state.isProcessing = false;
+              chatSend.disabled = false;
+            }
+          } catch (e) {
+            status.textContent = 'Failed to start session';
+            state.isProcessing = false;
+            chatSend.disabled = false;
+          }
+          return;
+        }
 
         // Show user message
-        renderChatMessage({ type: 'user', result: text });
-        chatMessages.scrollTop = chatMessages.scrollHeight;
+        const userMsg = { type: 'user', result: text };
+        state.messages.push(userMsg);
+        const div = createMessageElement(userMsg);
+        if (div) {
+          chatMessagesContainer.appendChild(div);
+          chatMessagesContainer.scrollTop = chatMessagesContainer.scrollHeight;
+        }
         chatInput.value = '';
+        state.inputValue = '';
 
         // Send to server
-        isProcessing = true;
+        state.isProcessing = true;
         chatSend.disabled = true;
         status.textContent = 'Thinking...';
         status.className = '';
@@ -2865,7 +3031,7 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           type: 'user',
           message: { role: 'user', content: text }
         }) + '\n';
-        chatWs.send(jsonMsg);
+        state.chatWs.send(jsonMsg);
       }
 
       chatSend.addEventListener('click', sendChatMessage);
@@ -3677,6 +3843,8 @@ async fn ws_handler(
 
 #[cfg(not(target_os = "ios"))]
 async fn handle_ws(socket: WebSocket, session_id: String) {
+    use tokio::time::{interval, Duration};
+
     let (mut sender, mut receiver) = socket.split();
     let session_id_clone = session_id.clone();
 
@@ -3698,22 +3866,58 @@ async fn handle_ws(socket: WebSocket, session_id: String) {
             return;
         };
 
-        // Spawn task to forward JSON output to WebSocket
+        // Spawn task to forward JSON output to WebSocket with keepalive pings
         let send_task = tokio::spawn(async move {
-            while let Ok(data) = rx.recv().await {
-                if sender.send(Message::Text(data)).await.is_err() {
-                    break;
+            let mut ping_interval = interval(Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    result = rx.recv() => {
+                        match result {
+                            Ok(data) => {
+                                if sender.send(Message::Text(data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    _ = ping_interval.tick() => {
+                        // Send WebSocket ping to keep connection alive
+                        if sender.send(Message::Ping(vec![])).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });
 
         // Handle incoming messages from WebSocket (user input for JSON process)
+        let session_id_for_recv = session_id.clone();
         let recv_task = tokio::spawn(async move {
             while let Some(Ok(msg)) = receiver.next().await {
                 match msg {
                     Message::Text(text) => {
                         // For JSON sessions, forward text directly to stdin
-                        let _ = write_to_process(session_id_clone.clone(), text);
+                        let _ = write_to_process(session_id_clone.clone(), text.clone());
+
+                        // Also broadcast the user message so other clients (mobile web) can see it
+                        if let Some(tx) = {
+                            let broadcasters = JSON_BROADCASTERS.lock();
+                            broadcasters.get(&session_id_clone).cloned()
+                        } {
+                            let _ = tx.send(text.clone());
+                        }
+
+                        // Emit Tauri event so desktop frontend can see user messages from mobile
+                        if let Some(app) = APP_HANDLE.lock().as_ref() {
+                            let _ = app.emit("json-output", serde_json::json!({
+                                "session_id": session_id_clone.clone(),
+                                "data": text,
+                            }));
+                        }
+                    }
+                    Message::Pong(_) => {
+                        // Pong received, connection is alive
                     }
                     Message::Close(_) => break,
                     _ => {}
@@ -3737,11 +3941,27 @@ async fn handle_ws(socket: WebSocket, session_id: String) {
             return;
         };
 
-        // Spawn task to forward PTY output to WebSocket
+        // Spawn task to forward PTY output to WebSocket with keepalive pings
         let send_task = tokio::spawn(async move {
-            while let Ok(data) = rx.recv().await {
-                if sender.send(Message::Binary(data)).await.is_err() {
-                    break;
+            let mut ping_interval = interval(Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    result = rx.recv() => {
+                        match result {
+                            Ok(data) => {
+                                if sender.send(Message::Binary(data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    _ = ping_interval.tick() => {
+                        // Send WebSocket ping to keep connection alive
+                        if sender.send(Message::Ping(vec![])).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -3770,6 +3990,9 @@ async fn handle_ws(socket: WebSocket, session_id: String) {
                         if let Ok(text) = String::from_utf8(data) {
                             let _ = write_pty(session_id_clone.clone(), text);
                         }
+                    }
+                    Message::Pong(_) => {
+                        // Pong received, connection is alive
                     }
                     Message::Close(_) => break,
                     _ => {}
@@ -4067,6 +4290,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             setup_app(app)
         })

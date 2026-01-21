@@ -110,6 +110,12 @@ interface PastedTextBlock {
 }
 
 // Chat UI state for JSON sessions
+interface TodoItem {
+  content: string;
+  status: "pending" | "in_progress" | "completed";
+  activeForm: string;
+}
+
 interface ChatSession {
   messagesEl: HTMLElement;
   inputEl: HTMLTextAreaElement;
@@ -117,12 +123,15 @@ interface ChatSession {
   statusEl: HTMLElement;
   containerEl: HTMLElement;
   attachmentsEl: HTMLElement; // Preview area for pending images
+  todosEl: HTMLElement; // Todo panel for TodoWrite tracking
   messages: ClaudeJsonMessage[];
+  todos: TodoItem[]; // Current todo list state
   isProcessing: boolean;
   inputBuffer: string; // Buffer for partial JSON lines
   pendingImages: PendingImage[]; // Images waiting to be sent
   pastedTextBlocks: PastedTextBlock[]; // Pasted text blocks (like CC)
   pasteBlockCounter: number; // Counter for paste block IDs
+  cwd: string; // Working directory from init message
   // Streaming stats
   toolUseCount: number;
   streamingTokens: number;
@@ -2443,6 +2452,7 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
   containerEl.dataset.sessionId = session.id;
 
   containerEl.innerHTML = `
+    <div class="chat-todos"></div>
     <div class="chat-messages"></div>
     <div class="chat-thinking" style="display: none;">
       <span>Claude is thinking</span>
@@ -2467,6 +2477,7 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
   const sendBtn = containerEl.querySelector(".chat-send-btn") as HTMLButtonElement;
   const statusEl = containerEl.querySelector(".chat-status") as HTMLElement;
   const attachmentsEl = containerEl.querySelector(".chat-attachments") as HTMLElement;
+  const todosEl = containerEl.querySelector(".chat-todos") as HTMLElement;
 
   const chatSession: ChatSession = {
     messagesEl,
@@ -2475,12 +2486,15 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
     statusEl,
     containerEl,
     attachmentsEl,
+    todosEl,
     messages: [],
+    todos: [],
     isProcessing: false,
     inputBuffer: "",
     pendingImages: [],
     pastedTextBlocks: [],
     pasteBlockCounter: 0,
+    cwd: "",
     toolUseCount: 0,
     streamingTokens: 0,
     startTime: null,
@@ -2922,6 +2936,141 @@ async function pasteImageFromClipboard(sessionId: string) {
 }
 
 /**
+ * Format tool call for display based on tool type
+ * Makes common tools more readable (Read, Edit, Bash, etc.)
+ */
+function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: string): string {
+  const escapeForHtml = (str: string) => {
+    const div = document.createElement("div");
+    div.textContent = str;
+    return div.innerHTML;
+  };
+
+  // Helper to make paths relative to cwd
+  const relativePath = (fullPath: string) => {
+    if (cwd && fullPath.startsWith(cwd)) {
+      const rel = fullPath.slice(cwd.length);
+      return rel.startsWith("/") ? rel.slice(1) : rel;
+    }
+    return fullPath;
+  };
+
+  switch (toolName) {
+    case "Read": {
+      const filePath = input.file_path as string || "";
+      const relPath = relativePath(filePath);
+      let details = "";
+      if (input.offset || input.limit) {
+        const parts = [];
+        if (input.offset) parts.push(`from line ${input.offset}`);
+        if (input.limit) parts.push(`${input.limit} lines`);
+        details = ` <span class="tool-detail">(${parts.join(", ")})</span>`;
+      }
+      return `<span class="tool-name">Read</span><span class="tool-path">${escapeForHtml(relPath)}</span>${details}`;
+    }
+
+    case "Edit": {
+      const filePath = input.file_path as string || "";
+      const relPath = relativePath(filePath);
+      const oldStr = input.old_string as string || "";
+      const newStr = input.new_string as string || "";
+      const replaceAll = input.replace_all as boolean;
+
+      // Truncate long strings for display
+      const maxLen = 100;
+      const truncate = (s: string) => s.length > maxLen ? s.slice(0, maxLen) + "..." : s;
+
+      let diffHtml = "";
+      if (oldStr || newStr) {
+        diffHtml = `<div class="tool-diff">`;
+        if (oldStr) {
+          diffHtml += `<div class="diff-old">- ${escapeForHtml(truncate(oldStr))}</div>`;
+        }
+        if (newStr) {
+          diffHtml += `<div class="diff-new">+ ${escapeForHtml(truncate(newStr))}</div>`;
+        }
+        diffHtml += `</div>`;
+      }
+
+      const replaceNote = replaceAll ? ` <span class="tool-detail">(replace all)</span>` : "";
+      return `<span class="tool-name">Edit</span><span class="tool-path">${escapeForHtml(relPath)}</span>${replaceNote}${diffHtml}`;
+    }
+
+    case "Write": {
+      const filePath = input.file_path as string || "";
+      const relPath = relativePath(filePath);
+      const content = input.content as string || "";
+      const lineCount = content.split("\n").length;
+      return `<span class="tool-name">Write</span><span class="tool-path">${escapeForHtml(relPath)}</span><span class="tool-detail">(${lineCount} lines)</span>`;
+    }
+
+    case "Bash": {
+      const command = input.command as string || "";
+      const description = input.description as string || "";
+      const timeout = input.timeout as number;
+      const background = input.run_in_background as boolean;
+
+      let html = `<span class="tool-name">Bash</span>`;
+      if (description) {
+        html += `<span class="tool-desc">${escapeForHtml(description)}</span>`;
+      }
+      html += `<pre class="tool-command">${escapeForHtml(command)}</pre>`;
+
+      const flags = [];
+      if (background) flags.push("background");
+      if (timeout) flags.push(`timeout: ${Math.round(timeout / 1000)}s`);
+      if (flags.length > 0) {
+        html += `<span class="tool-detail">(${flags.join(", ")})</span>`;
+      }
+      return html;
+    }
+
+    case "Glob": {
+      const pattern = input.pattern as string || "";
+      const path = input.path as string;
+      let pathInfo = "";
+      if (path) {
+        pathInfo = ` in ${escapeForHtml(relativePath(path))}`;
+      }
+      return `<span class="tool-name">Glob</span><code class="tool-pattern">${escapeForHtml(pattern)}</code>${pathInfo}`;
+    }
+
+    case "Grep": {
+      const pattern = input.pattern as string || "";
+      const path = input.path as string;
+      let pathInfo = "";
+      if (path) {
+        pathInfo = ` in ${escapeForHtml(relativePath(path))}`;
+      }
+      return `<span class="tool-name">Grep</span><code class="tool-pattern">${escapeForHtml(pattern)}</code>${pathInfo}`;
+    }
+
+    case "Task": {
+      const description = input.description as string || "";
+      const subagentType = input.subagent_type as string || "";
+      return `<span class="tool-name">Task</span><span class="tool-desc">${escapeForHtml(description)}</span><span class="tool-detail">(${escapeForHtml(subagentType)})</span>`;
+    }
+
+    case "WebFetch": {
+      const url = input.url as string || "";
+      const prompt = input.prompt as string || "";
+      return `<span class="tool-name">WebFetch</span><a href="${escapeForHtml(url)}" target="_blank" class="tool-url">${escapeForHtml(url)}</a><span class="tool-detail">${escapeForHtml(prompt.slice(0, 50))}${prompt.length > 50 ? "..." : ""}</span>`;
+    }
+
+    case "WebSearch": {
+      const query = input.query as string || "";
+      return `<span class="tool-name">WebSearch</span><span class="tool-query">"${escapeForHtml(query)}"</span>`;
+    }
+
+    default: {
+      // Fall back to JSON for unknown tools
+      const inputJson = JSON.stringify(input || {}, null, 2);
+      return `<span class="tool-name">${escapeForHtml(toolName)}</span><span class="tool-input">${escapeForHtml(inputJson)}</span>`;
+    }
+  }
+}
+
+/**
  * Add a session event (resumed, stopped) to the chat
  */
 function addSessionEvent(sessionId: string, eventType: "resumed" | "stopped") {
@@ -3005,15 +3154,27 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
         chatSession.toolUseCount++;
         messageEl.classList.remove("assistant");
         messageEl.classList.add("tool-use");
-        // Format JSON with indentation for readability
-        const inputJson = JSON.stringify(block.input || {}, null, 2);
-        html += `<span class="tool-name">${escapeHtml(block.name || "Tool")}</span>\n<span class="tool-input">${escapeHtml(inputJson)}</span>`;
+
+        // Special handling for TodoWrite - update the todo panel
+        if (block.name === "TodoWrite") {
+          const input = block.input as { todos?: TodoItem[] };
+          if (input.todos && Array.isArray(input.todos)) {
+            chatSession.todos = input.todos;
+            renderTodosPanel(chatSession);
+          }
+          // Don't show TodoWrite in the message stream - it's shown in the panel
+          continue;
+        }
+
+        // Format tool call with special handling for known tools
+        const formattedTool = formatToolCall(block.name || "Tool", (block.input || {}) as Record<string, unknown>, chatSession.cwd);
+        html += `<div class="tool-call">${formattedTool}</div>`;
       }
     }
 
     // Add token usage details if available
     const usage = message.message?.usage;
-    if (usage && !hasToolUse) {
+    if (usage) {
       const tokenParts: string[] = [];
       if (usage.input_tokens) tokenParts.push(`in: ${usage.input_tokens}`);
       if (usage.cache_read_input_tokens) tokenParts.push(`cache read: ${usage.cache_read_input_tokens}`);
@@ -3063,7 +3224,7 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
       ${meta.length > 0 ? `<div class="init-meta">${meta.join(" • ")}</div>` : ""}
     `;
 
-    // Capture session_id from init message
+    // Capture session_id and cwd from init message
     if (message.session_id) {
       const session = sessions.get(sessionId);
       if (session) {
@@ -3071,6 +3232,10 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
         session.hasBeenStarted = true;
         saveSessionToDb(session);
       }
+    }
+    // Store cwd for relative path display in tool calls
+    if (message.cwd) {
+      chatSession.cwd = message.cwd;
     }
 
     // Insert or update init message at the very beginning
@@ -3249,6 +3414,60 @@ function formatTokens(tokens: number): string {
   return tokens.toString();
 }
 
+/**
+ * Render the todos panel for a chat session
+ */
+function renderTodosPanel(chatSession: ChatSession): void {
+  const { todosEl, todos } = chatSession;
+
+  // Hide if no todos
+  if (!todos || todos.length === 0) {
+    todosEl.innerHTML = "";
+    todosEl.style.display = "none";
+    return;
+  }
+
+  todosEl.style.display = "block";
+
+  // Count completed and find current task
+  const completed = todos.filter((t) => t.status === "completed").length;
+  const inProgress = todos.find((t) => t.status === "in_progress");
+  const total = todos.length;
+
+  // Build the HTML
+  let html = `<div class="todos-header">
+    <span class="todos-title">Tasks</span>
+    <span class="todos-progress">${completed}/${total}</span>
+  </div>`;
+
+  // Show current task prominently if there is one
+  if (inProgress) {
+    html += `<div class="todo-current">
+      <span class="todo-spinner"></span>
+      <span class="todo-text">${escapeHtml(inProgress.activeForm || inProgress.content)}</span>
+    </div>`;
+  }
+
+  // Collapsible list of all todos
+  html += `<div class="todos-list">`;
+  for (const todo of todos) {
+    const statusClass = todo.status;
+    const icon =
+      todo.status === "completed"
+        ? "✓"
+        : todo.status === "in_progress"
+          ? "◐"
+          : "○";
+    html += `<div class="todo-item ${statusClass}">
+      <span class="todo-icon">${icon}</span>
+      <span class="todo-content">${escapeHtml(todo.content)}</span>
+    </div>`;
+  }
+  html += `</div>`;
+
+  todosEl.innerHTML = html;
+}
+
 // Chat message persistence functions
 
 /**
@@ -3332,9 +3551,21 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
       } else if (block.type === "tool_use") {
         messageEl.classList.remove("assistant");
         messageEl.classList.add("tool-use");
-        // Format JSON with indentation for readability
-        const inputJson = JSON.stringify(block.input || {}, null, 2);
-        html += `<span class="tool-name">${escapeHtml(block.name || "Tool")}</span>\n<span class="tool-input">${escapeHtml(inputJson)}</span>`;
+
+        // Special handling for TodoWrite - update the todo panel
+        if (block.name === "TodoWrite") {
+          const input = block.input as { todos?: TodoItem[] };
+          if (input.todos && Array.isArray(input.todos)) {
+            chatSession.todos = input.todos;
+            renderTodosPanel(chatSession);
+          }
+          // Don't show TodoWrite in the message stream
+          continue;
+        }
+
+        // Format tool call with special handling for known tools
+        const formattedTool = formatToolCall(block.name || "Tool", (block.input || {}) as Record<string, unknown>, chatSession.cwd);
+        html += `<div class="tool-call">${formattedTool}</div>`;
       }
     }
     messageEl.innerHTML = html || "(empty response)";
@@ -3595,10 +3826,11 @@ async function resumeClaudeSession(claudeSessionId: string, project: string): Pr
     id: crypto.randomUUID(),
     name: `Resumed: ${claudeSessionId.substring(0, 8)}...`,
     agentType: "claude-json",
-    command: `claude --print --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions --resume ${claudeSessionId}`,
+    command: `claude --print --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions`,
     workingDir: project,
     createdAt: new Date(),
     claudeSessionId: claudeSessionId,
+    hasBeenStarted: true, // Mark as started since we're resuming an existing Claude session
     sortOrder: sessions.size,
     isRunning: false,
   };
