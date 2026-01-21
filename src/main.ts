@@ -2679,9 +2679,13 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
 
   chatSessions.set(session.id, chatSession);
 
-  // Load existing messages if session has been used before
-  if (session.hasBeenStarted) {
-    await loadChatMessages(session.id, chatSession);
+  // Always try to load existing messages - buffer may exist even if claudeSessionId is missing
+  // (e.g., session was used but claudeSessionId wasn't saved properly)
+  await loadChatMessages(session.id, chatSession);
+
+  // If we loaded messages, mark the session as having been started
+  if (chatSession.messages.length > 0 && !session.hasBeenStarted) {
+    session.hasBeenStarted = true;
   }
 
   return chatSession;
@@ -3616,6 +3620,15 @@ async function loadChatMessages(sessionId: string, chatSession: ChatSession): Pr
       if (latestInit) {
         chatSession.messages.push(latestInit);
         renderChatMessage(chatSession, latestInit);
+
+        // If session is missing claudeSessionId, extract it from the init message
+        const session = sessions.get(sessionId);
+        if (session && !session.claudeSessionId && latestInit.session_id) {
+          session.claudeSessionId = latestInit.session_id;
+          session.hasBeenStarted = true;
+          saveSessionToDb(session);
+          console.log(`[loadChatMessages] Recovered claudeSessionId from buffer: ${latestInit.session_id}`);
+        }
       }
 
       for (const msg of nonInitMessages) {

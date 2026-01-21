@@ -167,7 +167,7 @@ jobs:
           VERSION=${{ steps.get-version.outputs.version }}
 
           # Find the signature file
-          SIG_FILE="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Agent-Hub.app.tar.gz.minisig"
+          SIG_FILE="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Agent-Hub.app.tar.gz.sig"
           if [ -f "$SIG_FILE" ]; then
             SIGNATURE=$(cat "$SIG_FILE")
           else
@@ -218,7 +218,7 @@ jobs:
           fi
 
           # Upload signature
-          SIG_FILE="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Agent-Hub.app.tar.gz.minisig"
+          SIG_FILE="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Agent-Hub.app.tar.gz.sig"
           if [ -f "$SIG_FILE" ]; then
             gh release upload "v$VERSION" "$SIG_FILE"
           fi
