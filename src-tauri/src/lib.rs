@@ -1527,6 +1527,38 @@ fn load_app_settings() -> Result<AppSettings, String> {
     Ok(settings)
 }
 
+/// Read an image file and return as base64
+#[tauri::command]
+fn read_image_file(path: String) -> Result<String, String> {
+    use base64::Engine;
+
+    // Expand ~ to home directory
+    let expanded_path = shellexpand::tilde(&path);
+    let file_path = std::path::Path::new(expanded_path.as_ref());
+
+    if !file_path.exists() {
+        return Err(format!("File not found: {}", path));
+    }
+
+    // Read file contents
+    let contents = std::fs::read(file_path)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+
+    // Determine media type from extension
+    let media_type = match file_path.extension().and_then(|e| e.to_str()) {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        _ => "application/octet-stream",
+    };
+
+    // Encode as base64 data URL
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(&contents);
+    Ok(format!("data:{};base64,{}", media_type, base64_data))
+}
+
 /// MCP callback - receives results from JS execution
 #[cfg(not(target_os = "ios"))]
 #[tauri::command]
@@ -4647,6 +4679,7 @@ pub fn run() {
             load_window_state,
             save_app_settings,
             load_app_settings,
+            read_image_file,
             get_web_server_port,
             mcp_callback
         ])
@@ -4686,6 +4719,7 @@ pub fn run() {
             load_window_state,
             save_app_settings,
             load_app_settings,
+            read_image_file,
             get_web_server_port
         ])
         .run(tauri::generate_context!())

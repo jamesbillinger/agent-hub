@@ -65,7 +65,7 @@ interface ClaudeJsonMessage {
     id: string;
     type: string;
     role: string;
-    content: Array<{ type: string; text?: string; name?: string; input?: unknown }>;
+    content: Array<{ type: string; text?: string; name?: string; input?: unknown; source?: { type: string; media_type: string; data: string; url?: string } }>;
     stop_reason?: string | null;
     usage?: {
       input_tokens?: number;
@@ -3281,7 +3281,15 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
       if (block.type === "text" && block.text) {
         // Render markdown to HTML
         const renderedMarkdown = marked.parse(block.text) as string;
-        html += `<div>${renderedMarkdown}</div>`;
+        // Process image references [Image: source: /path/to/image.png]
+        const processedHtml = processImageReferences(renderedMarkdown);
+        html += `<div>${processedHtml}</div>`;
+      } else if (block.type === "image" && block.source) {
+        // Handle native image blocks from Claude API
+        const src = block.source.type === "base64"
+          ? `data:${block.source.media_type};base64,${block.source.data}`
+          : block.source.url || "";
+        html += `<div class="chat-image"><img src="${src}" alt="Image" loading="lazy" /></div>`;
       } else if (block.type === "tool_use") {
         hasToolUse = true;
         chatSession.toolUseCount++;
@@ -3542,6 +3550,41 @@ function escapeHtml(text: string): string {
   return div.innerHTML;
 }
 
+/**
+ * Process image references in text content.
+ * Converts [Image: source: /path/to/image.png] to placeholder images
+ * that will be loaded asynchronously.
+ */
+function processImageReferences(html: string): string {
+  // Match patterns like [Image: source: /path/to/file.png] or [Image: /path/to/file.png]
+  const imagePattern = /\[Image(?::\s*source)?:\s*([^\]]+)\]/g;
+
+  return html.replace(imagePattern, (match, imagePath) => {
+    const path = imagePath.trim();
+    const imageId = `img-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+
+    // Create a placeholder that will be replaced with the actual image
+    setTimeout(async () => {
+      const imgEl = document.getElementById(imageId);
+      if (!imgEl) return;
+
+      try {
+        const dataUrl = await invoke<string>("read_image_file", { path });
+        imgEl.innerHTML = `<img src="${dataUrl}" alt="${escapeHtml(path)}" loading="lazy" />`;
+        imgEl.classList.remove("loading");
+        imgEl.classList.add("loaded");
+      } catch (err) {
+        console.error(`Failed to load image: ${path}`, err);
+        imgEl.innerHTML = `<span class="image-error">Failed to load: ${escapeHtml(path)}</span>`;
+        imgEl.classList.remove("loading");
+        imgEl.classList.add("error");
+      }
+    }, 0);
+
+    return `<div id="${imageId}" class="chat-image loading"><span class="image-loading">Loading image...</span></div>`;
+  });
+}
+
 function formatTokens(tokens: number): string {
   if (tokens >= 1000) {
     return `${(tokens / 1000).toFixed(1)}k`;
@@ -3752,7 +3795,15 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
       if (block.type === "text" && block.text) {
         // Render markdown to HTML
         const renderedMarkdown = marked.parse(block.text) as string;
-        html += `<div>${renderedMarkdown}</div>`;
+        // Process image references [Image: source: /path/to/image.png]
+        const processedHtml = processImageReferences(renderedMarkdown);
+        html += `<div>${processedHtml}</div>`;
+      } else if (block.type === "image" && block.source) {
+        // Handle native image blocks from Claude API
+        const src = block.source.type === "base64"
+          ? `data:${block.source.media_type};base64,${block.source.data}`
+          : block.source.url || "";
+        html += `<div class="chat-image"><img src="${src}" alt="Image" loading="lazy" /></div>`;
       } else if (block.type === "tool_use") {
         messageEl.classList.remove("assistant");
         messageEl.classList.add("tool-use");
