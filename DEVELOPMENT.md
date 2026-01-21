@@ -88,7 +88,10 @@ The app checks for updates from:
 https://github.com/jamesbillinger/agent-hub/releases/latest/download/latest.json
 ```
 
-When a new release is available, the updater plugin will notify and can auto-install.
+Update behavior:
+- **On startup**: Checks for updates 5 seconds after launch. If an update is available, shows a system notification.
+- **Manual check**: Go to Settings → About → "Check for Updates" to check and install.
+- **Installing**: Click "Download & Install" to download the update, then the app auto-relaunches.
 
 ### Manual Build (without version bump)
 

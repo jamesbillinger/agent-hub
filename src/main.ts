@@ -1208,6 +1208,25 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Initial render
   renderSessionList();
   updateView();
+
+  // Check for updates in the background after a short delay
+  setTimeout(async () => {
+    try {
+      const update = await check();
+      if (update) {
+        console.log(`Update available: v${update.version}`);
+        // Show notification about available update
+        if (appSettings.notifications_enabled) {
+          await showNotification(
+            "Update Available",
+            `Agent Hub v${update.version} is available. Open Settings to install.`
+          );
+        }
+      }
+    } catch (err) {
+      console.log("Update check skipped:", err);
+    }
+  }, 5000); // Check 5 seconds after startup
 });
 
 async function loadSavedSessions() {
