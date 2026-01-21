@@ -1,6 +1,6 @@
 [package]
 name = "agent-hub"
-version = "0.1.38"
+version = "0.1.39"
 description = "Agent Hub - Terminal session manager for AI agents"
 authors = ["James Billinger"]
 edition = "2021"
