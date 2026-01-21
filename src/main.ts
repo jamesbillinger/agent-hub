@@ -2442,15 +2442,14 @@ function updateStartBanner() {
     return;
   }
 
-  // For JSON chat sessions, use inline status instead of banner
+  // For JSON chat sessions, no banner needed - auto-resumes on send
   if (isJsonAgent(session.agentType)) {
     startBanner.style.display = "none";
     const chatSession = chatSessions.get(activeSessionId);
     if (chatSession && !session.isRunning) {
-      const statusText = session.hasBeenStarted ? "Session inactive" : "New session";
-      const actionText = session.hasBeenStarted ? "Press any key or click to resume" : "Press any key or click to start";
-      chatSession.statusEl.textContent = `${statusText} · ${actionText}`;
-      chatSession.statusEl.className = "chat-status inactive";
+      // Just show "Ready" - will auto-resume when user sends a message
+      chatSession.statusEl.textContent = "Ready";
+      chatSession.statusEl.className = "chat-status";
     }
     return;
   }
