@@ -3260,8 +3260,10 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
   messageEl.className = "chat-message";
 
   if (message.type === "user") {
-    // Skip user messages with empty content (e.g., tool_result messages)
-    if (!message.result?.trim()) {
+    // Skip rendering user messages with empty/non-string content (e.g., tool_result messages)
+    // but still save them to preserve history
+    if (typeof message.result !== "string" || !message.result.trim()) {
+      saveChatMessages(sessionId);
       return;
     }
     messageEl.classList.add("user");
@@ -3390,7 +3392,8 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
     const renderedMarkdown = marked.parse(message.result) as string;
     messageEl.innerHTML = renderedMarkdown;
   } else {
-    // Skip other message types for now
+    // Skip rendering other message types but still save
+    saveChatMessages(sessionId);
     return;
   }
 
@@ -3948,10 +3951,100 @@ function showDiffModal(path: string, oldContent: string, newContent: string): vo
   const newEl = document.getElementById("diff-new-content")!;
 
   pathEl.textContent = path;
-  oldEl.textContent = oldContent || "(empty)";
-  newEl.textContent = newContent || "(empty)";
+
+  // Compute line-by-line diff
+  const oldLines = oldContent.split("\n");
+  const newLines = newContent.split("\n");
+
+  // Simple diff: find changed, added, and removed lines
+  // Use LCS-style approach for better matching
+  const diff = computeLineDiff(oldLines, newLines);
+
+  // Render old content with highlighting
+  let oldHtml = "";
+  let newHtml = "";
+
+  for (const change of diff) {
+    if (change.type === "unchanged") {
+      oldHtml += `<div class="diff-line unchanged">${escapeHtml(change.oldLine || "")}</div>`;
+      newHtml += `<div class="diff-line unchanged">${escapeHtml(change.newLine || "")}</div>`;
+    } else if (change.type === "removed") {
+      oldHtml += `<div class="diff-line removed">${escapeHtml(change.oldLine || "")}</div>`;
+      newHtml += `<div class="diff-line spacer"></div>`;
+    } else if (change.type === "added") {
+      oldHtml += `<div class="diff-line spacer"></div>`;
+      newHtml += `<div class="diff-line added">${escapeHtml(change.newLine || "")}</div>`;
+    } else if (change.type === "modified") {
+      oldHtml += `<div class="diff-line removed">${escapeHtml(change.oldLine || "")}</div>`;
+      newHtml += `<div class="diff-line added">${escapeHtml(change.newLine || "")}</div>`;
+    }
+  }
+
+  oldEl.innerHTML = oldHtml || "(empty)";
+  newEl.innerHTML = newHtml || "(empty)";
 
   modal.classList.add("visible");
+}
+
+interface DiffChange {
+  type: "unchanged" | "added" | "removed" | "modified";
+  oldLine?: string;
+  newLine?: string;
+}
+
+function computeLineDiff(oldLines: string[], newLines: string[]): DiffChange[] {
+  const changes: DiffChange[] = [];
+
+  // Simple diff algorithm using longest common subsequence approach
+  const m = oldLines.length;
+  const n = newLines.length;
+
+  // Build LCS matrix
+  const dp: number[][] = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
+
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (oldLines[i - 1] === newLines[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1] + 1;
+      } else {
+        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+  }
+
+  // Backtrack to find the diff
+  let i = m, j = n;
+  const tempChanges: DiffChange[] = [];
+
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
+      tempChanges.unshift({ type: "unchanged", oldLine: oldLines[i - 1], newLine: newLines[j - 1] });
+      i--;
+      j--;
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      tempChanges.unshift({ type: "added", newLine: newLines[j - 1] });
+      j--;
+    } else {
+      tempChanges.unshift({ type: "removed", oldLine: oldLines[i - 1] });
+      i--;
+    }
+  }
+
+  // Merge adjacent removed+added into modified where lines are similar
+  for (let k = 0; k < tempChanges.length; k++) {
+    const change = tempChanges[k];
+    const next = tempChanges[k + 1];
+
+    // Check if this is a removed followed by added (potential modification)
+    if (change.type === "removed" && next?.type === "added") {
+      changes.push({ type: "modified", oldLine: change.oldLine, newLine: next.newLine });
+      k++; // Skip the next one
+    } else {
+      changes.push(change);
+    }
+  }
+
+  return changes;
 }
 
 function hideDiffModal(): void {

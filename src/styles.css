@@ -1290,20 +1290,21 @@ body.resizing-sidebar {
 
 /* Diff expand button */
 .chat-message.tool-use .diff-expand-btn {
-  background: none;
-  border: none;
-  color: var(--text-dim);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
   cursor: pointer;
-  padding: 2px 6px;
-  font-size: 12px;
+  padding: 4px 10px;
+  font-size: 14px;
   border-radius: 4px;
   margin-left: 8px;
-  transition: background 0.15s, color 0.15s;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
 
 .chat-message.tool-use .diff-expand-btn:hover {
   background: var(--bg-tertiary);
   color: var(--text-primary);
+  border-color: var(--text-dim);
 }
 
 /* Diff Modal */
@@ -1423,6 +1424,33 @@ body.resizing-sidebar {
 .diff-pane-new pre {
   background: rgba(63, 185, 80, 0.05);
   color: var(--text-primary);
+}
+
+/* Diff line-by-line highlighting */
+.diff-line {
+  padding: 0 4px;
+  min-height: 1.5em;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.diff-line.unchanged {
+  color: var(--text-secondary);
+}
+
+.diff-line.removed {
+  background: rgba(248, 81, 73, 0.2);
+  color: var(--text-primary);
+}
+
+.diff-line.added {
+  background: rgba(63, 185, 80, 0.2);
+  color: var(--text-primary);
+}
+
+.diff-line.spacer {
+  background: transparent;
+  opacity: 0.3;
 }
 
 /* Task tool display */
