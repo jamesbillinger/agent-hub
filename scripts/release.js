@@ -13,10 +13,6 @@ const packageJsonPath = path.join(rootDir, 'package.json');
 const tauriConfPath = path.join(rootDir, 'src-tauri', 'tauri.conf.json');
 const cargoTomlPath = path.join(rootDir, 'src-tauri', 'Cargo.toml');
 
-// Parse args
-const args = process.argv.slice(2);
-const noInstall = args.includes('--no-install') || args.includes('--build-only');
-
 // Read current version
 const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
 const currentVersion = packageJson.version;
@@ -45,48 +41,32 @@ cargoToml = cargoToml.replace(/^version = ".*"$/m, `version = "${newVersion}"`);
 fs.writeFileSync(cargoTomlPath, cargoToml);
 console.log(`✓ Updated Cargo.toml`);
 
-// Build
-console.log(`\n📦 Building release...\n`);
+// Git operations
+console.log(`\n📦 Creating release branch...\n`);
+
 try {
-  execSync('npm run tauri build', { cwd: rootDir, stdio: 'inherit' });
+  // Commit version bump
+  execSync('git add package.json src-tauri/Cargo.toml src-tauri/tauri.conf.json', { cwd: rootDir, stdio: 'inherit' });
+  execSync(`git commit -m "chore: bump version to ${newVersion}"`, { cwd: rootDir, stdio: 'inherit' });
+  console.log(`✓ Committed version bump`);
+
+  // Push to main
+  execSync('git push origin main', { cwd: rootDir, stdio: 'inherit' });
+  console.log(`✓ Pushed to main`);
+
+  // Create and push release branch
+  execSync(`git checkout -b release/${newVersion}`, { cwd: rootDir, stdio: 'inherit' });
+  execSync(`git push origin release/${newVersion}`, { cwd: rootDir, stdio: 'inherit' });
+  console.log(`✓ Pushed release/${newVersion} branch`);
+
+  // Switch back to main
+  execSync('git checkout main', { cwd: rootDir, stdio: 'inherit' });
+
+  console.log(`\n✅ Release ${newVersion} triggered!\n`);
+  console.log(`   CI will build, sign, notarize, and publish the release.`);
+  console.log(`   Monitor progress: https://github.com/jamesbillinger/agent-hub/actions\n`);
 } catch (e) {
-  console.error('\n❌ Build failed');
+  console.error('\n❌ Release failed');
+  console.error(e.message);
   process.exit(1);
-}
-
-const appSource = path.join(rootDir, 'src-tauri', 'target', 'release', 'bundle', 'macos', 'Agent Hub.app');
-const appDest = '/Applications/Agent Hub.app';
-
-if (noInstall) {
-  console.log(`\n✅ Release ${newVersion} built (--no-install)!\n`);
-  console.log(`   App bundle: ${appSource}`);
-  console.log(`   DMG: src-tauri/target/release/bundle/dmg/`);
-  console.log(`\n   To install manually:`);
-  console.log(`   ditto "${appSource}" "${appDest}"\n`);
-} else {
-  // Install to Applications
-  console.log(`\n📲 Installing to Applications...`);
-
-  // Kill running app
-  try {
-    execSync('pkill -f "Agent Hub"', { stdio: 'ignore' });
-    execSync('sleep 1');
-  } catch (e) {
-    // App might not be running, that's fine
-  }
-
-  // Remove old and copy new
-  try {
-    execSync(`rm -rf "${appDest}"`);
-    execSync(`ditto "${appSource}" "${appDest}"`);
-    console.log(`✓ Installed to ${appDest}`);
-  } catch (e) {
-    console.error(`\n❌ Failed to install. You can manually run:`);
-    console.error(`   ditto "${appSource}" "${appDest}"`);
-    process.exit(1);
-  }
-
-  console.log(`\n✅ Release ${newVersion} complete!\n`);
-  console.log(`   App installed to: ${appDest}`);
-  console.log(`   DMG available at: src-tauri/target/release/bundle/dmg/\n`);
 }
