@@ -78,6 +78,12 @@ static JSON_PROCESSES: Lazy<Mutex<HashMap<String, JsonProcess>>> =
 static JSON_BROADCASTERS: Lazy<Mutex<HashMap<String, broadcast::Sender<String>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+// Broadcast channel for session status changes (start/stop events)
+// All connected WebSocket clients receive these notifications
+#[cfg(not(target_os = "ios"))]
+static STATUS_BROADCASTER: Lazy<broadcast::Sender<String>> =
+    Lazy::new(|| broadcast::channel::<String>(64).0);
+
 // Global AppHandle for web server to use
 static APP_HANDLE: Lazy<Mutex<Option<AppHandle>>> = Lazy::new(|| Mutex::new(None));
 
@@ -103,6 +109,45 @@ static MCP_HTTP_RESULTS: Lazy<Mutex<HashMap<String, Option<String>>>> =
 // PIN authentication: Rate limiting (IP -> (attempts, last_attempt_time))
 static PIN_RATE_LIMIT: Lazy<Mutex<HashMap<String, (u32, std::time::Instant)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Broadcast a session event to all connected WebSocket clients
+#[cfg(not(target_os = "ios"))]
+fn broadcast_session_event(event_type: &str, data: serde_json::Value) {
+    let msg = serde_json::json!({
+        "type": event_type,
+        "data": data
+    }).to_string();
+    let _ = STATUS_BROADCASTER.send(msg);
+}
+
+/// Broadcast a session status change (started/stopped)
+#[cfg(not(target_os = "ios"))]
+fn broadcast_session_status(session_id: &str, running: bool) {
+    broadcast_session_event("session_status", serde_json::json!({
+        "session_id": session_id,
+        "running": running
+    }));
+}
+
+/// Broadcast that a session was created
+#[cfg(not(target_os = "ios"))]
+fn broadcast_session_created(session: &SessionData) {
+    broadcast_session_event("session_created", serde_json::json!(session));
+}
+
+/// Broadcast that a session was deleted
+#[cfg(not(target_os = "ios"))]
+fn broadcast_session_deleted(session_id: &str) {
+    broadcast_session_event("session_deleted", serde_json::json!({
+        "session_id": session_id
+    }));
+}
+
+/// Broadcast that a session was updated
+#[cfg(not(target_os = "ios"))]
+fn broadcast_session_updated(session: &SessionData) {
+    broadcast_session_event("session_updated", serde_json::json!(session));
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PairingRequest {
@@ -367,6 +412,14 @@ fn load_sessions() -> Result<Vec<SessionData>, String> {
 #[tauri::command]
 fn save_session(session: SessionData) -> Result<(), String> {
     let conn = init_db().map_err(|e| e.to_string())?;
+
+    // Check if this is an update or create
+    let is_new: bool = conn.query_row(
+        "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+        params![session.id],
+        |row| row.get::<_, i32>(0)
+    ).unwrap_or(0) == 0;
+
     conn.execute(
         "INSERT OR REPLACE INTO sessions (id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -382,6 +435,17 @@ fn save_session(session: SessionData) -> Result<(), String> {
         ],
     )
     .map_err(|e| e.to_string())?;
+
+    // Broadcast session change to WebSocket clients
+    #[cfg(not(target_os = "ios"))]
+    {
+        if is_new {
+            broadcast_session_created(&session);
+        } else {
+            broadcast_session_updated(&session);
+        }
+    }
+
     Ok(())
 }
 
@@ -403,6 +467,11 @@ fn delete_session(session_id: String) -> Result<(), String> {
     let conn = init_db().map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
         .map_err(|e| e.to_string())?;
+
+    // Broadcast session deletion to WebSocket clients
+    #[cfg(not(target_os = "ios"))]
+    broadcast_session_deleted(&session_id);
+
     Ok(())
 }
 
@@ -914,6 +983,9 @@ fn spawn_pty(
         broadcasters.insert(session_id.clone(), tx.clone());
     }
 
+    // Notify WebSocket clients that session started
+    broadcast_session_status(&session_id, true);
+
     // For new Claude sessions (not resuming), spawn a thread to detect the actual session ID
     // Claude creates its own session ID, so we need to scan the projects folder
     let is_claude_command = cmd_str.contains("claude");
@@ -1004,6 +1076,8 @@ fn spawn_pty(
             let mut broadcasters = PTY_BROADCASTERS.lock();
             broadcasters.remove(&session_id_clone);
         }
+        // Notify WebSocket clients that session stopped
+        broadcast_session_status(&session_id_clone, false);
     });
 
     Ok(())
@@ -1171,6 +1245,9 @@ fn spawn_json_process(
                 "session_id": session_id_clone
             }));
 
+            // Notify WebSocket clients that session started
+            broadcast_session_status(&session_id_clone, true);
+
             // Spawn task to handle stdin
             let session_id_stdin = session_id_clone.clone();
             tokio::spawn(async move {
@@ -1247,6 +1324,8 @@ fn spawn_json_process(
                 let mut broadcasters = JSON_BROADCASTERS.lock();
                 broadcasters.remove(&session_id_clone);
             }
+            // Notify WebSocket clients that session stopped
+            broadcast_session_status(&session_id_clone, false);
         });
     });
 
@@ -3216,12 +3295,108 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         }
       });
 
-      // Refresh session list periodically to keep status in sync with desktop
-      setInterval(() => {
-        if (currentView === 'sessions') {
-          loadSessions();
+      // Connect to status WebSocket for real-time session updates
+      connectStatusWebSocket();
+    }
+
+    // Status WebSocket for real-time session events
+    let statusWs = null;
+    let statusWsReconnectTimer = null;
+
+    function connectStatusWebSocket() {
+      if (statusWs && statusWs.readyState === WebSocket.OPEN) return;
+
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      statusWs = new WebSocket(`${protocol}//${location.host}/api/ws/status`);
+
+      statusWs.onopen = () => {
+        console.log('Status WebSocket connected');
+        if (statusWsReconnectTimer) {
+          clearTimeout(statusWsReconnectTimer);
+          statusWsReconnectTimer = null;
         }
-      }, 5000); // Refresh every 5 seconds when viewing session list
+      };
+
+      statusWs.onclose = () => {
+        console.log('Status WebSocket closed, reconnecting in 3s...');
+        statusWsReconnectTimer = setTimeout(connectStatusWebSocket, 3000);
+      };
+
+      statusWs.onerror = (err) => {
+        console.error('Status WebSocket error:', err);
+      };
+
+      statusWs.onmessage = (e) => {
+        try {
+          const event = JSON.parse(e.data);
+          handleStatusEvent(event);
+        } catch (err) {
+          console.warn('Failed to parse status event:', e.data);
+        }
+      };
+    }
+
+    function handleStatusEvent(event) {
+      console.log('Status event:', event.type, event.data);
+
+      switch (event.type) {
+        case 'session_status': {
+          // Update running status for a session
+          const { session_id, running } = event.data;
+          const session = sessionsData.find(s => s.id === session_id);
+          if (session) {
+            session.running = running;
+            renderSessionsList();
+            // Update start button if viewing this session
+            if (currentSessionId === session_id) {
+              startBtn.style.display = running ? 'none' : 'inline-block';
+              if (!running) {
+                status.textContent = 'Session stopped';
+                status.className = 'disconnected';
+              }
+            }
+          }
+          break;
+        }
+
+        case 'session_created': {
+          // Add new session to the list
+          const session = event.data;
+          // Check if already exists (avoid duplicates)
+          if (!sessionsData.find(s => s.id === session.id)) {
+            sessionsData.unshift(session);
+            renderSessionsList();
+          }
+          break;
+        }
+
+        case 'session_updated': {
+          // Update existing session
+          const updated = event.data;
+          const idx = sessionsData.findIndex(s => s.id === updated.id);
+          if (idx !== -1) {
+            sessionsData[idx] = { ...sessionsData[idx], ...updated };
+            renderSessionsList();
+            // Update title if viewing this session
+            if (currentSessionId === updated.id) {
+              sessionTitle.textContent = updated.name;
+            }
+          }
+          break;
+        }
+
+        case 'session_deleted': {
+          // Remove session from list
+          const { session_id } = event.data;
+          sessionsData = sessionsData.filter(s => s.id !== session_id);
+          renderSessionsList();
+          // Navigate back if viewing the deleted session
+          if (currentSessionId === session_id) {
+            showSessionsList();
+          }
+          break;
+        }
+      }
     }
 
     // Start auth check
@@ -3923,7 +4098,10 @@ async fn handle_ws(socket: WebSocket, session_id: String) {
             return;
         };
 
-        // Spawn task to forward JSON output to WebSocket with keepalive pings
+        // Subscribe to status updates for all sessions
+        let mut status_rx = STATUS_BROADCASTER.subscribe();
+
+        // Spawn task to forward JSON output and status updates to WebSocket with keepalive pings
         let send_task = tokio::spawn(async move {
             let mut ping_interval = interval(Duration::from_secs(30));
             loop {
@@ -3936,6 +4114,14 @@ async fn handle_ws(socket: WebSocket, session_id: String) {
                                 }
                             }
                             Err(_) => break,
+                        }
+                    }
+                    // Forward session status changes to client
+                    result = status_rx.recv() => {
+                        if let Ok(status_msg) = result {
+                            if sender.send(Message::Text(status_msg)).await.is_err() {
+                                break;
+                            }
                         }
                     }
                     _ = ping_interval.tick() => {
@@ -3998,7 +4184,10 @@ async fn handle_ws(socket: WebSocket, session_id: String) {
             return;
         };
 
-        // Spawn task to forward PTY output to WebSocket with keepalive pings
+        // Subscribe to status updates for all sessions
+        let mut status_rx = STATUS_BROADCASTER.subscribe();
+
+        // Spawn task to forward PTY output and status updates to WebSocket with keepalive pings
         let send_task = tokio::spawn(async move {
             let mut ping_interval = interval(Duration::from_secs(30));
             loop {
@@ -4011,6 +4200,14 @@ async fn handle_ws(socket: WebSocket, session_id: String) {
                                 }
                             }
                             Err(_) => break,
+                        }
+                    }
+                    // Forward session status/events to client
+                    result = status_rx.recv() => {
+                        if let Ok(status_msg) = result {
+                            if sender.send(Message::Text(status_msg)).await.is_err() {
+                                break;
+                            }
                         }
                     }
                     _ = ping_interval.tick() => {
@@ -4079,6 +4276,59 @@ async fn ws_handler(
     (StatusCode::NOT_IMPLEMENTED, "WebSocket PTY streaming not supported on iOS")
 }
 
+// Status-only WebSocket for receiving session events (start/stop, create/update/delete)
+// This allows mobile clients to receive updates without being connected to a specific session
+#[cfg(not(target_os = "ios"))]
+async fn ws_status_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(handle_ws_status)
+}
+
+#[cfg(not(target_os = "ios"))]
+async fn handle_ws_status(socket: WebSocket) {
+    use tokio::time::{interval, Duration};
+
+    let (mut sender, mut receiver) = socket.split();
+    let mut status_rx = STATUS_BROADCASTER.subscribe();
+
+    // Spawn task to forward status updates to WebSocket with keepalive pings
+    let send_task = tokio::spawn(async move {
+        let mut ping_interval = interval(Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                result = status_rx.recv() => {
+                    if let Ok(status_msg) = result {
+                        if sender.send(Message::Text(status_msg)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    if sender.send(Message::Ping(vec![])).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Handle incoming messages (mainly pongs, but could be used for commands later)
+    while let Some(msg) = receiver.next().await {
+        match msg {
+            Ok(Message::Close(_)) => break,
+            Err(_) => break,
+            _ => {} // Ignore other messages
+        }
+    }
+
+    send_task.abort();
+}
+
+// iOS stub for status WebSocket
+#[cfg(target_os = "ios")]
+async fn ws_status_handler(_ws: WebSocketUpgrade) -> impl IntoResponse {
+    (StatusCode::NOT_IMPLEMENTED, "Status WebSocket not supported on iOS")
+}
+
 #[cfg(not(target_os = "ios"))]
 fn start_web_server() {
     // Load paired devices from database
@@ -4102,6 +4352,7 @@ fn start_web_server() {
                 .route("/api/sessions/:session_id/buffer", get(api_get_buffer))
                 .route("/api/sessions/:session_id/start", axum::routing::post(api_start_session))
                 .route("/api/ws/:session_id", get(ws_handler))
+                .route("/api/ws/status", get(ws_status_handler))
                 // MCP HTTP endpoints for external control
                 .route("/api/mcp/execute", axum::routing::post(api_mcp_execute))
                 .route("/api/mcp/result", axum::routing::post(api_mcp_result))
@@ -4177,6 +4428,7 @@ fn start_web_server() {
                 .route("/api/sessions/:session_id/buffer", get(api_get_buffer))
                 .route("/api/sessions/:session_id/start", axum::routing::post(api_start_session))
                 .route("/api/ws/:session_id", get(ws_handler))
+                .route("/api/ws/status", get(ws_status_handler))
                 .layer(CorsLayer::permissive());
 
             // Try ports starting from WEB_PORT_BASE until we find one available
