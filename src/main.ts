@@ -3574,7 +3574,8 @@ function processImageReferences(html: string): string {
   // 1. Start with / or ~/
   // 2. End with common image extensions
   // 3. Are preceded by context words like "at", "to", "saved", etc.
-  const pathPattern = /(?:saved|at|to|screenshot|image|file)\s+([\/~][^\s<>"']+\.(?:png|jpg|jpeg|gif|webp|svg))/gi;
+  // Also handle paths wrapped in <code> tags from markdown rendering
+  const pathPattern = /(?:saved|at|to|screenshot|image|file)\s+(?:<code>)?([\/~][^\s<>"']+\.(?:png|jpg|jpeg|gif|webp|svg))(?:<\/code>)?/gi;
   result = result.replace(pathPattern, (match, imagePath) => {
     const path = imagePath.trim();
     if (processedPaths.has(path)) return match;
