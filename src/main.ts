@@ -3048,7 +3048,19 @@ function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: s
     case "Task": {
       const description = input.description as string || "";
       const subagentType = input.subagent_type as string || "";
-      return `<span class="tool-name">Task</span><span class="tool-desc">${escapeForHtml(description)}</span><span class="tool-detail">(${escapeForHtml(subagentType)})</span>`;
+      const prompt = input.prompt as string || "";
+      // Show Task with description as subtitle and truncated prompt preview
+      let html = `<div class="tool-task">`;
+      html += `<div class="tool-task-header"><span class="tool-name">Task</span><span class="tool-task-type">${escapeForHtml(subagentType)}</span></div>`;
+      if (description) {
+        html += `<div class="tool-task-desc">${escapeForHtml(description)}</div>`;
+      }
+      if (prompt) {
+        const truncatedPrompt = prompt.length > 200 ? prompt.slice(0, 200) + "..." : prompt;
+        html += `<div class="tool-task-prompt">${escapeForHtml(truncatedPrompt)}</div>`;
+      }
+      html += `</div>`;
+      return html;
     }
 
     case "WebFetch": {

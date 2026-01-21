@@ -1253,6 +1253,46 @@ body.resizing-sidebar {
   word-break: break-word;
 }
 
+/* Task tool display */
+.chat-message.tool-use .tool-task {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.chat-message.tool-use .tool-task-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chat-message.tool-use .tool-task-type {
+  background: var(--bg-tertiary);
+  color: var(--accent-purple);
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.chat-message.tool-use .tool-task-desc {
+  color: var(--text-primary);
+  font-weight: 500;
+  font-size: 13px;
+}
+
+.chat-message.tool-use .tool-task-prompt {
+  color: var(--text-dim);
+  font-size: 11px;
+  background: var(--bg-tertiary);
+  padding: 6px 8px;
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 80px;
+  overflow-y: auto;
+}
+
 .chat-message.tool-result {
   align-self: flex-start;
   background: var(--bg-tertiary);
