@@ -654,6 +654,27 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (e.target === aboutModal) hideAboutModal();
   });
 
+  // Diff modal event listeners
+  const diffModal = document.getElementById("diff-modal")!;
+  document.getElementById("diff-modal-close")!.addEventListener("click", hideDiffModal);
+  diffModal.addEventListener("click", (e) => {
+    if (e.target === diffModal) hideDiffModal();
+  });
+
+  // Event delegation for diff expand buttons (dynamically added)
+  document.getElementById("chat-messages")!.addEventListener("click", (e) => {
+    const btn = (e.target as HTMLElement).closest(".diff-expand-btn") as HTMLButtonElement;
+    if (btn) {
+      const path = btn.dataset.path || "";
+      const oldB64 = btn.dataset.old || "";
+      const newB64 = btn.dataset.new || "";
+      // Decode from base64
+      const oldContent = decodeURIComponent(escape(atob(oldB64)));
+      const newContent = decodeURIComponent(escape(atob(newB64)));
+      showDiffModal(path, oldContent, newContent);
+    }
+  });
+
   // Claude sessions modal event listeners
   const claudeSessionsModalEl = document.getElementById("claude-sessions-modal")!;
   document.getElementById("claude-sessions-cancel")!.addEventListener("click", hideClaudeSessionsModal);
@@ -3062,7 +3083,17 @@ function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: s
       }
 
       const replaceNote = replaceAll ? ` <span class="tool-detail">(replace all)</span>` : "";
-      return `<span class="tool-name">Edit</span><span class="tool-path">${escapeForHtml(relPath)}</span>${replaceNote}${diffHtml}`;
+
+      // Add expand button if there's actual diff content
+      let expandBtn = "";
+      if (oldStr || newStr) {
+        // Encode the strings as base64 to safely embed in data attributes
+        const oldB64 = btoa(unescape(encodeURIComponent(oldStr)));
+        const newB64 = btoa(unescape(encodeURIComponent(newStr)));
+        expandBtn = `<button class="diff-expand-btn" data-path="${escapeForHtml(relPath)}" data-old="${oldB64}" data-new="${newB64}" title="View full diff">⤢</button>`;
+      }
+
+      return `<span class="tool-name">Edit</span><span class="tool-path">${escapeForHtml(relPath)}</span>${replaceNote}${expandBtn}${diffHtml}`;
     }
 
     case "Write": {
@@ -3873,6 +3904,26 @@ async function checkForUpdates(): Promise<void> {
     statusEl.textContent = `Check failed: ${err}`;
     button.disabled = false;
   }
+}
+
+// Diff modal functions
+
+function showDiffModal(path: string, oldContent: string, newContent: string): void {
+  const modal = document.getElementById("diff-modal")!;
+  const pathEl = document.getElementById("diff-modal-path")!;
+  const oldEl = document.getElementById("diff-old-content")!;
+  const newEl = document.getElementById("diff-new-content")!;
+
+  pathEl.textContent = path;
+  oldEl.textContent = oldContent || "(empty)";
+  newEl.textContent = newContent || "(empty)";
+
+  modal.classList.add("visible");
+}
+
+function hideDiffModal(): void {
+  const modal = document.getElementById("diff-modal")!;
+  modal.classList.remove("visible");
 }
 
 // About modal functions

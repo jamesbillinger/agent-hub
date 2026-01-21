@@ -275,6 +275,27 @@
       </div>
     </div>
 
+    <!-- Diff Modal -->
+    <div id="diff-modal">
+      <div class="modal-content diff-modal-content">
+        <div class="diff-modal-header">
+          <h2>File Changes</h2>
+          <span id="diff-modal-path" class="diff-modal-path"></span>
+          <button class="modal-close-btn" id="diff-modal-close">&times;</button>
+        </div>
+        <div class="diff-container">
+          <div class="diff-pane diff-pane-old">
+            <div class="diff-pane-header">Removed</div>
+            <pre id="diff-old-content"></pre>
+          </div>
+          <div class="diff-pane diff-pane-new">
+            <div class="diff-pane-header">Added</div>
+            <pre id="diff-new-content"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Claude Sessions Modal -->
     <div id="claude-sessions-modal">
       <div class="modal-content claude-sessions-modal-content">
