@@ -808,7 +808,6 @@ document.addEventListener("DOMContentLoaded", async () => {
         chatSession.statusEl.textContent = `Process exited (${event.payload.exit_code ?? "unknown"})`;
         chatSession.statusEl.className = "chat-status";
         chatSession.isProcessing = false;
-        chatSession.sendBtn.disabled = false;
         const thinkingEl = chatSession.containerEl.querySelector(".chat-thinking") as HTMLElement;
         if (thinkingEl) thinkingEl.style.display = "none";
 
@@ -1072,7 +1071,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       e.preventDefault();
       toggleSidebar();
     }
-    // Escape to close modals
+    // Escape to close modals or interrupt processing
     if (e.key === "Escape") {
       if (settingsModal.classList.contains("visible")) {
         hideSettingsModal();
@@ -1080,6 +1079,12 @@ document.addEventListener("DOMContentLoaded", async () => {
         hideAboutModal();
       } else if (newSessionModal.classList.contains("visible")) {
         hideNewSessionModal();
+      } else if (activeSessionId) {
+        // Interrupt current session if processing
+        const chatSession = chatSessions.get(activeSessionId);
+        if (chatSession?.isProcessing) {
+          interruptSession(activeSessionId);
+        }
       }
     }
     // Cmd+1-9,0 to switch to sessions (like iTerm2)
@@ -2787,6 +2792,24 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
 }
 
 /**
+ * Interrupt a running chat session (like pressing Escape in CLI)
+ */
+async function interruptSession(sessionId: string) {
+  const session = sessions.get(sessionId);
+  const chatSession = chatSessions.get(sessionId);
+  if (!session || !chatSession || !chatSession.isProcessing) return;
+
+  try {
+    await invoke("interrupt_json_process", { sessionId });
+    chatSession.statusEl.textContent = "Interrupted";
+    chatSession.statusEl.className = "chat-status";
+    // Note: isProcessing will be set to false when we receive the result message
+  } catch (err) {
+    console.error("Failed to interrupt session:", err);
+  }
+}
+
+/**
  * Send a message in a chat session
  */
 async function sendChatMessage(sessionId: string) {
@@ -2803,7 +2826,7 @@ async function sendChatMessage(sessionId: string) {
   }
 
   // Allow sending if there's text OR images attached
-  if ((!message && chatSession.pendingImages.length === 0) || chatSession.isProcessing) return;
+  if (!message && chatSession.pendingImages.length === 0) return;
 
   // Handle slash commands
   if (message.startsWith("/")) {
@@ -2826,7 +2849,6 @@ async function sendChatMessage(sessionId: string) {
 
   // Show thinking indicator and reset stats
   chatSession.isProcessing = true;
-  chatSession.sendBtn.disabled = true;
   chatSession.toolUseCount = 0;
   chatSession.streamingTokens = 0;
   chatSession.startTime = Date.now();
@@ -2869,7 +2891,6 @@ async function sendChatMessage(sessionId: string) {
       chatSession.statusEl.textContent = `Start failed: ${errMsg}`;
       chatSession.statusEl.className = "chat-status error";
       chatSession.isProcessing = false;
-      chatSession.sendBtn.disabled = false;
       if (thinkingEl) thinkingEl.style.display = "none";
       return;
     }
@@ -2923,7 +2944,6 @@ async function sendChatMessage(sessionId: string) {
     chatSession.statusEl.textContent = `Send failed: ${errMsg}`;
     chatSession.statusEl.className = "chat-status error";
     chatSession.isProcessing = false;
-    chatSession.sendBtn.disabled = false;
     if (thinkingEl) thinkingEl.style.display = "none";
   }
 }
@@ -3422,7 +3442,6 @@ function processChatOutput(sessionId: string, data: string) {
       // Check if response is complete
       if (message.type === "result") {
         chatSession.isProcessing = false;
-        chatSession.sendBtn.disabled = false;
         const thinkingEl = chatSession.containerEl.querySelector(".chat-thinking") as HTMLElement;
         if (thinkingEl) thinkingEl.style.display = "none";
 

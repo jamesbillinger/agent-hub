@@ -1353,6 +1353,22 @@ fn write_to_process(session_id: String, data: String) -> Result<(), String> {
     }
 }
 
+/// Interrupt a JSON process by sending SIGINT
+#[cfg(not(target_os = "ios"))]
+#[tauri::command]
+fn interrupt_json_process(session_id: String) -> Result<(), String> {
+    let processes = JSON_PROCESSES.lock();
+    if let Some(process) = processes.get(&session_id) {
+        if process.child_id > 0 {
+            // Send SIGINT to the process
+            unsafe {
+                libc::kill(process.child_id as i32, libc::SIGINT);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Kill a JSON process
 #[cfg(not(target_os = "ios"))]
 #[tauri::command]
@@ -4611,6 +4627,7 @@ pub fn run() {
             kill_pty,
             spawn_json_process,
             write_to_process,
+            interrupt_json_process,
             kill_json_process,
             load_sessions,
             save_session,
