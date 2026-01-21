@@ -1249,6 +1249,18 @@ body.resizing-sidebar {
   font-size: 12px;
 }
 
+.chat-message.tool-use .tool-path.clickable {
+  color: var(--accent-blue);
+  text-decoration: none;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.chat-message.tool-use .tool-path.clickable:hover {
+  color: var(--accent-blue-bright, #6cb6ff);
+  text-decoration: underline;
+}
+
 .chat-message.tool-use .tool-detail {
   color: var(--text-dim);
   font-size: 11px;

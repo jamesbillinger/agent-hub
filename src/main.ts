@@ -661,9 +661,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (e.target === diffModal) hideDiffModal();
   });
 
-  // Event delegation for diff expand buttons (dynamically added)
+  // Event delegation for diff expand buttons and clickable paths (dynamically added)
   // Use chat-container since chat-messages elements are created dynamically per session
   document.getElementById("chat-container")!.addEventListener("click", (e) => {
+    // Handle diff expand buttons
     const btn = (e.target as HTMLElement).closest(".diff-expand-btn") as HTMLButtonElement;
     if (btn) {
       const path = btn.dataset.path || "";
@@ -673,6 +674,19 @@ document.addEventListener("DOMContentLoaded", async () => {
       const oldContent = decodeURIComponent(escape(atob(oldB64)));
       const newContent = decodeURIComponent(escape(atob(newB64)));
       showDiffModal(path, oldContent, newContent);
+      return;
+    }
+
+    // Handle clickable file paths - open in VS Code
+    const pathLink = (e.target as HTMLElement).closest("a[data-vscode-path]") as HTMLAnchorElement;
+    if (pathLink) {
+      e.preventDefault();
+      const vscodePath = pathLink.dataset.vscodePath || "";
+      if (vscodePath) {
+        // VS Code URL scheme: vscode://file/path/to/file:line:column
+        const vscodeUrl = `vscode://file${vscodePath}`;
+        window.open(vscodeUrl);
+      }
     }
   });
 
@@ -3026,10 +3040,18 @@ function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: s
     return fullPath;
   };
 
+  // Helper to create clickable file path that opens in VS Code
+  const clickablePath = (fullPath: string, displayPath?: string, line?: number) => {
+    const display = displayPath || relativePath(fullPath);
+    const lineParam = line ? `:${line}` : "";
+    return `<a class="tool-path clickable" href="#" data-vscode-path="${escapeForHtml(fullPath)}${lineParam}" title="Open in VS Code: ${escapeForHtml(fullPath)}${lineParam}">${escapeForHtml(display)}</a>`;
+  };
+
   switch (toolName) {
     case "Read": {
       const filePath = input.file_path as string || "";
       const relPath = relativePath(filePath);
+      const line = input.offset as number | undefined;
       let details = "";
       if (input.offset || input.limit) {
         const parts = [];
@@ -3037,7 +3059,7 @@ function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: s
         if (input.limit) parts.push(`${input.limit} lines`);
         details = ` <span class="tool-detail">(${parts.join(", ")})</span>`;
       }
-      return `<span class="tool-name">Read</span><span class="tool-path">${escapeForHtml(relPath)}</span>${details}`;
+      return `<span class="tool-name">Read</span>${clickablePath(filePath, relPath, line)}${details}`;
     }
 
     case "Edit": {
@@ -3121,7 +3143,7 @@ function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: s
         expandBtn = `<button class="diff-expand-btn" data-path="${escapeForHtml(relPath)}" data-old="${oldB64}" data-new="${newB64}" title="View full diff">⤢</button>`;
       }
 
-      return `<span class="tool-name">Edit</span><span class="tool-path">${escapeForHtml(relPath)}</span>${replaceNote}${expandBtn}${diffHtml}`;
+      return `<span class="tool-name">Edit</span>${clickablePath(filePath, relPath)}${replaceNote}${expandBtn}${diffHtml}`;
     }
 
     case "Write": {
@@ -3129,7 +3151,7 @@ function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: s
       const relPath = relativePath(filePath);
       const content = input.content as string || "";
       const lineCount = content.split("\n").length;
-      return `<span class="tool-name">Write</span><span class="tool-path">${escapeForHtml(relPath)}</span><span class="tool-detail">(${lineCount} lines)</span>`;
+      return `<span class="tool-name">Write</span>${clickablePath(filePath, relPath)}<span class="tool-detail">(${lineCount} lines)</span>`;
     }
 
     case "Bash": {
