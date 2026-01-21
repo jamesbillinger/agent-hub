@@ -662,7 +662,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   // Event delegation for diff expand buttons (dynamically added)
-  document.getElementById("chat-messages")!.addEventListener("click", (e) => {
+  // Use chat-container since chat-messages elements are created dynamically per session
+  document.getElementById("chat-container")!.addEventListener("click", (e) => {
     const btn = (e.target as HTMLElement).closest(".diff-expand-btn") as HTMLButtonElement;
     if (btn) {
       const path = btn.dataset.path || "";
