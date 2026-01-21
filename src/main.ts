@@ -808,6 +808,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         chatSession.statusEl.textContent = `Process exited (${event.payload.exit_code ?? "unknown"})`;
         chatSession.statusEl.className = "chat-status";
         chatSession.isProcessing = false;
+        updateSessionActivityIndicator(event.payload.session_id, false);
         const thinkingEl = chatSession.containerEl.querySelector(".chat-thinking") as HTMLElement;
         if (thinkingEl) thinkingEl.style.display = "none";
 
@@ -2853,6 +2854,7 @@ async function sendChatMessage(sessionId: string) {
   chatSession.startTime = Date.now();
   chatSession.statusEl.textContent = "Starting...";
   chatSession.statusEl.className = "chat-status";
+  updateSessionActivityIndicator(sessionId, true);
   const thinkingEl = chatSession.containerEl.querySelector(".chat-thinking") as HTMLElement;
   if (thinkingEl) thinkingEl.style.display = "flex";
 
@@ -2890,6 +2892,7 @@ async function sendChatMessage(sessionId: string) {
       chatSession.statusEl.textContent = `Start failed: ${errMsg}`;
       chatSession.statusEl.className = "chat-status error";
       chatSession.isProcessing = false;
+      updateSessionActivityIndicator(sessionId, false);
       if (thinkingEl) thinkingEl.style.display = "none";
       return;
     }
@@ -2943,6 +2946,7 @@ async function sendChatMessage(sessionId: string) {
     chatSession.statusEl.textContent = `Send failed: ${errMsg}`;
     chatSession.statusEl.className = "chat-status error";
     chatSession.isProcessing = false;
+    updateSessionActivityIndicator(sessionId, false);
     if (thinkingEl) thinkingEl.style.display = "none";
   }
 }
@@ -3445,6 +3449,7 @@ function processChatOutput(sessionId: string, data: string) {
       // Check if response is complete
       if (message.type === "result") {
         chatSession.isProcessing = false;
+        updateSessionActivityIndicator(sessionId, false);
         const thinkingEl = chatSession.containerEl.querySelector(".chat-thinking") as HTMLElement;
         if (thinkingEl) thinkingEl.style.display = "none";
 
