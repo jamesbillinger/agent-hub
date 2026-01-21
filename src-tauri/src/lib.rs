@@ -3215,6 +3215,13 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           openSession(sessionId);
         }
       });
+
+      // Refresh session list periodically to keep status in sync with desktop
+      setInterval(() => {
+        if (currentView === 'sessions') {
+          loadSessions();
+        }
+      }, 5000); // Refresh every 5 seconds when viewing session list
     }
 
     // Start auth check
