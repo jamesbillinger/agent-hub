@@ -636,6 +636,56 @@ fn list_claude_sessions(_working_dir: Option<String>) -> Result<Vec<ClaudeSessio
     Ok(vec![])
 }
 
+/// Load the full message history from a Claude session file
+#[cfg(not(target_os = "ios"))]
+#[tauri::command]
+fn load_claude_session_history(session_id: String, project: String) -> Result<Vec<serde_json::Value>, String> {
+    use std::io::{BufRead, BufReader};
+
+    let home = dirs::home_dir().ok_or_else(|| "Could not find home directory".to_string())?;
+    let claude_projects = home.join(".claude").join("projects");
+
+    // Build project folder name the same way Claude does
+    let project_folder_name = project
+        .replace('/', "-")
+        .trim_start_matches('-')
+        .to_string();
+
+    let session_file = claude_projects
+        .join(format!("-{}", project_folder_name))
+        .join(format!("{}.jsonl", session_id));
+
+    if !session_file.exists() {
+        return Err(format!("Session file not found: {:?}", session_file));
+    }
+
+    let file = std::fs::File::open(&session_file)
+        .map_err(|e| format!("Could not open session file: {}", e))?;
+    let reader = BufReader::new(file);
+
+    let mut messages = Vec::new();
+    for line in reader.lines() {
+        if let Ok(line) = line {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                // Only include user and assistant messages
+                if let Some(msg_type) = json.get("type").and_then(|t| t.as_str()) {
+                    if msg_type == "user" || msg_type == "assistant" {
+                        messages.push(json);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(messages)
+}
+
+#[cfg(target_os = "ios")]
+#[tauri::command]
+fn load_claude_session_history(_session_id: String, _project: String) -> Result<Vec<serde_json::Value>, String> {
+    Ok(vec![])
+}
+
 #[derive(serde::Serialize)]
 struct ClaudeSessionInfo {
     session_id: String,
@@ -4308,6 +4358,7 @@ pub fn run() {
             delete_session,
             update_session_claude_id,
             list_claude_sessions,
+            load_claude_session_history,
             update_session_orders,
             save_recently_closed,
             get_recently_closed,
@@ -4346,6 +4397,7 @@ pub fn run() {
             delete_session,
             update_session_claude_id,
             list_claude_sessions,
+            load_claude_session_history,
             update_session_orders,
             save_recently_closed,
             get_recently_closed,

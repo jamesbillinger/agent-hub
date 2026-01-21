@@ -656,6 +656,33 @@ body.resizing-sidebar {
   background: var(--accent-hover);
 }
 
+/* Secondary button for settings */
+.secondary-btn {
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  transition: background 0.15s;
+}
+
+.secondary-btn:hover {
+  background: var(--bg-hover);
+}
+
+.secondary-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* About version in settings */
+.about-version {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar {
   width: 10px;
@@ -1253,6 +1280,14 @@ body.resizing-sidebar {
   word-break: break-word;
 }
 
+.chat-message.tool-use .diff-context {
+  color: var(--text-dim);
+  padding: 2px 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-style: italic;
+}
+
 /* Task tool display */
 .chat-message.tool-use .tool-task {
   display: flex;
@@ -1521,9 +1556,10 @@ body.resizing-sidebar {
   color: var(--text-primary);
   font-size: 14px;
   resize: none;
-  min-height: 40px;
-  max-height: 150px;
+  min-height: 80px;
+  max-height: 200px;
   font-family: inherit;
+  line-height: 1.5;
 }
 
 .chat-input:focus {
@@ -1944,6 +1980,11 @@ body.resizing-sidebar {
   /* Chat input safe area */
   .chat-input-container {
     padding-bottom: max(12px, env(safe-area-inset-bottom, 0));
+  }
+
+  .chat-input {
+    min-height: 40px;
+    max-height: 120px;
   }
 
   /* Empty state adjustments */

@@ -3,6 +3,8 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalPosition, LogicalSize, type Theme } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SerializeAddon } from "@xterm/addon-serialize";
@@ -641,6 +643,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Settings modal event listeners
   document.getElementById("settings-cancel")!.addEventListener("click", hideSettingsModal);
   document.getElementById("settings-save")!.addEventListener("click", saveSettings);
+  document.getElementById("settings-check-update")!.addEventListener("click", checkForUpdates);
   settingsModal.addEventListener("click", (e) => {
     if (e.target === settingsModal) hideSettingsModal();
   });
@@ -2976,19 +2979,66 @@ function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: s
       const newStr = input.new_string as string || "";
       const replaceAll = input.replace_all as boolean;
 
-      // Truncate long strings for display
-      const maxLen = 100;
-      const truncate = (s: string) => s.length > maxLen ? s.slice(0, maxLen) + "..." : s;
-
+      // Generate a proper line-by-line diff
       let diffHtml = "";
       if (oldStr || newStr) {
+        const oldLines = oldStr.split("\n");
+        const newLines = newStr.split("\n");
+
+        // Find common prefix lines
+        let prefixLen = 0;
+        while (prefixLen < oldLines.length && prefixLen < newLines.length &&
+               oldLines[prefixLen] === newLines[prefixLen]) {
+          prefixLen++;
+        }
+
+        // Find common suffix lines (but don't overlap with prefix)
+        let suffixLen = 0;
+        while (suffixLen < oldLines.length - prefixLen &&
+               suffixLen < newLines.length - prefixLen &&
+               oldLines[oldLines.length - 1 - suffixLen] === newLines[newLines.length - 1 - suffixLen]) {
+          suffixLen++;
+        }
+
+        // Extract the changed portions
+        const oldChanged = oldLines.slice(prefixLen, oldLines.length - suffixLen);
+        const newChanged = newLines.slice(prefixLen, newLines.length - suffixLen);
+
+        // Build diff HTML showing only changed lines with minimal context
         diffHtml = `<div class="tool-diff">`;
-        if (oldStr) {
-          diffHtml += `<div class="diff-old">- ${escapeForHtml(truncate(oldStr))}</div>`;
+        const maxLines = 8;
+        const truncateLine = (s: string) => s.length > 80 ? s.slice(0, 80) + "..." : s;
+
+        // Show context indicator if there's unchanged prefix
+        if (prefixLen > 0) {
+          const contextLine = prefixLen === 1 ? oldLines[0] : `... ${prefixLen} unchanged lines ...`;
+          diffHtml += `<div class="diff-context">  ${escapeForHtml(truncateLine(contextLine))}</div>`;
         }
-        if (newStr) {
-          diffHtml += `<div class="diff-new">+ ${escapeForHtml(truncate(newStr))}</div>`;
+
+        // Show removed lines
+        const oldToShow = oldChanged.length > maxLines ? oldChanged.slice(0, maxLines) : oldChanged;
+        for (const line of oldToShow) {
+          diffHtml += `<div class="diff-old">- ${escapeForHtml(truncateLine(line))}</div>`;
         }
+        if (oldChanged.length > maxLines) {
+          diffHtml += `<div class="diff-old">- ... ${oldChanged.length - maxLines} more lines removed</div>`;
+        }
+
+        // Show added lines
+        const newToShow = newChanged.length > maxLines ? newChanged.slice(0, maxLines) : newChanged;
+        for (const line of newToShow) {
+          diffHtml += `<div class="diff-new">+ ${escapeForHtml(truncateLine(line))}</div>`;
+        }
+        if (newChanged.length > maxLines) {
+          diffHtml += `<div class="diff-new">+ ... ${newChanged.length - maxLines} more lines added</div>`;
+        }
+
+        // Show context indicator if there's unchanged suffix
+        if (suffixLen > 0) {
+          const contextLine = suffixLen === 1 ? oldLines[oldLines.length - 1] : `... ${suffixLen} unchanged lines ...`;
+          diffHtml += `<div class="diff-context">  ${escapeForHtml(truncateLine(contextLine))}</div>`;
+        }
+
         diffHtml += `</div>`;
       }
 
@@ -3025,16 +3075,7 @@ function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: s
       return html;
     }
 
-    case "Glob": {
-      const pattern = input.pattern as string || "";
-      const path = input.path as string;
-      let pathInfo = "";
-      if (path) {
-        pathInfo = ` in ${escapeForHtml(relativePath(path))}`;
-      }
-      return `<span class="tool-name">Glob</span><code class="tool-pattern">${escapeForHtml(pattern)}</code>${pathInfo}`;
-    }
-
+    case "Glob":
     case "Grep": {
       const pattern = input.pattern as string || "";
       const path = input.path as string;
@@ -3042,7 +3083,7 @@ function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: s
       if (path) {
         pathInfo = ` in ${escapeForHtml(relativePath(path))}`;
       }
-      return `<span class="tool-name">Grep</span><code class="tool-pattern">${escapeForHtml(pattern)}</code>${pathInfo}`;
+      return `<span class="tool-name">Search</span><code class="tool-pattern">${escapeForHtml(pattern)}</code>${pathInfo}`;
     }
 
     case "Task": {
@@ -3697,7 +3738,7 @@ async function saveAllTerminalBuffers(): Promise<void> {
 
 // Settings modal functions
 
-function showSettingsModal(): void {
+async function showSettingsModal(): Promise<void> {
   // Populate settings form with current values
   settingsFontSizeInput.value = String(appSettings.font_size);
   settingsFontFamilySelect.value = appSettings.font_family;
@@ -3710,6 +3751,18 @@ function showSettingsModal(): void {
   settingsReadAloudCheckbox.checked = appSettings.read_aloud_enabled ?? false;
   settingsRendererSelect.value = appSettings.renderer || "webgl";
   settingsRemotePinInput.value = appSettings.remote_pin || "";
+
+  // Show app version
+  try {
+    const version = await getVersion();
+    document.getElementById("settings-app-version")!.textContent = version;
+  } catch {
+    document.getElementById("settings-app-version")!.textContent = "unknown";
+  }
+
+  // Clear update status
+  document.getElementById("settings-update-status")!.textContent = "";
+
   settingsModal.classList.add("visible");
 }
 
@@ -3742,6 +3795,65 @@ async function saveSettings(): Promise<void> {
   await applyTheme();
 
   hideSettingsModal();
+}
+
+// Update checking
+async function checkForUpdates(): Promise<void> {
+  const statusEl = document.getElementById("settings-update-status")!;
+  const button = document.getElementById("settings-check-update") as HTMLButtonElement;
+
+  try {
+    button.disabled = true;
+    statusEl.textContent = "Checking for updates...";
+
+    const update = await check();
+
+    if (update) {
+      statusEl.innerHTML = `Update available: <strong>v${update.version}</strong>`;
+
+      // Replace button with install button
+      button.textContent = "Download & Install";
+      button.disabled = false;
+      button.onclick = async () => {
+        try {
+          button.disabled = true;
+          statusEl.textContent = "Downloading update...";
+
+          // Download the update
+          let downloaded = 0;
+          let contentLength = 0;
+          await update.downloadAndInstall((progress) => {
+            if (progress.event === "Started") {
+              contentLength = (progress.data as { contentLength?: number }).contentLength || 0;
+              statusEl.textContent = `Downloading...`;
+            } else if (progress.event === "Progress") {
+              downloaded += progress.data.chunkLength;
+              if (contentLength > 0) {
+                const percent = Math.round((downloaded / contentLength) * 100);
+                statusEl.textContent = `Downloading... ${percent}%`;
+              }
+            } else if (progress.event === "Finished") {
+              statusEl.textContent = "Download complete. Restarting...";
+            }
+          });
+
+          // Relaunch the app
+          await relaunch();
+        } catch (err) {
+          console.error("Update install failed:", err);
+          statusEl.textContent = `Install failed: ${err}`;
+          button.disabled = false;
+        }
+      };
+    } else {
+      statusEl.textContent = "You're running the latest version.";
+      button.disabled = false;
+    }
+  } catch (err) {
+    console.error("Update check failed:", err);
+    statusEl.textContent = `Check failed: ${err}`;
+    button.disabled = false;
+  }
 }
 
 // About modal functions
@@ -3864,6 +3976,43 @@ async function resumeClaudeSession(claudeSessionId: string, project: string): Pr
 
   renderSessionList();
   await switchToSession(newSession.id);
+
+  // Load and display chat history from the Claude session file
+  try {
+    const history = await invoke<Array<Record<string, unknown>>>("load_claude_session_history", {
+      sessionId: claudeSessionId,
+      project: project,
+    });
+
+    if (history && history.length > 0) {
+      for (const msg of history) {
+        const msgType = msg.type as string;
+        if (msgType === "user") {
+          // User messages have message.content as a string
+          const content = (msg.message as Record<string, unknown>)?.content as string;
+          if (content) {
+            const claudeMsg: ClaudeJsonMessage = {
+              type: "user",
+              result: content,
+            };
+            addChatMessage(newSession.id, claudeMsg);
+          }
+        } else if (msgType === "assistant") {
+          // Assistant messages have full message structure
+          const message = msg.message as ClaudeJsonMessage["message"];
+          if (message) {
+            const claudeMsg: ClaudeJsonMessage = {
+              type: "assistant",
+              message: message,
+            };
+            addChatMessage(newSession.id, claudeMsg);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("Could not load session history:", e);
+  }
 }
 
 // Pairing modal functions
