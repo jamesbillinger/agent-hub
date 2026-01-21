@@ -3150,6 +3150,14 @@ function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: s
       if (flags.length > 0) {
         html += `<span class="tool-detail">(${flags.join(", ")})</span>`;
       }
+
+      // Detect agent-browser screenshot commands and display the image
+      const screenshotMatch = command.match(/agent-browser\s+screenshot\s+([^\s]+)/);
+      if (screenshotMatch) {
+        const imagePath = screenshotMatch[1];
+        html += createImagePlaceholder(imagePath);
+      }
+
       return html;
     }
 
