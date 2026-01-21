@@ -45,7 +45,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQyQTlFQkY0MEY1MjNGNkEKUldScVAxSVA5T3VwMHZTSUtpTllOdy9DYTBSV3RMTWZQMXp1aVRGcHRUN0dTRTdPYWRkMGpobG0K",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZBREY2RkNCQjhFMkM2QUQKUldTdHh1SzR5Mi9mK3JlajhGUDJoU29MMHVuVm1ySWNvQjZYclZCYjdrOERjUWVBU2F6Q2dqNDAK",
       "endpoints": [
         "https://github.com/jamesbillinger/agent-hub/releases/latest/download/latest.json"
       ]
