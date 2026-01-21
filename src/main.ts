@@ -3552,37 +3552,65 @@ function escapeHtml(text: string): string {
 
 /**
  * Process image references in text content.
- * Converts [Image: source: /path/to/image.png] to placeholder images
- * that will be loaded asynchronously.
+ * Converts image references to placeholder images that will be loaded asynchronously.
+ * Supports:
+ * - [Image: source: /path/to/image.png] - explicit pattern from Claude
+ * - Standalone paths ending in image extensions mentioned in context
  */
 function processImageReferences(html: string): string {
-  // Match patterns like [Image: source: /path/to/file.png] or [Image: /path/to/file.png]
-  const imagePattern = /\[Image(?::\s*source)?:\s*([^\]]+)\]/g;
+  // Track paths we've already processed to avoid duplicates
+  const processedPaths = new Set<string>();
 
-  return html.replace(imagePattern, (match, imagePath) => {
+  // First, match explicit patterns like [Image: source: /path/to/file.png]
+  let result = html.replace(/\[Image(?::\s*source)?:\s*([^\]]+)\]/g, (match, imagePath) => {
     const path = imagePath.trim();
-    const imageId = `img-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-
-    // Create a placeholder that will be replaced with the actual image
-    setTimeout(async () => {
-      const imgEl = document.getElementById(imageId);
-      if (!imgEl) return;
-
-      try {
-        const dataUrl = await invoke<string>("read_image_file", { path });
-        imgEl.innerHTML = `<img src="${dataUrl}" alt="${escapeHtml(path)}" loading="lazy" />`;
-        imgEl.classList.remove("loading");
-        imgEl.classList.add("loaded");
-      } catch (err) {
-        console.error(`Failed to load image: ${path}`, err);
-        imgEl.innerHTML = `<span class="image-error">Failed to load: ${escapeHtml(path)}</span>`;
-        imgEl.classList.remove("loading");
-        imgEl.classList.add("error");
-      }
-    }, 0);
-
-    return `<div id="${imageId}" class="chat-image loading"><span class="image-loading">Loading image...</span></div>`;
+    if (processedPaths.has(path)) return match;
+    processedPaths.add(path);
+    return createImagePlaceholder(path);
   });
+
+  // Then, look for image paths in context (e.g., "saved at /tmp/screenshot.png")
+  // Match paths that:
+  // 1. Start with / or ~/
+  // 2. End with common image extensions
+  // 3. Are preceded by context words like "at", "to", "saved", etc.
+  const pathPattern = /(?:saved|at|to|screenshot|image|file)\s+([\/~][^\s<>"']+\.(?:png|jpg|jpeg|gif|webp|svg))/gi;
+  result = result.replace(pathPattern, (match, imagePath) => {
+    const path = imagePath.trim();
+    if (processedPaths.has(path)) return match;
+    processedPaths.add(path);
+    // Keep the context text and add the image after
+    return match + createImagePlaceholder(path);
+  });
+
+  return result;
+}
+
+/**
+ * Create an image placeholder that will be loaded asynchronously.
+ */
+function createImagePlaceholder(path: string): string {
+  const imageId = `img-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+
+  // Load image asynchronously
+  setTimeout(async () => {
+    const imgEl = document.getElementById(imageId);
+    if (!imgEl) return;
+
+    try {
+      const dataUrl = await invoke<string>("read_image_file", { path });
+      imgEl.innerHTML = `<img src="${dataUrl}" alt="${escapeHtml(path)}" loading="lazy" />`;
+      imgEl.classList.remove("loading");
+      imgEl.classList.add("loaded");
+    } catch (err) {
+      console.error(`Failed to load image: ${path}`, err);
+      imgEl.innerHTML = `<span class="image-error">Failed to load: ${escapeHtml(path)}</span>`;
+      imgEl.classList.remove("loading");
+      imgEl.classList.add("error");
+    }
+  }, 0);
+
+  return `<div id="${imageId}" class="chat-image loading"><span class="image-loading">Loading image...</span></div>`;
 }
 
 function formatTokens(tokens: number): string {
