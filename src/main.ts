@@ -3332,7 +3332,8 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
       messageEl.classList.add("tool-result", "error");
       messageEl.innerHTML = `<pre><code>${escapeHtml(message.result)}</code></pre>`;
     } else {
-      // Skip rendering non-error results (they just duplicate assistant content)
+      // Skip rendering non-error results (they just duplicate assistant content) but still save
+      saveChatMessages(sessionId);
       return;
     }
   } else if (message.type === "system" && message.subtype === "init") {
@@ -3599,12 +3600,51 @@ function renderTodosPanel(chatSession: ChatSession): void {
 
 // Chat message persistence functions
 
+// Debounce timers for saving chat messages (prevents race conditions)
+const savePendingTimers = new Map<string, number>();
+const saveInProgress = new Map<string, boolean>();
+
 /**
- * Save chat messages to the database (uses terminal_buffer table for storage)
+ * Save chat messages to the database (debounced to prevent race conditions)
+ * Uses terminal_buffer table for storage.
+ *
+ * When many messages are added quickly (e.g., loading history), multiple saves
+ * could complete out of order, causing an earlier save to overwrite a later one.
+ * This debounced approach ensures we always save the final state.
  */
-async function saveChatMessages(sessionId: string): Promise<void> {
+function saveChatMessages(sessionId: string): void {
+  // Clear any pending save for this session
+  const existingTimer = savePendingTimers.get(sessionId);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+  }
+
+  // Schedule a new save after a short delay
+  const timer = window.setTimeout(() => {
+    savePendingTimers.delete(sessionId);
+    doSaveChatMessages(sessionId);
+  }, 100); // 100ms debounce
+
+  savePendingTimers.set(sessionId, timer);
+}
+
+/**
+ * Actually perform the save (called after debounce delay)
+ */
+async function doSaveChatMessages(sessionId: string): Promise<void> {
+  // Prevent concurrent saves for the same session
+  if (saveInProgress.get(sessionId)) {
+    // A save is already in progress - schedule another save when it's done
+    saveChatMessages(sessionId);
+    return;
+  }
+
   const chatSession = chatSessions.get(sessionId);
-  if (!chatSession || chatSession.messages.length === 0) return;
+  if (!chatSession || chatSession.messages.length === 0) {
+    return;
+  }
+
+  saveInProgress.set(sessionId, true);
 
   try {
     const bufferContent = JSON.stringify(chatSession.messages);
@@ -3614,7 +3654,29 @@ async function saveChatMessages(sessionId: string): Promise<void> {
     });
   } catch (err) {
     console.error("Failed to save chat messages:", err);
+  } finally {
+    saveInProgress.set(sessionId, false);
   }
+}
+
+/**
+ * Force an immediate save (bypasses debounce, used for explicit saves)
+ */
+async function saveChatMessagesImmediate(sessionId: string): Promise<void> {
+  // Clear any pending debounced save
+  const existingTimer = savePendingTimers.get(sessionId);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+    savePendingTimers.delete(sessionId);
+  }
+
+  // Wait for any in-progress save to complete
+  while (saveInProgress.get(sessionId)) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+
+  // Now do the save
+  await doSaveChatMessages(sessionId);
 }
 
 /**
@@ -3811,10 +3873,10 @@ async function saveAllTerminalBuffers(): Promise<void> {
     }
   }
 
-  // Save chat session messages
+  // Save chat session messages (use immediate save to bypass debounce on app close)
   for (const [sessionId, chatSession] of chatSessions.entries()) {
     if (chatSession.messages.length > 0) {
-      savePromises.push(saveChatMessages(sessionId));
+      savePromises.push(saveChatMessagesImmediate(sessionId));
     }
   }
 
@@ -4203,6 +4265,12 @@ async function resumeClaudeSession(claudeSessionId: string, project: string): Pr
             addChatMessage(newSession.id, claudeMsg);
           }
         }
+      }
+
+      // Ensure messages are saved after loading history (use immediate save to guarantee persistence)
+      const chatSession = chatSessions.get(newSession.id);
+      if (chatSession && chatSession.messages.length > 0) {
+        await saveChatMessagesImmediate(newSession.id);
       }
     }
   } catch (e) {
