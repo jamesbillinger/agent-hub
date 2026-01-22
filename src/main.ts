@@ -687,6 +687,23 @@ document.addEventListener("DOMContentLoaded", async () => {
         const vscodeUrl = `vscode://file${vscodePath}`;
         window.open(vscodeUrl);
       }
+      return;
+    }
+
+    // Handle AskUserQuestion option clicks
+    const askOption = (e.target as HTMLElement).closest(".ask-option") as HTMLButtonElement;
+    if (askOption) {
+      e.preventDefault();
+      handleAskOptionClick(askOption);
+      return;
+    }
+
+    // Handle AskUserQuestion submit button
+    const askSubmit = (e.target as HTMLElement).closest(".ask-submit") as HTMLButtonElement;
+    if (askSubmit && !askSubmit.disabled) {
+      e.preventDefault();
+      handleAskSubmit(askSubmit);
+      return;
     }
   });
 
@@ -2966,6 +2983,169 @@ async function sendChatMessage(sessionId: string) {
 }
 
 /**
+ * Handle click on an AskUserQuestion option button
+ */
+function handleAskOptionClick(optionBtn: HTMLButtonElement) {
+  const questionEl = optionBtn.closest(".ask-question") as HTMLElement;
+  const questionContainer = optionBtn.closest(".ask-user-question") as HTMLElement;
+  if (!questionEl || !questionContainer) return;
+
+  const isMultiSelect = questionEl.dataset.multiSelect === "true";
+  const isOther = optionBtn.classList.contains("ask-option-other");
+  const otherInputEl = questionEl.querySelector(".ask-other-input") as HTMLElement;
+  const otherTextEl = questionEl.querySelector(".ask-other-text") as HTMLInputElement;
+
+  if (isMultiSelect) {
+    // Toggle selection for multi-select
+    optionBtn.classList.toggle("selected");
+
+    // Show/hide "Other" input based on selection
+    if (isOther) {
+      if (optionBtn.classList.contains("selected")) {
+        otherInputEl.style.display = "block";
+        otherTextEl.focus();
+      } else {
+        otherInputEl.style.display = "none";
+      }
+    }
+  } else {
+    // Single select - deselect others in this question
+    questionEl.querySelectorAll(".ask-option").forEach(opt => opt.classList.remove("selected"));
+    optionBtn.classList.add("selected");
+
+    // Show/hide "Other" input
+    if (isOther) {
+      otherInputEl.style.display = "block";
+      otherTextEl.focus();
+    } else {
+      otherInputEl.style.display = "none";
+    }
+  }
+
+  // Enable/disable submit button based on whether all questions have selections
+  updateAskSubmitState(questionContainer);
+}
+
+/**
+ * Update the submit button enabled state based on selections
+ */
+function updateAskSubmitState(container: HTMLElement) {
+  const submitBtn = container.querySelector(".ask-submit") as HTMLButtonElement;
+  if (!submitBtn) return;
+
+  const questions = container.querySelectorAll(".ask-question");
+  let allAnswered = true;
+
+  questions.forEach(q => {
+    const hasSelection = q.querySelector(".ask-option.selected") !== null;
+    if (!hasSelection) allAnswered = false;
+
+    // If "Other" is selected, check that text is provided
+    const otherSelected = q.querySelector(".ask-option-other.selected");
+    if (otherSelected) {
+      const otherText = (q.querySelector(".ask-other-text") as HTMLInputElement)?.value.trim();
+      if (!otherText) allAnswered = false;
+    }
+  });
+
+  submitBtn.disabled = !allAnswered;
+}
+
+/**
+ * Handle submit of AskUserQuestion answers
+ */
+async function handleAskSubmit(submitBtn: HTMLButtonElement) {
+  const container = submitBtn.closest(".ask-user-question") as HTMLElement;
+  if (!container || !activeSessionId) return;
+
+  const chatSession = chatSessions.get(activeSessionId);
+  if (!chatSession) return;
+
+  // Collect answers from each question
+  const answers: Record<string, string> = {};
+  const questions = container.querySelectorAll(".ask-question");
+
+  questions.forEach((q, idx) => {
+    const selectedOptions = q.querySelectorAll(".ask-option.selected");
+    const isMulti = (q as HTMLElement).dataset.multiSelect === "true";
+
+    if (isMulti) {
+      // Multi-select: join labels with comma
+      const labels: string[] = [];
+      selectedOptions.forEach(opt => {
+        if (opt.classList.contains("ask-option-other")) {
+          const otherText = (q.querySelector(".ask-other-text") as HTMLInputElement)?.value.trim();
+          if (otherText) labels.push(otherText);
+        } else {
+          labels.push((opt as HTMLElement).dataset.label || "");
+        }
+      });
+      answers[`q${idx}`] = labels.join(", ");
+    } else {
+      // Single select
+      const selected = selectedOptions[0] as HTMLElement;
+      if (selected) {
+        if (selected.classList.contains("ask-option-other")) {
+          answers[`q${idx}`] = (q.querySelector(".ask-other-text") as HTMLInputElement)?.value.trim() || "";
+        } else {
+          answers[`q${idx}`] = selected.dataset.label || "";
+        }
+      }
+    }
+  });
+
+  // Disable container to prevent double-submit
+  container.classList.add("answered");
+  submitBtn.disabled = true;
+  submitBtn.textContent = "Submitted";
+
+  // Show user's selections as feedback
+  questions.forEach(q => {
+    q.querySelectorAll(".ask-option:not(.selected)").forEach(opt => {
+      (opt as HTMLElement).style.display = "none";
+    });
+    const otherInput = q.querySelector(".ask-other-input") as HTMLElement;
+    if (otherInput && !q.querySelector(".ask-option-other.selected")) {
+      otherInput.style.display = "none";
+    }
+  });
+
+  // Build the response message - Claude expects this format
+  const answerText = Object.values(answers).join("\n");
+
+  // Add user's answer to the chat display
+  addChatMessage(activeSessionId, { type: "user", result: answerText });
+
+  // Send as user message
+  const jsonMessage = JSON.stringify({
+    type: "user",
+    message: {
+      role: "user",
+      content: answerText,
+    }
+  }) + "\n";
+
+  // Show thinking indicator
+  chatSession.isProcessing = true;
+  chatSession.statusEl.textContent = "Processing...";
+  chatSession.statusEl.className = "chat-status";
+  updateSessionActivityIndicator(activeSessionId, true);
+  const thinkingEl = chatSession.containerEl.querySelector(".chat-thinking") as HTMLElement;
+  if (thinkingEl) thinkingEl.style.display = "flex";
+
+  try {
+    await invoke("write_to_process", { sessionId: activeSessionId, data: jsonMessage });
+  } catch (err) {
+    console.error("Failed to send answer:", err);
+    chatSession.statusEl.textContent = `Failed to send answer`;
+    chatSession.statusEl.className = "chat-status error";
+    chatSession.isProcessing = false;
+    updateSessionActivityIndicator(activeSessionId, false);
+    if (thinkingEl) thinkingEl.style.display = "none";
+  }
+}
+
+/**
  * Paste image from clipboard (Ctrl+V)
  */
 async function pasteImageFromClipboard(sessionId: string) {
@@ -3221,6 +3401,96 @@ function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: s
     case "WebSearch": {
       const query = input.query as string || "";
       return `<span class="tool-name">WebSearch</span><span class="tool-query">"${escapeForHtml(query)}"</span>`;
+    }
+
+    case "ExitPlanMode": {
+      // ExitPlanMode doesn't have the plan in the tool call itself - it's read from a file
+      // But we can show allowed prompts and indicate the plan is ready for review
+      const allowedPrompts = input.allowedPrompts as Array<{ tool: string; prompt: string }> || [];
+
+      let html = `<div class="exit-plan-mode">`;
+      html += `<div class="plan-header">`;
+      html += `<span class="plan-icon">📋</span>`;
+      html += `<span class="plan-title">Plan Ready for Review</span>`;
+      html += `</div>`;
+
+      if (allowedPrompts.length > 0) {
+        html += `<div class="plan-permissions">`;
+        html += `<div class="plan-permissions-label">Requested permissions:</div>`;
+        html += `<ul class="plan-permissions-list">`;
+        for (const perm of allowedPrompts) {
+          html += `<li><span class="perm-tool">${escapeForHtml(perm.tool)}</span>: ${escapeForHtml(perm.prompt)}</li>`;
+        }
+        html += `</ul>`;
+        html += `</div>`;
+      }
+
+      html += `<div class="plan-note">The plan file should be displayed in your working directory. Review and approve in the terminal.</div>`;
+      html += `</div>`;
+
+      return html;
+    }
+
+    case "AskUserQuestion": {
+      const questions = input.questions as Array<{
+        question: string;
+        header: string;
+        options: Array<{ label: string; description: string }>;
+        multiSelect?: boolean;
+      }> || [];
+
+      if (questions.length === 0) {
+        return `<span class="tool-name">AskUserQuestion</span><span class="tool-detail">(no questions)</span>`;
+      }
+
+      // Generate unique ID for this question set
+      const questionId = `ask-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+      let html = `<div class="ask-user-question" data-question-id="${questionId}">`;
+
+      for (let qIdx = 0; qIdx < questions.length; qIdx++) {
+        const q = questions[qIdx];
+        const isMulti = q.multiSelect === true;
+
+        html += `<div class="ask-question" data-question-idx="${qIdx}" data-multi-select="${isMulti}">`;
+        html += `<div class="ask-header">${escapeForHtml(q.header)}</div>`;
+        html += `<div class="ask-text">${escapeForHtml(q.question)}</div>`;
+        html += `<div class="ask-options">`;
+
+        for (let oIdx = 0; oIdx < q.options.length; oIdx++) {
+          const opt = q.options[oIdx];
+          html += `<button class="ask-option" data-option-idx="${oIdx}" data-label="${escapeForHtml(opt.label)}">`;
+          html += `<span class="ask-option-label">${escapeForHtml(opt.label)}</span>`;
+          if (opt.description) {
+            html += `<span class="ask-option-desc">${escapeForHtml(opt.description)}</span>`;
+          }
+          html += `</button>`;
+        }
+
+        // Always add "Other" option for custom text input
+        html += `<button class="ask-option ask-option-other" data-option-idx="other" data-label="Other">`;
+        html += `<span class="ask-option-label">Other</span>`;
+        html += `<span class="ask-option-desc">Provide custom response</span>`;
+        html += `</button>`;
+
+        html += `</div>`; // .ask-options
+
+        // Hidden text input for "Other" option
+        html += `<div class="ask-other-input" style="display: none;">`;
+        html += `<input type="text" class="ask-other-text" placeholder="Enter your response..." />`;
+        html += `</div>`;
+
+        html += `</div>`; // .ask-question
+      }
+
+      // Submit button (hidden until selections are made)
+      html += `<div class="ask-submit-row">`;
+      html += `<button class="ask-submit" disabled>Submit Answer</button>`;
+      html += `</div>`;
+
+      html += `</div>`; // .ask-user-question
+
+      return html;
     }
 
     default: {
