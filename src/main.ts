@@ -5,6 +5,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SerializeAddon } from "@xterm/addon-serialize";
@@ -692,7 +693,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (vscodePath) {
         // VS Code URL scheme: vscode://file/path/to/file:line:column
         const vscodeUrl = `vscode://file${vscodePath}`;
-        window.open(vscodeUrl);
+        openUrl(vscodeUrl).catch(err => console.error("Failed to open VS Code:", err));
       }
       return;
     }
