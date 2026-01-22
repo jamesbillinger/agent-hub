@@ -1677,6 +1677,37 @@ body.resizing-sidebar {
   cursor: not-allowed;
 }
 
+/* Plan mode indicators */
+.plan-mode-indicator {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px;
+  border-radius: 8px;
+  border-left-width: 3px;
+  border-left-style: solid;
+}
+
+.plan-mode-indicator.enter {
+  background: rgba(136, 192, 208, 0.1);
+  border-color: var(--accent-cyan, #88c0d0);
+}
+
+.plan-mode-indicator .plan-mode-icon {
+  font-size: 16px;
+}
+
+.plan-mode-indicator .plan-mode-text {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--accent-cyan, #88c0d0);
+}
+
+.plan-mode-indicator .plan-mode-desc {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
 /* ExitPlanMode - plan ready for review */
 .exit-plan-mode {
   display: flex;

@@ -3403,6 +3403,14 @@ function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: s
       return `<span class="tool-name">WebSearch</span><span class="tool-query">"${escapeForHtml(query)}"</span>`;
     }
 
+    case "EnterPlanMode": {
+      return `<div class="plan-mode-indicator enter">
+        <span class="plan-mode-icon">📝</span>
+        <span class="plan-mode-text">Plan Mode Enabled</span>
+        <span class="plan-mode-desc">Claude is exploring the codebase and designing an implementation approach</span>
+      </div>`;
+    }
+
     case "ExitPlanMode": {
       // ExitPlanMode doesn't have the plan in the tool call itself - it's read from a file
       // But we can show allowed prompts and indicate the plan is ready for review
