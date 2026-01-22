@@ -1559,6 +1559,52 @@ fn read_image_file(path: String) -> Result<String, String> {
     Ok(format!("data:{};base64,{}", media_type, base64_data))
 }
 
+/// Read a text file and return its contents
+#[tauri::command]
+fn read_text_file(path: String) -> Result<String, String> {
+    let expanded_path = shellexpand::tilde(&path);
+    let file_path = std::path::Path::new(expanded_path.as_ref());
+
+    if !file_path.exists() {
+        return Err(format!("File not found: {}", path));
+    }
+
+    std::fs::read_to_string(file_path)
+        .map_err(|e| format!("Failed to read file: {}", e))
+}
+
+/// Find the most recently modified plan file in ~/.claude/plans/
+#[tauri::command]
+fn find_latest_plan_file() -> Result<String, String> {
+    let home = dirs::home_dir().ok_or("Could not find home directory")?;
+    let plans_dir = home.join(".claude").join("plans");
+
+    if !plans_dir.exists() {
+        return Err("Plans directory does not exist".to_string());
+    }
+
+    let mut latest: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
+
+    if let Ok(entries) = std::fs::read_dir(&plans_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "md") {
+                if let Ok(metadata) = path.metadata() {
+                    if let Ok(modified) = metadata.modified() {
+                        if latest.as_ref().map_or(true, |(_, t)| modified > *t) {
+                            latest = Some((path, modified));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    latest
+        .map(|(path, _)| path.to_string_lossy().to_string())
+        .ok_or("No plan files found".to_string())
+}
+
 /// MCP callback - receives results from JS execution
 #[cfg(not(target_os = "ios"))]
 #[tauri::command]
@@ -4692,6 +4738,8 @@ pub fn run() {
             save_app_settings,
             load_app_settings,
             read_image_file,
+            read_text_file,
+            find_latest_plan_file,
             get_web_server_port,
             mcp_callback
         ])
@@ -4732,6 +4780,8 @@ pub fn run() {
             save_app_settings,
             load_app_settings,
             read_image_file,
+            read_text_file,
+            find_latest_plan_file,
             get_web_server_port
         ])
         .run(tauri::generate_context!())

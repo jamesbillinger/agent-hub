@@ -3412,11 +3412,42 @@ function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: s
     }
 
     case "ExitPlanMode": {
-      // ExitPlanMode doesn't have the plan in the tool call itself - it's read from a file
-      // But we can show allowed prompts and indicate the plan is ready for review
+      // ExitPlanMode doesn't have the plan in the tool call itself - it's written to a file
+      // We'll create a placeholder and async load the plan content
       const allowedPrompts = input.allowedPrompts as Array<{ tool: string; prompt: string }> || [];
+      const planId = `plan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-      let html = `<div class="exit-plan-mode">`;
+      // Async load the plan file content
+      setTimeout(async () => {
+        const planEl = document.getElementById(planId);
+        if (!planEl) return;
+
+        try {
+          // Find the most recent plan file
+          const planPath = await invoke<string>("find_latest_plan_file");
+          if (planPath) {
+            const planContent = await invoke<string>("read_text_file", { path: planPath });
+            if (planContent) {
+              const renderedPlan = marked.parse(planContent) as string;
+              const contentEl = planEl.querySelector(".plan-content");
+              if (contentEl) {
+                contentEl.innerHTML = renderedPlan;
+                contentEl.classList.remove("loading");
+                contentEl.classList.add("loaded");
+              }
+            }
+          }
+        } catch (err) {
+          console.error("Failed to load plan file:", err);
+          const contentEl = planEl.querySelector(".plan-content");
+          if (contentEl) {
+            contentEl.innerHTML = `<em>Could not load plan file. Check ~/.claude/plans/ directory.</em>`;
+            contentEl.classList.remove("loading");
+          }
+        }
+      }, 0);
+
+      let html = `<div id="${planId}" class="exit-plan-mode">`;
       html += `<div class="plan-header">`;
       html += `<span class="plan-icon">📋</span>`;
       html += `<span class="plan-title">Plan Ready for Review</span>`;
@@ -3433,7 +3464,7 @@ function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: s
         html += `</div>`;
       }
 
-      html += `<div class="plan-note">The plan file should be displayed in your working directory. Review and approve in the terminal.</div>`;
+      html += `<div class="plan-content loading"><em>Loading plan...</em></div>`;
       html += `</div>`;
 
       return html;
