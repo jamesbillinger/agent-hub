@@ -661,6 +661,13 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (e.target === diffModal) hideDiffModal();
   });
 
+  // Plan modal event listeners
+  const planModal = document.getElementById("plan-modal")!;
+  document.getElementById("plan-modal-close")!.addEventListener("click", hidePlanModal);
+  planModal.addEventListener("click", (e) => {
+    if (e.target === planModal) hidePlanModal();
+  });
+
   // Event delegation for diff expand buttons and clickable paths (dynamically added)
   // Use chat-container since chat-messages elements are created dynamically per session
   document.getElementById("chat-container")!.addEventListener("click", (e) => {
@@ -703,6 +710,18 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (askSubmit && !askSubmit.disabled) {
       e.preventDefault();
       handleAskSubmit(askSubmit);
+      return;
+    }
+
+    // Handle plan expand button
+    const planExpandBtn = (e.target as HTMLElement).closest(".plan-expand-btn") as HTMLButtonElement;
+    if (planExpandBtn) {
+      e.preventDefault();
+      const planContainer = planExpandBtn.closest(".exit-plan-mode");
+      const planContent = planContainer?.querySelector(".plan-content.loaded");
+      if (planContent) {
+        showPlanModal(planContent.innerHTML);
+      }
       return;
     }
   });
@@ -3451,6 +3470,7 @@ function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: s
       html += `<div class="plan-header">`;
       html += `<span class="plan-icon">📋</span>`;
       html += `<span class="plan-title">Plan Ready for Review</span>`;
+      html += `<button class="plan-expand-btn" title="View full plan">⤢</button>`;
       html += `</div>`;
 
       if (allowedPrompts.length > 0) {
@@ -4534,6 +4554,20 @@ function computeLineDiff(oldLines: string[], newLines: string[]): DiffChange[] {
 
 function hideDiffModal(): void {
   const modal = document.getElementById("diff-modal")!;
+  modal.classList.remove("visible");
+}
+
+// Plan modal functions
+
+function showPlanModal(planHtml: string): void {
+  const modal = document.getElementById("plan-modal")!;
+  const bodyEl = document.getElementById("plan-modal-body")!;
+  bodyEl.innerHTML = planHtml;
+  modal.classList.add("visible");
+}
+
+function hidePlanModal(): void {
+  const modal = document.getElementById("plan-modal")!;
   modal.classList.remove("visible");
 }
 
