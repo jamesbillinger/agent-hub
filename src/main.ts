@@ -698,6 +698,17 @@ document.addEventListener("DOMContentLoaded", async () => {
       return;
     }
 
+    // Handle external links - open in default browser instead of navigating webview
+    const externalLink = (e.target as HTMLElement).closest("a[href^='http']") as HTMLAnchorElement;
+    if (externalLink && !externalLink.dataset.vscodePath) {
+      e.preventDefault();
+      const url = externalLink.href;
+      if (url) {
+        openUrl(url).catch(err => console.error("Failed to open external link:", err));
+      }
+      return;
+    }
+
     // Handle AskUserQuestion option clicks
     const askOption = (e.target as HTMLElement).closest(".ask-option") as HTMLButtonElement;
     if (askOption) {
