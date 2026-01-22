@@ -3350,6 +3350,7 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
     // Status WebSocket for real-time session events
     let statusWs = null;
     let statusWsReconnectTimer = null;
+    let statusWsHasConnectedBefore = false;
 
     function connectStatusWebSocket() {
       if (statusWs && statusWs.readyState === WebSocket.OPEN) return;
@@ -3363,6 +3364,12 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           clearTimeout(statusWsReconnectTimer);
           statusWsReconnectTimer = null;
         }
+        // On reconnect, refetch sessions to sync running status
+        if (statusWsHasConnectedBefore) {
+          console.log('Reconnected - refreshing sessions list');
+          loadSessions();
+        }
+        statusWsHasConnectedBefore = true;
       };
 
       statusWs.onclose = () => {
@@ -3743,14 +3750,19 @@ async fn api_list_sessions(headers: axum::http::HeaderMap) -> impl IntoResponse 
     }
     match load_sessions() {
         Ok(sessions) => {
-            let running_ids: std::collections::HashSet<String> = {
+            // Check both PTY (shell) and JSON (chat) broadcasters for running status
+            let pty_running_ids: std::collections::HashSet<String> = {
                 let broadcasters = PTY_BROADCASTERS.lock();
+                broadcasters.keys().cloned().collect()
+            };
+            let json_running_ids: std::collections::HashSet<String> = {
+                let broadcasters = JSON_BROADCASTERS.lock();
                 broadcasters.keys().cloned().collect()
             };
 
             // Add running status to each session
             let sessions_with_status: Vec<serde_json::Value> = sessions.into_iter().map(|s| {
-                let is_running = running_ids.contains(&s.id);
+                let is_running = pty_running_ids.contains(&s.id) || json_running_ids.contains(&s.id);
                 serde_json::json!({
                     "id": s.id,
                     "name": s.name,
