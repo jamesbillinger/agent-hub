@@ -4224,7 +4224,32 @@ async function loadChatMessages(sessionId: string, chatSession: ChatSession): Pr
   try {
     const bufferContent = await invoke<string | null>("load_terminal_buffer", { sessionId });
     if (bufferContent) {
-      const messages = JSON.parse(bufferContent) as ClaudeJsonMessage[];
+      let messages: ClaudeJsonMessage[];
+
+      // Try to parse as JSON array first
+      try {
+        messages = JSON.parse(bufferContent) as ClaudeJsonMessage[];
+      } catch (parseErr) {
+        // If that fails, the buffer might be corrupted or contain incomplete JSON
+        // Try to recover by parsing line by line (newline-delimited JSON)
+        console.warn("Failed to parse buffer as JSON array, attempting line-by-line recovery:", parseErr);
+        messages = [];
+        const lines = bufferContent.split("\n").filter(line => line.trim());
+        for (const line of lines) {
+          try {
+            const msg = JSON.parse(line) as ClaudeJsonMessage;
+            messages.push(msg);
+          } catch {
+            // Skip malformed lines
+            console.warn("Skipping malformed line in buffer");
+          }
+        }
+        if (messages.length === 0) {
+          console.error("Could not recover any messages from buffer");
+          return;
+        }
+        console.log(`Recovered ${messages.length} messages from buffer`);
+      }
 
       // Find the most recent init message and filter out duplicates
       let latestInit: ClaudeJsonMessage | null = null;
