@@ -1,6 +1,6 @@
 [package]
 name = "agent-hub"
-version = "0.1.42"
+version = "0.1.43"
 description = "Agent Hub - Terminal session manager for AI agents"
 authors = ["James Billinger"]
 edition = "2021"
@@ -38,6 +38,9 @@ shellexpand = "3.1.1"
 
 # MCP server support for Claude Code integration
 uuid = { version = "1", features = ["v4"] }
+
+# Local IP address discovery for remote access URL
+local-ip-address = "0.6"
 
 # PTY support is desktop-only (iOS doesn't allow child process spawning)
 [target.'cfg(not(target_os = "ios"))'.dependencies]

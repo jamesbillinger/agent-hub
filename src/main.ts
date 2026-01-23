@@ -364,6 +364,7 @@ function recordSessionInput(sessionId: string): void {
 
 /**
  * Update the activity indicator in the session list.
+ * For JSON sessions, also updates the status dot to show processing state.
  */
 function updateSessionActivityIndicator(sessionId: string, isActive: boolean): void {
   const sessionItem = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
@@ -372,6 +373,21 @@ function updateSessionActivityIndicator(sessionId: string, isActive: boolean): v
       sessionItem.classList.add("session-active");
     } else {
       sessionItem.classList.remove("session-active");
+    }
+
+    // For JSON sessions, update the status dot to show processing state
+    const session = sessions.get(sessionId);
+    const chatSession = chatSessions.get(sessionId);
+    if (session && isJsonAgent(session.agentType)) {
+      const statusEl = sessionItem.querySelector(".status");
+      if (statusEl) {
+        statusEl.classList.remove("running", "processing");
+        if (chatSession?.isProcessing) {
+          statusEl.classList.add("processing");
+        } else if (session.isRunning) {
+          statusEl.classList.add("running");
+        }
+      }
     }
   }
 }
@@ -2372,9 +2388,14 @@ function renderSessionList() {
     const shortcutKey = i < 9 ? String(i + 1) : i === 9 ? "0" : null;
     const shortcutHtml = shortcutKey ? `<span class="shortcut-hint">⌘${shortcutKey}</span>` : "";
 
+    // Determine status class - for JSON sessions, show processing state with blue pulsing dot
+    const chatSession = chatSessions.get(session.id);
+    const isProcessing = chatSession?.isProcessing || false;
+    const statusClass = isProcessing ? "processing" : (session.isRunning ? "running" : "");
+
     item.innerHTML = `
       <div class="drag-handle" title="Drag to reorder">⋮⋮</div>
-      <div class="status ${session.isRunning ? "running" : ""}"></div>
+      <div class="status ${statusClass}"></div>
       <div class="details">
         <div class="name">${escapeHtml(session.name)}</div>
         <div class="meta">
@@ -2422,6 +2443,14 @@ function renderSessionList() {
     }
 
     sessionListEl.appendChild(item);
+  }
+
+  // After rebuilding the DOM, update all processing indicators
+  // This ensures the correct state is shown even after full re-render
+  for (const [sessionId, chatSession] of chatSessions) {
+    if (chatSession.isProcessing) {
+      updateSessionActivityIndicator(sessionId, true);
+    }
   }
 }
 
@@ -2549,6 +2578,36 @@ function isJsonAgent(agentType: string): boolean {
   return agentType === "claude-json";
 }
 
+/**
+ * Create an image preview element for the attachments area
+ */
+function createImagePreview(
+  mediaType: string,
+  base64Data: string,
+  chatSession: ChatSession
+): HTMLElement {
+  const dataUrl = `data:${mediaType};base64,${base64Data}`;
+  const previewEl = document.createElement("div");
+  previewEl.className = "attachment-preview";
+  previewEl.innerHTML = `
+    <img src="${dataUrl}" alt="Attached image" />
+    <button class="attachment-remove" title="Remove">×</button>
+  `;
+
+  // Remove button handler
+  const removeBtn = previewEl.querySelector(".attachment-remove")!;
+  removeBtn.addEventListener("click", () => {
+    const idx = chatSession.pendingImages.findIndex(img => img.previewEl === previewEl);
+    if (idx >= 0) {
+      chatSession.pendingImages.splice(idx, 1);
+    }
+    previewEl.remove();
+  });
+
+  chatSession.attachmentsEl.appendChild(previewEl);
+  return previewEl;
+}
+
 // ============================================
 // Chat UI Functions for JSON Sessions
 // ============================================
@@ -2575,6 +2634,8 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
     </div>
     <div class="chat-attachments"></div>
     <div class="chat-input-container">
+      <button class="chat-attach-btn" title="Attach files">📎</button>
+      <input type="file" class="chat-file-input" accept="image/*" multiple />
       <textarea class="chat-input" placeholder="Type a message..." rows="1"></textarea>
       <button class="chat-send-btn">Send</button>
     </div>
@@ -2589,6 +2650,8 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
   const statusEl = containerEl.querySelector(".chat-status") as HTMLElement;
   const attachmentsEl = containerEl.querySelector(".chat-attachments") as HTMLElement;
   const todosEl = containerEl.querySelector(".chat-todos") as HTMLElement;
+  const attachBtn = containerEl.querySelector(".chat-attach-btn") as HTMLButtonElement;
+  const fileInput = containerEl.querySelector(".chat-file-input") as HTMLInputElement;
 
   const chatSession: ChatSession = {
     messagesEl,
@@ -2610,6 +2673,39 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
     streamingTokens: 0,
     startTime: null,
   };
+
+  // File attachment button click opens file picker
+  attachBtn.addEventListener("click", () => fileInput.click());
+
+  // File selection handler
+  fileInput.addEventListener("change", () => {
+    const files = fileInput.files;
+    if (!files?.length) return;
+
+    for (const file of Array.from(files)) {
+      // Validate it's an image
+      if (!file.type.startsWith("image/")) {
+        console.warn("Skipping non-image file:", file.name);
+        continue;
+      }
+
+      // Read as base64
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = reader.result as string;
+        const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+        if (!match) return;
+
+        const [, mediaType, base64Data] = match;
+        const previewEl = createImagePreview(mediaType, base64Data, chatSession);
+        chatSession.pendingImages.push({ mediaType, base64Data, previewEl });
+      };
+      reader.readAsDataURL(file);
+    }
+
+    // Clear input so same file can be selected again
+    fileInput.value = "";
+  });
 
   // Auto-resize textarea
   inputEl.addEventListener("input", () => {
@@ -2663,32 +2759,11 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
         const reader = new FileReader();
         reader.onload = () => {
           const dataUrl = reader.result as string;
-          // Extract base64 data (remove "data:image/png;base64," prefix)
-          const base64Match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
-          if (!base64Match) return;
+          const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+          if (!match) return;
 
-          const mediaType = base64Match[1];
-          const base64Data = base64Match[2];
-
-          // Create preview element
-          const previewEl = document.createElement("div");
-          previewEl.className = "attachment-preview";
-          previewEl.innerHTML = `
-            <img src="${dataUrl}" alt="Attached image" />
-            <button class="attachment-remove" title="Remove">×</button>
-          `;
-
-          // Remove button handler
-          const removeBtn = previewEl.querySelector(".attachment-remove")!;
-          removeBtn.addEventListener("click", () => {
-            const idx = chatSession.pendingImages.findIndex(img => img.previewEl === previewEl);
-            if (idx >= 0) {
-              chatSession.pendingImages.splice(idx, 1);
-            }
-            previewEl.remove();
-          });
-
-          chatSession.attachmentsEl.appendChild(previewEl);
+          const [, mediaType, base64Data] = match;
+          const previewEl = createImagePreview(mediaType, base64Data, chatSession);
           chatSession.pendingImages.push({ mediaType, base64Data, previewEl });
         };
         reader.readAsDataURL(file);
@@ -3193,31 +3268,11 @@ async function pasteImageFromClipboard(sessionId: string) {
         const reader = new FileReader();
         reader.onload = () => {
           const dataUrl = reader.result as string;
-          const base64Match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
-          if (!base64Match) return;
+          const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+          if (!match) return;
 
-          const mediaType = base64Match[1];
-          const base64Data = base64Match[2];
-
-          // Create preview element
-          const previewEl = document.createElement("div");
-          previewEl.className = "attachment-preview";
-          previewEl.innerHTML = `
-            <img src="${dataUrl}" alt="Attached image" />
-            <button class="attachment-remove" title="Remove">×</button>
-          `;
-
-          // Remove button handler
-          const removeBtn = previewEl.querySelector(".attachment-remove")!;
-          removeBtn.addEventListener("click", () => {
-            const idx = chatSession.pendingImages.findIndex(img => img.previewEl === previewEl);
-            if (idx >= 0) {
-              chatSession.pendingImages.splice(idx, 1);
-            }
-            previewEl.remove();
-          });
-
-          chatSession.attachmentsEl.appendChild(previewEl);
+          const [, mediaType, base64Data] = match;
+          const previewEl = createImagePreview(mediaType, base64Data, chatSession);
           chatSession.pendingImages.push({ mediaType, base64Data, previewEl });
 
           // Focus the input
@@ -3564,6 +3619,39 @@ function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: s
       return html;
     }
 
+    case "Skill": {
+      const skill = input.skill as string || "unknown";
+      const args = input.args as string || "";
+
+      // Icon mapping for common skills
+      const skillIcons: Record<string, string> = {
+        "jira": "🎫",
+        "confluence": "📄",
+        "launchdarkly": "🚀",
+        "rdeploy": "🚢",
+        "agent-browser": "🌐",
+        "office-web": "🏢",
+        "support-web": "🎧",
+        "lsa-web": "📱",
+      };
+      const icon = skillIcons[skill] || "⚡";
+
+      let html = `<div class="skill-call">`;
+      html += `<div class="skill-header">`;
+      html += `<span class="skill-icon">${icon}</span>`;
+      html += `<span class="skill-name">${escapeForHtml(skill)}</span>`;
+      html += `</div>`;
+
+      if (args) {
+        // Truncate long args for display, show full on hover
+        const truncated = args.length > 150 ? args.slice(0, 150) + "..." : args;
+        html += `<div class="skill-args" title="${escapeForHtml(args)}">${escapeForHtml(truncated)}</div>`;
+      }
+
+      html += `</div>`;
+      return html;
+    }
+
     default: {
       // Fall back to JSON for unknown tools
       const inputJson = JSON.stringify(input || {}, null, 2);
@@ -3825,8 +3913,10 @@ function processChatOutput(sessionId: string, data: string) {
       const message = JSON.parse(line) as ClaudeJsonMessage;
       addChatMessage(sessionId, message);
 
-      // Check if response is complete
-      if (message.type === "result") {
+      // Check if response is complete - only the FINAL result has num_turns or total_cost_usd
+      // Intermediate results (from Task subagents) don't have these fields
+      const isFinalResult = message.type === "result" && (message.num_turns !== undefined || message.total_cost_usd !== undefined || message.duration_ms !== undefined);
+      if (isFinalResult) {
         chatSession.isProcessing = false;
         updateSessionActivityIndicator(sessionId, false);
         const thinkingEl = chatSession.containerEl.querySelector(".chat-thinking") as HTMLElement;
@@ -4366,11 +4456,61 @@ async function showSettingsModal(): Promise<void> {
   // Clear update status
   document.getElementById("settings-update-status")!.textContent = "";
 
+  // Populate web interface URL
+  await populateWebInterfaceUrl();
+
   settingsModal.classList.add("visible");
 }
 
 function hideSettingsModal(): void {
   settingsModal.classList.remove("visible");
+}
+
+async function populateWebInterfaceUrl(): Promise<void> {
+  const urlContainer = document.getElementById("settings-web-url");
+  if (!urlContainer) return;
+
+  try {
+    // Get port and local IPs from backend
+    const [port, ips] = await Promise.all([
+      invoke<number | null>("get_web_server_port"),
+      invoke<string[]>("get_local_ips"),
+    ]);
+
+    if (!port) {
+      urlContainer.innerHTML = `<span class="loading-text">Web server not running</span>`;
+      return;
+    }
+
+    // Build URL list
+    let html = "";
+    for (const ip of ips) {
+      const url = `http://${ip}:${port}`;
+      html += `<a href="${url}" target="_blank" data-url="${url}">${url}</a>`;
+    }
+
+    // Add localhost fallback if no IPs found
+    if (ips.length === 0) {
+      const url = `http://localhost:${port}`;
+      html = `<a href="${url}" target="_blank" data-url="${url}">${url}</a>`;
+    }
+
+    urlContainer.innerHTML = html;
+
+    // Add click handlers to open in external browser
+    urlContainer.querySelectorAll("a").forEach((link) => {
+      link.addEventListener("click", async (e) => {
+        e.preventDefault();
+        const url = (link as HTMLAnchorElement).dataset.url;
+        if (url) {
+          await openUrl(url);
+        }
+      });
+    });
+  } catch (err) {
+    console.error("Failed to get web interface URL:", err);
+    urlContainer.innerHTML = `<span class="loading-text">Unable to determine URL</span>`;
+  }
 }
 
 async function saveSettings(): Promise<void> {

@@ -1461,6 +1461,46 @@ fn get_web_server_port() -> Result<Option<u16>, String> {
     Ok(*port)
 }
 
+/// Get local IP addresses for remote access URL display
+#[tauri::command]
+fn get_local_ips() -> Vec<String> {
+    use std::net::IpAddr;
+
+    let mut ips = Vec::new();
+
+    // Get the local IP address (primary network interface)
+    if let Ok(ip) = local_ip_address::local_ip() {
+        ips.push(ip.to_string());
+    }
+
+    // Also try to get all local IPs for multi-interface systems
+    if let Ok(network_interfaces) = local_ip_address::list_afinet_netifas() {
+        for (_, ip) in network_interfaces {
+            // Skip loopback addresses
+            if ip.is_loopback() {
+                continue;
+            }
+
+            // Skip IPv6 link-local addresses (fe80::) - not useful for remote access
+            if let IpAddr::V6(v6) = ip {
+                // Check for link-local (starts with fe80)
+                let segments = v6.segments();
+                if segments[0] == 0xfe80 {
+                    continue;
+                }
+            }
+
+            let ip_str = ip.to_string();
+            // Skip already-added addresses
+            if !ips.contains(&ip_str) {
+                ips.push(ip_str);
+            }
+        }
+    }
+
+    ips
+}
+
 fn get_config_path() -> PathBuf {
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -2899,17 +2939,18 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         if (isJsonSession(session)) {
           terminalContainer.style.display = 'none';
           chatContainer.classList.add('active');
-          if (isConnected) {
-            // Already connected - just show existing state
-            startBtn.style.display = 'none';
-            renderSessionMessages(sessionId);
-            status.textContent = 'Connected';
-            status.className = 'connected';
-            chatSend.disabled = false;
-          } else if (isRunning) {
+          if (isRunning) {
+            // Session is running - always refresh history and ensure WebSocket is connected
             startBtn.style.display = 'none';
             await loadChatHistory(sessionId);
-            connectChatWebSocket(sessionId);
+            if (!isConnected) {
+              connectChatWebSocket(sessionId);
+            } else {
+              // Already connected - just update status
+              status.textContent = 'Connected';
+              status.className = 'connected';
+              chatSend.disabled = false;
+            }
           } else if (autoStart) {
             startBtn.style.display = 'none';
             await startCurrentSession();
@@ -2970,6 +3011,17 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         ws.onclose = () => {
           status.textContent = 'Disconnected';
           status.className = 'disconnected';
+
+          // Auto-reconnect if session is still running
+          const session = sessionsData.find(s => s.id === sessionId);
+          if (session && session.running) {
+            console.log('Terminal WebSocket closed, reconnecting in 2s...');
+            setTimeout(() => {
+              if (currentSessionId === sessionId) {
+                connectWebSocket(sessionId);
+              }
+            }, 2000);
+          }
         };
         ws.onmessage = (e) => {
           if (e.data instanceof ArrayBuffer) {
@@ -3086,6 +3138,17 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
             status.className = 'disconnected';
             state.isProcessing = false;
             chatSend.disabled = false;
+
+            // Auto-reconnect if session is still running
+            const session = sessionsData.find(s => s.id === sessionId);
+            if (session && session.running) {
+              console.log('Chat WebSocket closed, reconnecting in 2s...');
+              setTimeout(() => {
+                if (currentSessionId === sessionId) {
+                  connectChatWebSocket(sessionId);
+                }
+              }, 2000);
+            }
           }
         };
         state.chatWs.onmessage = (e) => {
@@ -3410,10 +3473,24 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           clearTimeout(statusWsReconnectTimer);
           statusWsReconnectTimer = null;
         }
-        // On reconnect, refetch sessions to sync running status
+        // On reconnect, refetch sessions and reconnect current session if running
         if (statusWsHasConnectedBefore) {
           console.log('Reconnected - refreshing sessions list');
-          loadSessions();
+          loadSessions().then(() => {
+            // If viewing a session, refresh it
+            if (currentSessionId) {
+              const session = sessionsData.find(s => s.id === currentSessionId);
+              if (session && session.running) {
+                console.log('Reconnecting current session WebSocket');
+                if (isJsonSession(session)) {
+                  loadChatHistory(currentSessionId);
+                  connectChatWebSocket(currentSessionId);
+                } else {
+                  connectWebSocket(currentSessionId);
+                }
+              }
+            }
+          });
         }
         statusWsHasConnectedBefore = true;
       };
@@ -4741,6 +4818,7 @@ pub fn run() {
             read_text_file,
             find_latest_plan_file,
             get_web_server_port,
+            get_local_ips,
             mcp_callback
         ])
         .run(tauri::generate_context!())
@@ -4782,7 +4860,8 @@ pub fn run() {
             read_image_file,
             read_text_file,
             find_latest_plan_file,
-            get_web_server_port
+            get_web_server_port,
+            get_local_ips
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
