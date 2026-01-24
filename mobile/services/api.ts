@@ -126,11 +126,9 @@ class ApiClient {
   }
 
   async startSession(id: string): Promise<{ status: string }> {
-    const result = await this.request<{ status: string }>(`${API_ENDPOINTS.SESSIONS}/${id}/start`, {
+    return this.request<{ status: string }>(`${API_ENDPOINTS.SESSIONS}/${id}/start`, {
       method: 'POST',
     });
-    console.log('startSession response:', result);
-    return result;
   }
 
   async getSession(id: string): Promise<Session> {

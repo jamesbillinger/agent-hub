@@ -31,7 +31,6 @@ class WebSocketManager {
       const ws = new WebSocket(url);
 
       ws.onopen = () => {
-        console.log(`WebSocket connected for session ${sessionId}`);
         this.reconnectAttempts.set(sessionId, 0);
         handlers.onConnected();
       };
@@ -58,7 +57,6 @@ class WebSocketManager {
           }
 
           if (!data.startsWith('{') && !data.startsWith('[')) {
-            console.log('Skipping non-JSON WebSocket message');
             return;
           }
 
@@ -75,7 +73,6 @@ class WebSocketManager {
       };
 
       ws.onclose = (event) => {
-        console.log(`WebSocket closed for session ${sessionId}:`, event.code, event.reason);
         this.connections.delete(sessionId);
         handlers.onDisconnected();
 
@@ -96,14 +93,12 @@ class WebSocketManager {
     const attempts = this.reconnectAttempts.get(sessionId) || 0;
 
     if (attempts >= this.maxReconnectAttempts) {
-      console.log(`Max reconnect attempts reached for session ${sessionId}`);
       const handlers = this.handlers.get(sessionId);
       handlers?.onError(new Error('Failed to reconnect after multiple attempts'));
       return;
     }
 
     const delay = this.reconnectDelay * Math.pow(2, attempts);
-    console.log(`Scheduling reconnect for session ${sessionId} in ${delay}ms (attempt ${attempts + 1})`);
 
     const timeout = setTimeout(() => {
       this.reconnectAttempts.set(sessionId, attempts + 1);

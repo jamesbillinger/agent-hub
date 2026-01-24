@@ -1345,8 +1345,19 @@ fn spawn_json_process(
 fn write_to_process(session_id: String, data: String) -> Result<(), String> {
     let processes = JSON_PROCESSES.lock();
     if let Some(process) = processes.get(&session_id) {
-        process.stdin.try_send(data)
+        process.stdin.try_send(data.clone())
             .map_err(|e| format!("Failed to send to stdin: {}", e))?;
+
+        // Broadcast user message to WebSocket clients (mobile app)
+        // so they can see messages typed on desktop
+        drop(processes); // Release lock before acquiring another
+        if let Some(tx) = {
+            let broadcasters = JSON_BROADCASTERS.lock();
+            broadcasters.get(&session_id).cloned()
+        } {
+            let _ = tx.send(data);
+        }
+
         Ok(())
     } else {
         Err("Process not found".to_string())
@@ -2557,7 +2568,7 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           document.getElementById('pairing-auth').style.display = 'none';
         }
       } catch (e) {
-        console.log('PIN status check failed');
+        // PIN status check failed - fall through to pairing auth
       }
     }
 
@@ -2842,8 +2853,6 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
 
         isScrolling = false;
       }, { passive: true });
-
-      console.log('Touch overlay scroll initialized');
     }
 
     function initSessionHandlers() {
@@ -3182,9 +3191,13 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         div.className = 'chat-msg';
 
         if (msg.type === 'user') {
-          if (!msg.result?.trim()) return null; // Skip empty
+          // Handle both formats:
+          // Desktop: {"type": "user", "result": "text"}
+          // iOS: {"type": "user", "message": {"role": "user", "content": "text"}}
+          const userText = msg.result || msg.message?.content;
+          if (!userText?.trim()) return null; // Skip empty
           div.classList.add('user');
-          div.textContent = msg.result;
+          div.textContent = userText;
         } else if (msg.type === 'assistant' && msg.message?.content) {
           div.classList.add('assistant');
           let html = '';
@@ -3468,20 +3481,17 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
       statusWs = new WebSocket(`${protocol}//${location.host}/api/ws/status`);
 
       statusWs.onopen = () => {
-        console.log('Status WebSocket connected');
         if (statusWsReconnectTimer) {
           clearTimeout(statusWsReconnectTimer);
           statusWsReconnectTimer = null;
         }
         // On reconnect, refetch sessions and reconnect current session if running
         if (statusWsHasConnectedBefore) {
-          console.log('Reconnected - refreshing sessions list');
           loadSessions().then(() => {
             // If viewing a session, refresh it
             if (currentSessionId) {
               const session = sessionsData.find(s => s.id === currentSessionId);
               if (session && session.running) {
-                console.log('Reconnecting current session WebSocket');
                 if (isJsonSession(session)) {
                   loadChatHistory(currentSessionId);
                   connectChatWebSocket(currentSessionId);
@@ -3496,7 +3506,6 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
       };
 
       statusWs.onclose = () => {
-        console.log('Status WebSocket closed, reconnecting in 3s...');
         statusWsReconnectTimer = setTimeout(connectStatusWebSocket, 3000);
       };
 
@@ -3515,8 +3524,6 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
     }
 
     function handleStatusEvent(event) {
-      console.log('Status event:', event.type, event.data);
-
       switch (event.type) {
         case 'session_status': {
           // Update running status for a session
@@ -3637,8 +3644,6 @@ async fn api_request_pairing(
         });
     }
 
-    // Log the pairing code for debugging
-    println!("🔑 Pairing code requested: {} (device: {:?})", code, device_name);
 
     // Notify desktop app to show the code
     if let Some(app) = APP_HANDLE.lock().as_ref() {
@@ -3954,7 +3959,7 @@ async fn api_create_session(
     // Determine command based on agent type
     let command = match agent_type {
         "claude" => "claude --dangerously-skip-permissions".to_string(),
-        "claude-json" => "claude --print --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions".to_string(),
+        "claude-json" => "claude --print --input-format stream-json --output-format stream-json --dangerously-skip-permissions".to_string(),
         "aider" => "aider".to_string(),
         "shell" => std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string()),
         "custom" => custom_command.clone().unwrap_or_else(|| "/bin/zsh".to_string()),
@@ -4296,7 +4301,9 @@ async fn handle_ws(socket: WebSocket, session_id: String) {
                                     break;
                                 }
                             }
-                            Err(_) => break,
+                            Err(_) => {
+                                break;
+                            }
                         }
                     }
                     // Forward session status changes to client
@@ -4335,8 +4342,9 @@ async fn handle_ws(socket: WebSocket, session_id: String) {
                         }
 
                         // Emit Tauri event so desktop frontend can see user messages from mobile
+                        // Use same event name as process output so frontend handles it consistently
                         if let Some(app) = APP_HANDLE.lock().as_ref() {
-                            let _ = app.emit("json-output", serde_json::json!({
+                            let _ = app.emit("json-process-output", serde_json::json!({
                                 "session_id": session_id_clone.clone(),
                                 "data": text,
                             }));

@@ -210,7 +210,7 @@ let recentlyClosed: RecentlyClosedSession[] = [];
 // Agent commands
 const AGENT_COMMANDS: Record<string, string> = {
   claude: "claude --dangerously-skip-permissions",
-  "claude-json": "claude --print --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions",
+  "claude-json": "claude --print --input-format stream-json --output-format stream-json --dangerously-skip-permissions",
   codex: "codex --full-auto",
   aider: "aider",
   shell: "$SHELL",
@@ -850,7 +850,6 @@ document.addEventListener("DOMContentLoaded", async () => {
     const { session_id, claude_session_id } = event.payload;
     const session = sessions.get(session_id);
     if (session && session.agentType === "claude") {
-      console.log(`[Claude Session Detected] session=${session_id}, claude_id=${claude_session_id}`);
       session.claudeSessionId = claude_session_id;
       session.hasBeenStarted = true;
       // DB is already updated by backend, but we keep the local state in sync
@@ -1037,8 +1036,6 @@ document.addEventListener("DOMContentLoaded", async () => {
       "Device Pairing Request",
       `Enter code ${code}${deviceInfo} to pair this device`
     );
-
-    console.log(`Pairing request: code=${code}, device=${device_name || "unknown"}`);
   });
 
   // Listen for successful pairing (hide modal)
@@ -3722,14 +3719,16 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
   messageEl.className = "chat-message";
 
   if (message.type === "user") {
+    // Extract user content from either desktop format (result) or mobile format (message.content)
+    const userContent = message.result ?? message.message?.content;
     // Skip rendering user messages with empty/non-string content (e.g., tool_result messages)
     // but still save them to preserve history
-    if (typeof message.result !== "string" || !message.result.trim()) {
+    if (typeof userContent !== "string" || !userContent.trim()) {
       saveChatMessages(sessionId);
       return;
     }
     messageEl.classList.add("user");
-    messageEl.textContent = message.result;
+    messageEl.textContent = userContent;
   } else if (message.type === "assistant" && message.message?.content) {
     messageEl.classList.add("assistant");
     // Render assistant content and count tool uses
@@ -4274,7 +4273,6 @@ async function loadChatMessages(sessionId: string, chatSession: ChatSession): Pr
           session.claudeSessionId = latestInit.session_id;
           session.hasBeenStarted = true;
           saveSessionToDb(session);
-          console.log(`[loadChatMessages] Recovered claudeSessionId from buffer: ${latestInit.session_id}`);
         }
       }
 
@@ -4842,7 +4840,7 @@ async function resumeClaudeSession(claudeSessionId: string, project: string): Pr
     id: crypto.randomUUID(),
     name: `Resumed: ${claudeSessionId.substring(0, 8)}...`,
     agentType: "claude-json",
-    command: `claude --print --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions`,
+    command: `claude --print --input-format stream-json --output-format stream-json --dangerously-skip-permissions`,
     workingDir: project,
     createdAt: new Date(),
     claudeSessionId: claudeSessionId,
