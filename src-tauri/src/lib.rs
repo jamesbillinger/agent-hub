@@ -3959,7 +3959,7 @@ async fn api_create_session(
     // Determine command based on agent type
     let command = match agent_type {
         "claude" => "claude --dangerously-skip-permissions".to_string(),
-        "claude-json" => "claude --print --input-format stream-json --output-format stream-json --dangerously-skip-permissions".to_string(),
+        "claude-json" => "claude --print --verbose --input-format stream-json --output-format stream-json --dangerously-skip-permissions".to_string(),
         "aider" => "aider".to_string(),
         "shell" => std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string()),
         "custom" => custom_command.clone().unwrap_or_else(|| "/bin/zsh".to_string()),
