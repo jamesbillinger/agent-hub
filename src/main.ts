@@ -11,13 +11,29 @@ import { FitAddon } from "@xterm/addon-fit";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
-import { marked } from "marked";
+import { marked, Tokens } from "marked";
 import "@xterm/xterm/css/xterm.css";
 
-// Configure marked for safe rendering
+// Configure marked for safe rendering with copy buttons on code blocks
+const renderer = new marked.Renderer();
+const originalCodeRenderer = renderer.code.bind(renderer);
+renderer.code = function(code: Tokens.Code) {
+  const originalHtml = originalCodeRenderer(code);
+  // Wrap code block with container that includes copy button
+  const langLabel = code.lang ? `<span class="code-lang">${code.lang}</span>` : '';
+  return `<div class="code-block-wrapper">
+    <div class="code-block-header">
+      ${langLabel}
+      <button class="code-copy-btn" title="Copy code">Copy</button>
+    </div>
+    ${originalHtml}
+  </div>`;
+};
+
 marked.setOptions({
   breaks: true, // Convert \n to <br>
   gfm: true,    // GitHub Flavored Markdown
+  renderer: renderer,
 });
 
 // Types
@@ -581,6 +597,28 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   });
 
+  // Handle code block copy buttons (delegated)
+  document.addEventListener("click", async (e) => {
+    const target = e.target as HTMLElement;
+    if (target.classList.contains("code-copy-btn")) {
+      const wrapper = target.closest(".code-block-wrapper");
+      const codeEl = wrapper?.querySelector("pre code") || wrapper?.querySelector("pre");
+      if (codeEl) {
+        try {
+          await navigator.clipboard.writeText(codeEl.textContent || "");
+          target.textContent = "Copied!";
+          target.classList.add("copied");
+          setTimeout(() => {
+            target.textContent = "Copy";
+            target.classList.remove("copied");
+          }, 2000);
+        } catch (err) {
+          console.error("Failed to copy:", err);
+        }
+      }
+    }
+  });
+
   // Initial mobile view state
   if (isMobileLayout) {
     setMobileView("list");
@@ -632,6 +670,13 @@ document.addEventListener("DOMContentLoaded", async () => {
         await createQuickSessionWithAgent(agentType);
       }
     });
+  });
+
+  // Handle "Open Claude Code in Directory" button
+  document.getElementById("open-claude-in-dir")?.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    dropdownMenu.classList.remove("visible");
+    await openClaudeCodeInDirectory();
   });
 
   // Close dropdowns when clicking outside
@@ -1468,6 +1513,38 @@ async function createQuickSessionWithAgent(agentType: Session["agentType"]) {
   await switchToSession(session.id);
   await startSessionProcess(session);
   renderSessionList();
+}
+
+/**
+ * Open Claude Code in a specific directory (launches a new terminal window)
+ * This is useful when you need the MCP servers from that directory's .mcp.json
+ */
+async function openClaudeCodeInDirectory() {
+  const directory = prompt(
+    "Enter directory path to open Claude Code in:\n\n" +
+    "This launches a new terminal with Claude Code in the specified directory, " +
+    "which will load MCP servers from that directory's .mcp.json if present.",
+    "~/dev/agent-hub-tauri"
+  );
+
+  if (!directory) return;
+
+  // Expand ~ to home directory
+  const expandedDir = directory.startsWith("~")
+    ? directory.replace("~", await invoke<string>("get_home_dir"))
+    : directory;
+
+  try {
+    // Use osascript to open Terminal.app with Claude Code in the specified directory
+    // This creates a new terminal window that's separate from Agent Hub
+    await invoke("open_terminal_with_command", {
+      directory: expandedDir,
+      command: "claude"
+    });
+  } catch (err) {
+    console.error("Failed to open Claude Code:", err);
+    alert(`Failed to open Claude Code: ${err}`);
+  }
 }
 
 // Edit session modal state

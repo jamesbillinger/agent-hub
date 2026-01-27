@@ -231,6 +231,12 @@ body.resizing-sidebar {
   border-radius: 0 0 4px 4px;
 }
 
+.dropdown-divider {
+  height: 1px;
+  background: var(--border-color);
+  margin: 4px 0;
+}
+
 /* Sidebar controls (search and sort) */
 #sidebar-controls {
   padding: 8px 12px;
@@ -2067,6 +2073,58 @@ body.resizing-sidebar {
 
 .chat-message.error {
   border-left-color: #f14c4c;
+}
+
+/* Code block wrapper with copy button */
+.code-block-wrapper {
+  position: relative;
+  margin: 8px 0;
+  border-radius: 6px;
+  background: var(--bg-primary);
+  overflow: hidden;
+}
+
+.code-block-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 8px;
+  background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-primary);
+  font-size: 11px;
+}
+
+.code-lang {
+  color: var(--text-muted);
+  text-transform: lowercase;
+}
+
+.code-copy-btn {
+  padding: 2px 8px;
+  border: none;
+  border-radius: 3px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.code-copy-btn:hover {
+  background: var(--accent);
+  color: white;
+}
+
+.code-copy-btn.copied {
+  background: #27ae60;
+  color: white;
+}
+
+.code-block-wrapper pre {
+  margin: 0;
+  padding: 8px;
+  background: transparent;
+  border-radius: 0;
 }
 
 .chat-message pre {
