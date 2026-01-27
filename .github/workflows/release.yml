@@ -2,8 +2,8 @@ name: Release
 
 on:
   push:
-    branches:
-      - 'release/*'
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
@@ -14,11 +14,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Get version from branch name
+      - name: Get version from tag
         id: get-version
         run: |
-          BRANCH_NAME=${GITHUB_REF#refs/heads/release/}
-          echo "version=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          # Extract version from tag (removes 'v' prefix)
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
