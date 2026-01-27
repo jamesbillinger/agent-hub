@@ -1176,6 +1176,37 @@ body.resizing-sidebar {
   word-break: break-word;
 }
 
+/* User message images */
+.user-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.user-image {
+  max-width: 200px;
+  max-height: 150px;
+  border-radius: 6px;
+  object-fit: cover;
+  cursor: pointer;
+  transition: transform 0.2s ease;
+}
+
+.user-image:hover {
+  transform: scale(1.05);
+}
+
+.user-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Remove margin when only images (no text) */
+.chat-message.user .user-images:last-child {
+  margin-bottom: 0;
+}
+
 .chat-message.assistant {
   align-self: flex-start;
   background: var(--bg-secondary);

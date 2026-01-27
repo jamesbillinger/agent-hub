@@ -92,6 +92,8 @@ interface ClaudeJsonMessage {
     };
   };
   result?: string;
+  // User message images (for display in chat)
+  images?: Array<{ base64Data: string; mediaType: string }>;
   is_error?: boolean;
   duration_ms?: number;
   duration_api_ms?: number;
@@ -3089,8 +3091,13 @@ async function sendChatMessage(sessionId: string) {
   chatSession.inputEl.style.height = "auto";
   chatSession.pastedTextBlocks = [];
 
-  // Add user message to UI
-  addChatMessage(sessionId, { type: "user", result: message });
+  // Capture images before they get cleared (for display in chat)
+  const userImages = chatSession.pendingImages.length > 0
+    ? [...chatSession.pendingImages]
+    : undefined;
+
+  // Add user message to UI (with images if any)
+  addChatMessage(sessionId, { type: "user", result: message, images: userImages });
 
   // Show thinking indicator and reset stats
   chatSession.isProcessing = true;
@@ -3834,12 +3841,26 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
     const userContent = message.result ?? message.message?.content;
     // Skip rendering user messages with empty/non-string content (e.g., tool_result messages)
     // but still save them to preserve history
-    if (typeof userContent !== "string" || !userContent.trim()) {
+    const hasImages = message.images && message.images.length > 0;
+    if (!hasImages && (typeof userContent !== "string" || !userContent.trim())) {
       saveChatMessages(sessionId);
       return;
     }
     messageEl.classList.add("user");
-    messageEl.textContent = userContent;
+
+    // Build HTML for user message with optional images
+    let userHtml = "";
+    if (hasImages) {
+      userHtml += '<div class="user-images">';
+      for (const img of message.images!) {
+        userHtml += `<img src="data:${img.mediaType};base64,${img.base64Data}" alt="Attached image" class="user-image" />`;
+      }
+      userHtml += '</div>';
+    }
+    if (typeof userContent === "string" && userContent.trim()) {
+      userHtml += `<div class="user-text">${escapeHtml(userContent)}</div>`;
+    }
+    messageEl.innerHTML = userHtml;
   } else if (message.type === "assistant" && message.message?.content) {
     messageEl.classList.add("assistant");
     // Render assistant content and count tool uses
@@ -4406,11 +4427,25 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
 
   if (message.type === "user") {
     // Skip user messages with empty content (e.g., tool_result messages)
-    if (!message.result?.trim()) {
+    const hasImages = message.images && message.images.length > 0;
+    if (!hasImages && !message.result?.trim()) {
       return;
     }
     messageEl.classList.add("user");
-    messageEl.textContent = message.result;
+
+    // Build HTML for user message with optional images
+    let userHtml = "";
+    if (hasImages) {
+      userHtml += '<div class="user-images">';
+      for (const img of message.images!) {
+        userHtml += `<img src="data:${img.mediaType};base64,${img.base64Data}" alt="Attached image" class="user-image" />`;
+      }
+      userHtml += '</div>';
+    }
+    if (message.result?.trim()) {
+      userHtml += `<div class="user-text">${escapeHtml(message.result)}</div>`;
+    }
+    messageEl.innerHTML = userHtml;
   } else if (message.type === "assistant" && message.message?.content) {
     messageEl.classList.add("assistant");
     const content = message.message.content;
