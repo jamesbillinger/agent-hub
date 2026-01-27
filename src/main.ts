@@ -1149,17 +1149,37 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
     // Escape to close modals or interrupt processing
     if (e.key === "Escape") {
+      const diffModal = document.getElementById("diff-modal");
+      const planModal = document.getElementById("plan-modal");
+      const pairingModal = document.getElementById("pairing-modal");
+      const claudeSessionsModal = document.getElementById("claude-sessions-modal");
+
       if (settingsModal.classList.contains("visible")) {
         hideSettingsModal();
       } else if (aboutModal.classList.contains("visible")) {
         hideAboutModal();
       } else if (newSessionModal.classList.contains("visible")) {
         hideNewSessionModal();
+      } else if (diffModal?.classList.contains("visible")) {
+        hideDiffModal();
+      } else if (planModal?.classList.contains("visible")) {
+        hidePlanModal();
+      } else if (pairingModal?.classList.contains("visible")) {
+        pairingModal.classList.remove("visible");
+      } else if (claudeSessionsModal?.classList.contains("visible")) {
+        claudeSessionsModal.classList.remove("visible");
       } else if (activeSessionId) {
-        // Interrupt current session if processing
+        // Interrupt current session
+        const session = sessions.get(activeSessionId);
         const chatSession = chatSessions.get(activeSessionId);
+
         if (chatSession?.isProcessing) {
+          // JSON session - send interrupt signal
           interruptSession(activeSessionId);
+        } else if (session?.isRunning && session.terminal && !isJsonAgent(session.agentType)) {
+          // Terminal session - send Escape key to PTY (ASCII 27)
+          // This interrupts Claude Code in xterm mode
+          invoke("write_pty", { sessionId: activeSessionId, data: "\x1b" });
         }
       }
     }
@@ -2377,9 +2397,12 @@ function renderSessionList() {
     item.className = `session-item${session.id === activeSessionId ? " active" : ""}${isSessionActive ? " session-active" : ""}`;
     item.dataset.sessionId = session.id;
 
-    const agentBadgeClass = session.agentType === "claude" ? "claude" :
-                           session.agentType === "codex" ? "codex" :
+    // Only show agent badge for non-Claude sessions (most are Claude, so skip to save space)
+    const isClaudeSession = session.agentType === "claude" || session.agentType === "claude-json";
+    const agentBadgeClass = session.agentType === "codex" ? "codex" :
                            session.agentType === "aider" ? "aider" : "";
+    const agentBadgeHtml = isClaudeSession ? "" :
+      `<div class="meta"><span class="agent-badge ${agentBadgeClass}">${getAgentLabel(session.agentType)}</span></div>`;
 
     // Show shortcut indicator for first 10 sessions (⌘1-9, ⌘0)
     const shortcutKey = i < 9 ? String(i + 1) : i === 9 ? "0" : null;
@@ -2395,9 +2418,7 @@ function renderSessionList() {
       <div class="status ${statusClass}"></div>
       <div class="details">
         <div class="name">${escapeHtml(session.name)}</div>
-        <div class="meta">
-          <span class="agent-badge ${agentBadgeClass}">${getAgentLabel(session.agentType)}</span>
-        </div>
+        ${agentBadgeHtml}
       </div>
       ${shortcutHtml}
       <button class="close-btn" title="Close session">×</button>

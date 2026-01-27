@@ -129,6 +129,15 @@ fn broadcast_session_status(session_id: &str, running: bool) {
     }));
 }
 
+/// Broadcast processing state change (thinking started/stopped)
+#[cfg(not(target_os = "ios"))]
+fn broadcast_processing_status(session_id: &str, processing: bool) {
+    broadcast_session_event("processing_status", serde_json::json!({
+        "session_id": session_id,
+        "processing": processing
+    }));
+}
+
 /// Broadcast that a session was created
 #[cfg(not(target_os = "ios"))]
 fn broadcast_session_created(session: &SessionData) {
@@ -1270,6 +1279,23 @@ fn spawn_json_process(
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
+                    // Parse JSON to detect processing state changes
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                        if let Some(msg_type) = json.get("type").and_then(|t| t.as_str()) {
+                            match msg_type {
+                                "assistant" => {
+                                    // Assistant message = processing started
+                                    broadcast_processing_status(&session_id_stdout, true);
+                                }
+                                "result" => {
+                                    // Result = processing finished
+                                    broadcast_processing_status(&session_id_stdout, false);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
                     let data = line + "\n";
                     // Emit to Tauri (for desktop app)
                     let _ = app_stdout.emit("json-process-output", serde_json::json!({
@@ -2123,9 +2149,8 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
       outline: none;
       border-color: #0e9fd8;
     }
-    #chat-send {
+    #chat-send, #chat-stop {
       padding: 10px 16px;
-      background: #0e9fd8;
       color: white;
       border: none;
       border-radius: 20px;
@@ -2133,8 +2158,15 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
       font-weight: 500;
       cursor: pointer;
     }
+    #chat-send {
+      background: #0e9fd8;
+    }
     #chat-send:disabled {
       background: #555;
+    }
+    #chat-stop {
+      background: #e74c3c;
+      margin-right: 8px;
     }
 
     /* Paste indicator (shows on long-press) */
@@ -2397,6 +2429,7 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           <div id="chat-messages"></div>
           <div id="chat-input-container">
             <textarea id="chat-input" placeholder="Type a message..." rows="1"></textarea>
+            <button id="chat-stop" style="display: none;">Stop</button>
             <button id="chat-send">Send</button>
           </div>
         </div>
@@ -2647,11 +2680,133 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
     let dataHandler = null;
     let resizeHandler = null;
 
+    // Global status WebSocket - stays connected for status updates
+    let statusWs = null;
+    const runningSessionIds = new Set();
+    const processingSessionIds = new Set();
+
     // Per-session state management (keeps connections alive across navigation)
-    const sessionStates = new Map(); // sessionId -> { chatWs, messages: [], isProcessing }
+    const sessionStates = new Map(); // sessionId -> { chatWs, messages: [], isProcessing, isAtBottom }
+
+    // Connect to global status WebSocket for session events
+    function connectStatusWebSocket() {
+      if (statusWs && statusWs.readyState === WebSocket.OPEN) return;
+      if (statusWs) statusWs.close();
+
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      statusWs = new WebSocket(`${protocol}//${location.host}/api/ws/status`);
+
+      statusWs.onopen = () => {
+        console.log('Status WebSocket connected');
+      };
+
+      statusWs.onclose = () => {
+        console.log('Status WebSocket closed, reconnecting in 2s...');
+        setTimeout(connectStatusWebSocket, 2000);
+      };
+
+      statusWs.onmessage = (e) => {
+        try {
+          const event = JSON.parse(e.data);
+          handleStatusEvent(event);
+        } catch (err) {
+          console.warn('Failed to parse status event:', e.data);
+        }
+      };
+    }
+
+    function handleStatusEvent(event) {
+      const { type, data } = event;
+
+      switch (type) {
+        case 'session_status': {
+          const { session_id, running } = data;
+          if (running) {
+            runningSessionIds.add(session_id);
+          } else {
+            runningSessionIds.delete(session_id);
+            processingSessionIds.delete(session_id);
+          }
+          // Update session list UI
+          updateSessionListUI();
+          // Update current session UI if applicable
+          if (currentSessionId === session_id) {
+            updateCurrentSessionUI();
+          }
+          break;
+        }
+
+        case 'processing_status': {
+          const { session_id, processing } = data;
+          if (processing) {
+            processingSessionIds.add(session_id);
+          } else {
+            processingSessionIds.delete(session_id);
+          }
+          // Update current session UI if this is the viewed session
+          if (currentSessionId === session_id) {
+            const state = getSessionState(session_id);
+            state.isProcessing = processing;
+            updateProcessingUI(processing);
+          }
+          break;
+        }
+
+        case 'session_created':
+        case 'session_deleted':
+        case 'session_updated':
+          // Reload session list
+          loadSessions();
+          break;
+      }
+    }
+
+    function updateSessionListUI() {
+      // Update the running indicators in the session list
+      document.querySelectorAll('.session-item').forEach(item => {
+        const sessionId = item.dataset.sessionId;
+        const statusDot = item.querySelector('.session-status');
+        if (statusDot) {
+          const isRunning = runningSessionIds.has(sessionId);
+          statusDot.className = 'session-status ' + (isRunning ? 'running' : 'stopped');
+        }
+      });
+    }
+
+    function updateCurrentSessionUI() {
+      if (!currentSessionId) return;
+      const session = sessionsData.find(s => s.id === currentSessionId);
+      if (!session) return;
+
+      const isRunning = runningSessionIds.has(currentSessionId);
+      const isProcessing = processingSessionIds.has(currentSessionId);
+
+      // Update start button visibility
+      startBtn.style.display = isRunning ? 'none' : 'inline-block';
+
+      // Update processing UI
+      const state = getSessionState(currentSessionId);
+      state.isProcessing = isProcessing;
+      updateProcessingUI(isProcessing);
+
+      // Update connection status
+      if (isRunning && state.chatWs && state.chatWs.readyState === WebSocket.OPEN) {
+        status.textContent = isProcessing ? 'Thinking...' : 'Connected';
+        status.className = 'connected';
+      } else if (isRunning) {
+        status.textContent = 'Connecting...';
+        status.className = '';
+      } else {
+        status.textContent = 'Session stopped';
+        status.className = 'disconnected';
+      }
+    }
 
     function initMainApp() {
       if (term) return;
+
+      // Connect global status WebSocket immediately
+      connectStatusWebSocket();
 
       term = new Terminal({
         fontSize: 14,
@@ -2908,6 +3063,11 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         try {
           const res = await authFetch('/api/sessions');
           sessionsData = await res.json();
+          // Sync running state from session data
+          runningSessionIds.clear();
+          sessionsData.forEach(s => {
+            if (s.running) runningSessionIds.add(s.id);
+          });
           renderSessionsList();
         } catch (e) {
           console.error('Failed to load sessions', e);
@@ -3057,6 +3217,46 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
       const chatMessagesContainer = document.getElementById('chat-messages');
       const chatInput = document.getElementById('chat-input');
       const chatSend = document.getElementById('chat-send');
+      const chatStop = document.getElementById('chat-stop');
+
+      // Update UI based on processing state - separate Stop and Send buttons
+      function updateProcessingUI(isProcessing) {
+        // Show/hide stop button based on processing state
+        chatStop.style.display = isProcessing ? 'inline-block' : 'none';
+        // Send button always available when there's text (input never disabled)
+        chatSend.disabled = !chatInput.value.trim();
+      }
+
+      // Interrupt handler
+      async function interruptSession() {
+        if (!currentSessionId) return;
+        const state = getSessionState(currentSessionId);
+
+        try {
+          await authFetch(`/api/sessions/${currentSessionId}/interrupt`, { method: 'POST' });
+          // UI will update when we receive the result message or websocket closes
+        } catch (e) {
+          console.error('Failed to interrupt:', e);
+          // Reset UI anyway
+          state.isProcessing = false;
+          updateProcessingUI(false);
+          status.textContent = 'Interrupted';
+        }
+      }
+
+      // Handle page visibility changes - reset stuck state
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && currentSessionId) {
+          const state = getSessionState(currentSessionId);
+          // If we think we're processing but WebSocket is not open, reset
+          if (state.isProcessing && (!state.chatWs || state.chatWs.readyState !== WebSocket.OPEN)) {
+            state.isProcessing = false;
+            updateProcessingUI(false);
+            status.textContent = 'Disconnected';
+            status.className = 'disconnected';
+          }
+        }
+      });
 
       function getSessionState(sessionId) {
         if (!sessionStates.has(sessionId)) {
@@ -3064,11 +3264,34 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
             chatWs: null,
             messages: [],
             isProcessing: false,
-            inputValue: ''
+            inputValue: '',
+            isAtBottom: true
           });
         }
         return sessionStates.get(sessionId);
       }
+
+      // Check if chat container is scrolled to bottom (with tolerance)
+      function isScrolledToBottom() {
+        const tolerance = 50; // pixels
+        return chatMessagesContainer.scrollHeight - chatMessagesContainer.scrollTop - chatMessagesContainer.clientHeight < tolerance;
+      }
+
+      // Smart scroll - only auto-scroll if user was already at bottom
+      function smartScrollToBottom(forceScroll = false) {
+        if (!currentSessionId) return;
+        const state = getSessionState(currentSessionId);
+        if (forceScroll || state.isAtBottom) {
+          chatMessagesContainer.scrollTop = chatMessagesContainer.scrollHeight;
+        }
+      }
+
+      // Track scroll position
+      chatMessagesContainer.addEventListener('scroll', () => {
+        if (!currentSessionId) return;
+        const state = getSessionState(currentSessionId);
+        state.isAtBottom = isScrolledToBottom();
+      });
 
       function renderSessionMessages(sessionId) {
         const state = getSessionState(sessionId);
@@ -3077,7 +3300,9 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           const div = createMessageElement(msg);
           if (div) chatMessagesContainer.appendChild(div);
         });
+        // Always scroll to bottom on initial render
         chatMessagesContainer.scrollTop = chatMessagesContainer.scrollHeight;
+        state.isAtBottom = true;
       }
 
       async function loadChatHistory(sessionId) {
@@ -3124,7 +3349,7 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         if (state.chatWs && state.chatWs.readyState === WebSocket.OPEN) {
           status.textContent = 'Connected';
           status.className = 'connected';
-          chatSend.disabled = false;
+          updateProcessingUI(state.isProcessing);
           return;
         }
 
@@ -3138,7 +3363,7 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           if (currentSessionId === sessionId) {
             status.textContent = 'Connected';
             status.className = 'connected';
-            chatSend.disabled = false;
+            updateProcessingUI(state.isProcessing);
           }
         };
         state.chatWs.onclose = () => {
@@ -3146,7 +3371,7 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
             status.textContent = 'Disconnected';
             status.className = 'disconnected';
             state.isProcessing = false;
-            chatSend.disabled = false;
+            updateProcessingUI(false);
 
             // Auto-reconnect if session is still running
             const session = sessionsData.find(s => s.id === sessionId);
@@ -3170,11 +3395,12 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
                 const div = createMessageElement(msg);
                 if (div) {
                   chatMessagesContainer.appendChild(div);
-                  chatMessagesContainer.scrollTop = chatMessagesContainer.scrollHeight;
+                  smartScrollToBottom(); // Only scroll if user was at bottom
                 }
                 if (msg.type === 'result') {
                   state.isProcessing = false;
-                  chatSend.disabled = false;
+                  processingSessionIds.delete(sessionId);
+                  updateProcessingUI(false);
                   status.textContent = 'Done';
                   status.className = 'connected';
                 }
@@ -3256,11 +3482,11 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           const div = createMessageElement(userMsg);
           if (div) {
             chatMessagesContainer.appendChild(div);
-            chatMessagesContainer.scrollTop = chatMessagesContainer.scrollHeight;
+            smartScrollToBottom(true); // Force scroll for user's own message
           }
 
           state.isProcessing = true;
-          chatSend.disabled = true;
+          updateProcessingUI(true);
           status.textContent = 'Starting session...';
           status.className = '';
 
@@ -3299,12 +3525,12 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
             } else {
               status.textContent = 'Failed to start session';
               state.isProcessing = false;
-              chatSend.disabled = false;
+              updateProcessingUI(false);
             }
           } catch (e) {
             status.textContent = 'Failed to start session';
             state.isProcessing = false;
-            chatSend.disabled = false;
+            updateProcessingUI(false);
           }
           return;
         }
@@ -3315,14 +3541,14 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         const div = createMessageElement(userMsg);
         if (div) {
           chatMessagesContainer.appendChild(div);
-          chatMessagesContainer.scrollTop = chatMessagesContainer.scrollHeight;
+          smartScrollToBottom(true); // Force scroll for user's own message
         }
         chatInput.value = '';
         state.inputValue = '';
 
         // Send to server
         state.isProcessing = true;
-        chatSend.disabled = true;
+        updateProcessingUI(true);
         status.textContent = 'Thinking...';
         status.className = '';
 
@@ -3333,12 +3559,22 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         state.chatWs.send(jsonMsg);
       }
 
-      chatSend.addEventListener('click', sendChatMessage);
+      // Separate buttons for send and stop
+      chatSend.addEventListener('click', () => {
+        sendChatMessage();
+      });
+      chatStop.addEventListener('click', () => {
+        interruptSession();
+      });
       chatInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' && !e.shiftKey) {
           e.preventDefault();
           sendChatMessage();
         }
+      });
+      // Update send button state as user types
+      chatInput.addEventListener('input', () => {
+        chatSend.disabled = !chatInput.value.trim();
       });
 
       async function startCurrentSession() {
@@ -4154,6 +4390,73 @@ async fn api_start_session(
     }))).into_response()
 }
 
+// POST /api/sessions/{id}/interrupt - Interrupt a running session
+#[cfg(not(target_os = "ios"))]
+async fn api_interrupt_session(
+    headers: axum::http::HeaderMap,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(err) = check_auth(&headers) {
+        return err.into_response();
+    }
+
+    // Check if it's a JSON session
+    let is_json = {
+        let json_broadcasters = JSON_BROADCASTERS.lock();
+        json_broadcasters.contains_key(&session_id)
+    };
+
+    if is_json {
+        // Send SIGINT to JSON process
+        let processes = JSON_PROCESSES.lock();
+        if let Some(process) = processes.get(&session_id) {
+            if process.child_id > 0 {
+                unsafe {
+                    libc::kill(process.child_id as i32, libc::SIGINT);
+                }
+                return Json(serde_json::json!({ "status": "interrupted" })).into_response();
+            }
+        }
+        return (StatusCode::NOT_FOUND, "Process not found").into_response();
+    }
+
+    // Check if it's a PTY session
+    let is_pty = {
+        let pty_broadcasters = PTY_BROADCASTERS.lock();
+        pty_broadcasters.contains_key(&session_id)
+    };
+
+    if is_pty {
+        // Send Ctrl+C to PTY
+        let sessions = PTY_SESSIONS.lock();
+        if let Some(session) = sessions.get(&session_id) {
+            let mut session = session.lock();
+            // Send ETX (Ctrl+C)
+            let _ = session.writer.write_all(&[0x03]);
+            let _ = session.writer.flush();
+            return Json(serde_json::json!({ "status": "interrupted" })).into_response();
+        }
+        return (StatusCode::NOT_FOUND, "PTY session not found").into_response();
+    }
+
+    (StatusCode::NOT_FOUND, "Session not running").into_response()
+}
+
+// iOS version
+#[cfg(target_os = "ios")]
+async fn api_interrupt_session(
+    headers: axum::http::HeaderMap,
+    Path(_session_id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(err) = check_auth(&headers) {
+        return err.into_response();
+    }
+    (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
+        "error": "not_supported",
+        "message": "Cannot interrupt sessions on iOS."
+    }))).into_response()
+}
+
 // POST /api/mcp/execute - Execute JS in the webview and return result
 // This allows external MCP bridges to control the UI via HTTP
 #[cfg(not(target_os = "ios"))]
@@ -4542,6 +4845,7 @@ fn start_web_server() {
                 .route("/api/sessions", get(api_list_sessions).post(api_create_session))
                 .route("/api/sessions/:session_id/buffer", get(api_get_buffer))
                 .route("/api/sessions/:session_id/start", axum::routing::post(api_start_session))
+                .route("/api/sessions/:session_id/interrupt", axum::routing::post(api_interrupt_session))
                 .route("/api/ws/:session_id", get(ws_handler))
                 .route("/api/ws/status", get(ws_status_handler))
                 // MCP HTTP endpoints for external control
@@ -4618,6 +4922,7 @@ fn start_web_server() {
                 .route("/api/sessions", get(api_list_sessions).post(api_create_session))
                 .route("/api/sessions/:session_id/buffer", get(api_get_buffer))
                 .route("/api/sessions/:session_id/start", axum::routing::post(api_start_session))
+                .route("/api/sessions/:session_id/interrupt", axum::routing::post(api_interrupt_session))
                 .route("/api/ws/:session_id", get(ws_handler))
                 .route("/api/ws/status", get(ws_status_handler))
                 .layer(CorsLayer::permissive());

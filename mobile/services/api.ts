@@ -131,6 +131,12 @@ class ApiClient {
     });
   }
 
+  async interruptSession(id: string): Promise<{ status: string }> {
+    return this.request<{ status: string }>(`${API_ENDPOINTS.SESSIONS}/${id}/interrupt`, {
+      method: 'POST',
+    });
+  }
+
   async getSession(id: string): Promise<Session> {
     return this.request<Session>(`${API_ENDPOINTS.SESSIONS}/${id}`);
   }

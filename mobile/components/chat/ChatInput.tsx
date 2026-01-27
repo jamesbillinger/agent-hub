@@ -12,11 +12,13 @@ import { COLORS, FONT_SIZES, SPACING } from '../../utils/constants';
 
 interface ChatInputProps {
   onSend: (message: string) => void;
+  onInterrupt?: () => void;
   disabled?: boolean;
+  isProcessing?: boolean;
   placeholder?: string;
 }
 
-export function ChatInput({ onSend, disabled, placeholder = 'Type a message...' }: ChatInputProps) {
+export function ChatInput({ onSend, onInterrupt, disabled, isProcessing, placeholder = 'Type a message...' }: ChatInputProps) {
   const [text, setText] = useState('');
 
   const handleSend = () => {
@@ -28,7 +30,16 @@ export function ChatInput({ onSend, disabled, placeholder = 'Type a message...' 
     setText('');
   };
 
+  const handleInterrupt = () => {
+    if (onInterrupt) {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      onInterrupt();
+    }
+  };
+
   const canSend = text.trim().length > 0 && !disabled;
+  // Show stop button alongside send when processing
+  const showStop = isProcessing && onInterrupt;
 
   return (
     <KeyboardAvoidingView
@@ -48,8 +59,19 @@ export function ChatInput({ onSend, disabled, placeholder = 'Type a message...' 
             editable={!disabled}
             returnKeyType="default"
           />
+          {showStop && (
+            <TouchableOpacity
+              style={[styles.sendButton, styles.stopButton]}
+              onPress={handleInterrupt}
+            >
+              <View style={styles.stopIcon} />
+            </TouchableOpacity>
+          )}
           <TouchableOpacity
-            style={[styles.sendButton, !canSend && styles.sendButtonDisabled]}
+            style={[
+              styles.sendButton,
+              !canSend && styles.sendButtonDisabled
+            ]}
             onPress={handleSend}
             disabled={!canSend}
           >
@@ -100,6 +122,15 @@ const styles = StyleSheet.create({
   },
   sendButtonDisabled: {
     backgroundColor: COLORS.backgroundTertiary,
+  },
+  stopButton: {
+    backgroundColor: '#e74c3c',
+  },
+  stopIcon: {
+    width: 12,
+    height: 12,
+    backgroundColor: COLORS.text,
+    borderRadius: 2,
   },
   sendIcon: {
     width: 16,

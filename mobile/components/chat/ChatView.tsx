@@ -1,5 +1,5 @@
 import React, { useEffect, useCallback, useRef, useState } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, AppState, AppStateStatus } from 'react-native';
 import { MessageList } from './MessageList';
 import { ChatInput } from './ChatInput';
 import { ConnectionStatusBar } from '../common/StatusBar';
@@ -45,8 +45,10 @@ export function ChatView({ sessionId }: ChatViewProps) {
   const [isProcessing, setIsProcessingLocal] = useState(false);
   const [sessionState, setSessionState] = useState<SessionState>('checking');
   const [error, setError] = useState<string | null>(null);
+  const [pendingMessage, setPendingMessage] = useState<string | null>(null);
   const mountedRef = useRef(true);
   const seenMessagesRef = useRef<Set<string>>(new Set());
+  const appStateRef = useRef<AppStateStatus>(AppState.currentState);
 
   // Try to connect to WebSocket (session must already be running)
   const connectWebSocket = useCallback(() => {
@@ -158,8 +160,62 @@ export function ChatView({ sessionId }: ChatViewProps) {
     };
   }, [sessionId, connectWebSocket]);
 
+  // Handle app state changes - reset stuck processing state when returning to foreground
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextAppState: AppStateStatus) => {
+      if (appStateRef.current.match(/inactive|background/) && nextAppState === 'active') {
+        // Returning to foreground - check if we're still actually processing
+        // If not connected, we can't be processing
+        if (!wsManager.isConnected(sessionId)) {
+          setIsProcessingLocal(false);
+        }
+      }
+      appStateRef.current = nextAppState;
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, [sessionId]);
+
+  // Send pending message once connected
+  useEffect(() => {
+    if (pendingMessage && sessionState === 'connected' && wsManager.isConnected(sessionId)) {
+      const content = pendingMessage;
+      setPendingMessage(null);
+
+      // Add user message locally
+      const userMessage: ChatMessageWithId = {
+        type: 'user',
+        message: { role: 'user', content },
+        localId: Math.random().toString(36).substr(2, 9),
+        timestamp: Date.now(),
+      };
+      setMessages(prev => [...prev, userMessage]);
+      setIsProcessingLocal(true);
+
+      const sent = wsManager.send(sessionId, content);
+      if (!sent) {
+        setError('Failed to send message');
+        setIsProcessingLocal(false);
+      }
+    }
+  }, [pendingMessage, sessionState, sessionId]);
+
   const handleSend = useCallback((content: string) => {
+    // If not connected, auto-start the session
     if (!wsManager.isConnected(sessionId)) {
+      if (sessionState === 'inactive' || sessionState === 'disconnected' || sessionState === 'error') {
+        // Queue the message and start the session
+        setPendingMessage(content);
+        handleStartSession();
+        return;
+      }
+      // If already starting or checking, just queue the message
+      if (sessionState === 'starting' || sessionState === 'checking') {
+        setPendingMessage(content);
+        return;
+      }
       setError('Not connected to server');
       return;
     }
@@ -179,7 +235,7 @@ export function ChatView({ sessionId }: ChatViewProps) {
       setError('Failed to send message');
       setIsProcessingLocal(false);
     }
-  }, [sessionId]);
+  }, [sessionId, sessionState, handleStartSession]);
 
   const handleRetry = useCallback(() => {
     setError(null);
@@ -188,6 +244,17 @@ export function ChatView({ sessionId }: ChatViewProps) {
     seenMessagesRef.current.clear();
     connectWebSocket();
   }, [sessionId, connectWebSocket]);
+
+  const handleInterrupt = useCallback(async () => {
+    try {
+      await apiClient.interruptSession(sessionId);
+      // Processing state will be updated when we receive the result message
+    } catch (err) {
+      console.error('Failed to interrupt session:', err);
+      // Reset processing state anyway since interrupt failed
+      setIsProcessingLocal(false);
+    }
+  }, [sessionId]);
 
   // Render based on session state
   if (sessionState === 'checking') {
@@ -202,37 +269,33 @@ export function ChatView({ sessionId }: ChatViewProps) {
     return <ErrorView message={error || 'Unknown error'} onRetry={handleRetry} />;
   }
 
-  if (sessionState === 'inactive' || sessionState === 'disconnected') {
-    return (
-      <View style={styles.container}>
-        <View style={styles.inactiveContainer}>
-          <Text style={styles.inactiveTitle}>Session Inactive</Text>
-          <Text style={styles.inactiveText}>
-            This session is not currently running on the desktop.
-          </Text>
-          <TouchableOpacity style={styles.startButton} onPress={handleStartSession}>
-            <Text style={styles.startButtonText}>Start Session</Text>
-          </TouchableOpacity>
-          {messages.length > 0 && (
-            <Text style={styles.inactiveHint}>
-              Previous messages will be restored when connected.
-            </Text>
-          )}
-        </View>
-      </View>
-    );
-  }
-
+  // For inactive/disconnected states, show the input anyway so user can type and auto-start
   const isConnected = sessionState === 'connected';
 
   return (
     <View style={styles.container}>
       <ConnectionStatusBar connected={isConnected} />
-      <MessageList messages={messages} isProcessing={isProcessing} />
+      {(sessionState === 'inactive' || sessionState === 'disconnected') && messages.length === 0 ? (
+        <View style={styles.inactiveContainer}>
+          <Text style={styles.inactiveTitle}>Session Inactive</Text>
+          <Text style={styles.inactiveText}>
+            Type a message to start the session, or tap below.
+          </Text>
+          <TouchableOpacity style={styles.startButton} onPress={handleStartSession}>
+            <Text style={styles.startButtonText}>Start Session</Text>
+          </TouchableOpacity>
+        </View>
+      ) : (
+        <MessageList messages={messages} isProcessing={isProcessing} />
+      )}
       <ChatInput
         onSend={handleSend}
-        disabled={!isConnected || isProcessing}
-        placeholder={isProcessing ? 'Claude is responding...' : 'Type a message...'}
+        onInterrupt={handleInterrupt}
+        isProcessing={isProcessing}
+        placeholder={
+          !isConnected ? 'Type to start session...' :
+          'Type a message...'
+        }
       />
     </View>
   );
