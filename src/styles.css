@@ -287,11 +287,11 @@ body.resizing-sidebar {
 }
 
 .session-item {
-  padding: 10px 16px;
+  padding: 3px 12px;
   cursor: pointer;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 6px;
   border-left: 3px solid transparent;
   transition: background-color 0.1s;
 }

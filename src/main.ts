@@ -4622,7 +4622,10 @@ async function checkForUpdates(): Promise<void> {
           // Download the update
           let downloaded = 0;
           let contentLength = 0;
+          let downloadComplete = false;
+
           await update.downloadAndInstall((progress) => {
+            console.log("Update progress:", progress.event, "data" in progress ? progress.data : "");
             if (progress.event === "Started") {
               contentLength = (progress.data as { contentLength?: number }).contentLength || 0;
               statusEl.textContent = `Downloading...`;
@@ -4633,15 +4636,37 @@ async function checkForUpdates(): Promise<void> {
                 statusEl.textContent = `Downloading... ${percent}%`;
               }
             } else if (progress.event === "Finished") {
-              statusEl.textContent = "Download complete. Restarting...";
+              downloadComplete = true;
+              statusEl.textContent = "Installing update...";
             }
           });
+
+          if (!downloadComplete) {
+            throw new Error("Download did not complete");
+          }
+
+          statusEl.textContent = "Update installed. Restarting...";
+          console.log("Update installed successfully, relaunching...");
+
+          // Small delay to ensure status is visible
+          await new Promise(resolve => setTimeout(resolve, 500));
 
           // Relaunch the app
           await relaunch();
         } catch (err) {
           console.error("Update install failed:", err);
-          statusEl.textContent = `Install failed: ${err}`;
+          const errMsg = err instanceof Error ? err.message : String(err);
+
+          // Check for common issues
+          if (errMsg.includes("signature")) {
+            statusEl.innerHTML = `<span style="color: var(--error-color)">Update failed: Signature verification failed.<br>Please download manually from GitHub.</span>`;
+          } else if (errMsg.includes("permission") || errMsg.includes("access")) {
+            statusEl.innerHTML = `<span style="color: var(--error-color)">Update failed: Permission denied.<br>Try moving the app or run as admin.</span>`;
+          } else {
+            statusEl.innerHTML = `<span style="color: var(--error-color)">Update failed: ${escapeHtml(errMsg)}</span>`;
+          }
+
+          button.textContent = "Retry";
           button.disabled = false;
         }
       };

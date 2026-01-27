@@ -21,6 +21,25 @@ jobs:
           VERSION=${GITHUB_REF#refs/tags/v}
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
+      - name: Sync version across all config files
+        run: |
+          VERSION=${{ steps.get-version.outputs.version }}
+          echo "Syncing version $VERSION to all config files..."
+
+          # Update Cargo.toml
+          sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
+
+          # Update tauri.conf.json
+          sed -i '' "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" src-tauri/tauri.conf.json
+
+          # Update package.json
+          sed -i '' "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" package.json
+
+          echo "Versions after sync:"
+          grep "^version" src-tauri/Cargo.toml
+          grep '"version"' src-tauri/tauri.conf.json | head -1
+          grep '"version"' package.json | head -1
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
