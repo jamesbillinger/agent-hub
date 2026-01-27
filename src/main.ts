@@ -210,7 +210,7 @@ let recentlyClosed: RecentlyClosedSession[] = [];
 // Agent commands
 const AGENT_COMMANDS: Record<string, string> = {
   claude: "claude --dangerously-skip-permissions",
-  "claude-json": "claude --print --input-format stream-json --output-format stream-json --dangerously-skip-permissions",
+  "claude-json": "claude --print --verbose --input-format stream-json --output-format stream-json --dangerously-skip-permissions",
   codex: "codex --full-auto",
   aider: "aider",
   shell: "$SHELL",
@@ -866,6 +866,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     const session = sessions.get(event.payload.session_id);
     if (session) {
       session.isRunning = true;
+      startingJsonSessions.delete(event.payload.session_id); // Clear starting flag
       const chatSession = chatSessions.get(event.payload.session_id);
       if (chatSession) {
         chatSession.statusEl.textContent = "Connected";
@@ -2111,11 +2112,21 @@ async function startSessionProcess(session: Session) {
 /**
  * Start a JSON streaming process for chat-based sessions.
  */
+// Track sessions currently being started to prevent race conditions
+const startingJsonSessions = new Set<string>();
+
 async function startJsonProcess(session: Session) {
   if (session.isRunning) return;
 
+  // Prevent multiple concurrent start attempts
+  if (startingJsonSessions.has(session.id)) return;
+  startingJsonSessions.add(session.id);
+
   const chatSession = chatSessions.get(session.id);
-  if (!chatSession) return;
+  if (!chatSession) {
+    startingJsonSessions.delete(session.id);
+    return;
+  }
 
   // For claude-json sessions, determine if we should resume
   const shouldResume = session.hasBeenStarted === true && !!session.claudeSessionId;
@@ -2164,6 +2175,8 @@ async function startJsonProcess(session: Session) {
       subtype: "error",
       result: `Failed to start process: ${err}`,
     });
+  } finally {
+    startingJsonSessions.delete(session.id);
   }
 }
 
@@ -4861,7 +4874,7 @@ async function resumeClaudeSession(claudeSessionId: string, project: string): Pr
     id: crypto.randomUUID(),
     name: `Resumed: ${claudeSessionId.substring(0, 8)}...`,
     agentType: "claude-json",
-    command: `claude --print --input-format stream-json --output-format stream-json --dangerously-skip-permissions`,
+    command: `claude --print --verbose --input-format stream-json --output-format stream-json --dangerously-skip-permissions`,
     workingDir: project,
     createdAt: new Date(),
     claudeSessionId: claudeSessionId,
