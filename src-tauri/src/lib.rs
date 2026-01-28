@@ -2094,6 +2094,21 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
       margin-left: auto;
       border-bottom-right-radius: 4px;
     }
+    .chat-msg.user .user-images {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .chat-msg.user .user-image {
+      max-width: 150px;
+      max-height: 100px;
+      border-radius: 6px;
+      object-fit: cover;
+    }
+    .chat-msg.user .user-images:last-child {
+      margin-bottom: 0;
+    }
     .chat-msg.assistant {
       background: #2a2a2a;
       color: #e6e6e6;
@@ -2175,6 +2190,43 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
     #chat-stop {
       background: #e74c3c;
       margin-right: 8px;
+    }
+
+    /* Image preview in chat input */
+    .image-preview {
+      position: relative;
+      margin-bottom: 8px;
+      display: inline-block;
+    }
+    .image-preview img {
+      max-width: 150px;
+      max-height: 100px;
+      border-radius: 8px;
+      object-fit: cover;
+    }
+    .image-preview .remove-preview {
+      position: absolute;
+      top: -8px;
+      right: -8px;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: #e74c3c;
+      color: white;
+      border: none;
+      font-size: 16px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #chat-input-container {
+      flex-direction: column;
+    }
+    #chat-input-row {
+      display: flex;
+      gap: 8px;
+      align-items: flex-end;
     }
 
     /* Paste indicator (shows on long-press) */
@@ -2436,9 +2488,11 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         <div id="chat-container">
           <div id="chat-messages"></div>
           <div id="chat-input-container">
-            <textarea id="chat-input" placeholder="Type a message..." rows="1"></textarea>
-            <button id="chat-stop" style="display: none;">Stop</button>
-            <button id="chat-send">Send</button>
+            <div id="chat-input-row">
+              <textarea id="chat-input" placeholder="Type a message..." rows="1"></textarea>
+              <button id="chat-stop" style="display: none;">Stop</button>
+              <button id="chat-send">Send</button>
+            </div>
           </div>
         </div>
         <div id="status" class="disconnected">Disconnected</div>
@@ -3442,9 +3496,22 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           // Desktop: {"type": "user", "result": "text"}
           // iOS: {"type": "user", "message": {"role": "user", "content": "text"}}
           const userText = msg.result || msg.message?.content;
-          if (!userText?.trim()) return null; // Skip empty
+          const hasImages = msg.images && msg.images.length > 0;
+          if (!userText?.trim() && !hasImages) return null; // Skip empty
           div.classList.add('user');
-          div.textContent = userText;
+
+          let html = '';
+          if (hasImages) {
+            html += '<div class="user-images">';
+            for (const img of msg.images) {
+              html += '<img src="data:' + img.mediaType + ';base64,' + img.base64Data + '" alt="Image" class="user-image" />';
+            }
+            html += '</div>';
+          }
+          if (userText?.trim()) {
+            html += '<div class="user-text">' + escapeHtml(userText) + '</div>';
+          }
+          div.innerHTML = html;
         } else if (msg.type === 'assistant' && msg.message?.content) {
           div.classList.add('assistant');
           let html = '';
@@ -3488,17 +3555,43 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         if (!currentSessionId) return;
         const state = getSessionState(currentSessionId);
         const text = chatInput.value.trim();
-        if (!text || state.isProcessing) return;
+        if (!text && !pendingImage) return;
+        // Allow sending while processing - Claude can queue messages
+
+        // Build message content (text or array with images)
+        let messageContent;
+        const currentImage = pendingImage;
+        if (currentImage) {
+          messageContent = [];
+          messageContent.push({
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: currentImage.mediaType,
+              data: currentImage.base64Data
+            }
+          });
+          if (text) {
+            messageContent.push({ type: 'text', text: text });
+          }
+          // Clear image preview
+          pendingImage = null;
+          const preview = document.querySelector('.image-preview');
+          if (preview) preview.remove();
+        } else {
+          messageContent = text;
+        }
 
         // Auto-start if not connected
         if (!state.chatWs || state.chatWs.readyState !== WebSocket.OPEN) {
           // Store the message we want to send
-          const pendingMessage = text;
+          const pendingMessageContent = messageContent;
           chatInput.value = '';
+          chatInput.style.height = 'auto';
           state.inputValue = '';
 
-          // Show user message immediately
-          const userMsg = { type: 'user', result: pendingMessage };
+          // Show user message immediately (with image if present)
+          const userMsg = { type: 'user', result: text, images: currentImage ? [currentImage] : undefined };
           state.messages.push(userMsg);
           const div = createMessageElement(userMsg);
           if (div) {
@@ -3539,7 +3632,7 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
               // Now send the pending message
               const jsonMsg = JSON.stringify({
                 type: 'user',
-                message: { role: 'user', content: pendingMessage }
+                message: { role: 'user', content: pendingMessageContent }
               }) + '\n';
               state.chatWs.send(jsonMsg);
               status.textContent = 'Thinking...';
@@ -3556,8 +3649,8 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           return;
         }
 
-        // Show user message
-        const userMsg = { type: 'user', result: text };
+        // Show user message (with image if present)
+        const userMsg = { type: 'user', result: text, images: currentImage ? [currentImage] : undefined };
         state.messages.push(userMsg);
         const div = createMessageElement(userMsg);
         if (div) {
@@ -3565,6 +3658,7 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           smartScrollToBottom(true); // Force scroll for user's own message
         }
         chatInput.value = '';
+        chatInput.style.height = 'auto';
         state.inputValue = '';
 
         // Send to server
@@ -3575,7 +3669,7 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
 
         const jsonMsg = JSON.stringify({
           type: 'user',
-          message: { role: 'user', content: text }
+          message: { role: 'user', content: messageContent }
         }) + '\n';
         state.chatWs.send(jsonMsg);
       }
@@ -3593,10 +3687,65 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           sendChatMessage();
         }
       });
-      // Update send button state as user types
+      // Update send button state and auto-resize as user types
       chatInput.addEventListener('input', () => {
         chatSend.disabled = !chatInput.value.trim();
+        // Auto-resize textarea
+        chatInput.style.height = 'auto';
+        chatInput.style.height = Math.min(chatInput.scrollHeight, 120) + 'px';
       });
+
+      // Handle paste for images
+      let pendingImage = null;
+      chatInput.addEventListener('paste', async (e) => {
+        const items = e.clipboardData?.items;
+        if (!items) return;
+
+        for (const item of items) {
+          if (item.type.startsWith('image/')) {
+            e.preventDefault();
+            const file = item.getAsFile();
+            if (!file) continue;
+
+            const reader = new FileReader();
+            reader.onload = () => {
+              const dataUrl = reader.result;
+              // Extract base64 and media type
+              const matches = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+              if (matches) {
+                pendingImage = {
+                  mediaType: matches[1],
+                  base64Data: matches[2]
+                };
+                // Show preview
+                showImagePreview(dataUrl);
+                chatSend.disabled = false;
+              }
+            };
+            reader.readAsDataURL(file);
+            return;
+          }
+        }
+      });
+
+      function showImagePreview(dataUrl) {
+        // Remove any existing preview
+        const existing = document.querySelector('.image-preview');
+        if (existing) existing.remove();
+
+        const preview = document.createElement('div');
+        preview.className = 'image-preview';
+        preview.innerHTML = \`
+          <img src="\${dataUrl}" alt="Pasted image" />
+          <button class="remove-preview">×</button>
+        \`;
+        preview.querySelector('.remove-preview').addEventListener('click', () => {
+          pendingImage = null;
+          preview.remove();
+          chatSend.disabled = !chatInput.value.trim();
+        });
+        document.getElementById('chat-input-container').prepend(preview);
+      }
 
       async function startCurrentSession() {
         if (!currentSessionId) return;
