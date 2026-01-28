@@ -222,6 +222,9 @@ type MobileView = "list" | "session";
 let currentMobileView: MobileView = "list";
 let isMobileLayout = false;
 
+// Render coalescing - prevents redundant re-renders when multiple state changes occur
+let renderSessionListPending = false;
+
 // Recently closed sessions (for undo close) - loaded from database
 let recentlyClosed: RecentlyClosedSession[] = [];
 
@@ -1382,7 +1385,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     await updateSessionOrders(updates);
     isDragging = false;
     draggedSessionId = null;
-    renderSessionList();
+    renderSessionListImmediate(); // Immediate for drag-drop responsiveness
   });
 
   // Load saved sessions from database
@@ -1390,7 +1393,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   await loadRecentlyClosed();
 
   // Initial render
-  renderSessionList();
+  renderSessionListImmediate();
   updateView();
 
   // Check for updates in the background after a short delay
@@ -2500,7 +2503,23 @@ function getFilteredAndSortedSessions(): Session[] {
   return sortedSessions;
 }
 
-function renderSessionList() {
+/**
+ * Schedule a session list render on the next animation frame.
+ * Multiple calls coalesce into a single render, reducing redundant DOM work.
+ */
+function scheduleRenderSessionList() {
+  if (renderSessionListPending) return;
+  renderSessionListPending = true;
+  requestAnimationFrame(() => {
+    renderSessionListPending = false;
+    renderSessionListImmediate();
+  });
+}
+
+/**
+ * Render the session list immediately (use scheduleRenderSessionList for coalescing).
+ */
+function renderSessionListImmediate() {
   sessionListEl.innerHTML = "";
 
   const sortedSessions = getFilteredAndSortedSessions();
@@ -2597,6 +2616,14 @@ function renderSessionList() {
   }
 }
 
+/**
+ * Render session list - coalesces multiple calls into a single RAF render.
+ * For immediate rendering (e.g., after drag-drop), use renderSessionListImmediate().
+ */
+function renderSessionList() {
+  scheduleRenderSessionList();
+}
+
 function startRenaming(sessionId: string, nameEl: HTMLElement) {
   const session = sessions.get(sessionId);
   if (!session) return;
@@ -2616,7 +2643,7 @@ function startRenaming(sessionId: string, nameEl: HTMLElement) {
       finishRename();
     }
     if (e.key === "Escape") {
-      renderSessionList();
+      renderSessionListImmediate(); // Immediate for cancel responsiveness
     }
   });
 
@@ -2858,12 +2885,6 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
 
   // Send on Enter (Shift+Enter for newline)
   inputEl.addEventListener("keydown", (e) => {
-    // Start session if inactive and user types
-    const sess = sessions.get(session.id);
-    if (sess && !sess.isRunning && !e.ctrlKey && !e.metaKey && !e.altKey && e.key.length === 1) {
-      startSessionProcess(sess);
-    }
-
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       sendChatMessage(session.id);
