@@ -3397,6 +3397,19 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
           if (typeof e.data === 'string') {
             try {
               const msg = JSON.parse(e.data);
+              // Skip user messages that we sent ourselves (they have localId we set)
+              // But allow user messages from other clients (they won't have our localId)
+              if (msg.type === 'user') {
+                const incomingContent = msg.message?.content || msg.result;
+                // Check if this matches a message we recently sent (within last 5 messages)
+                const recentUserMsgs = state.messages.filter(m => m.type === 'user').slice(-5);
+                const isDuplicate = recentUserMsgs.some(m => {
+                  const existingContent = m.message?.content || m.result;
+                  return existingContent === incomingContent;
+                });
+                if (isDuplicate) return; // Skip - we already have this message
+              }
+
               state.messages.push(msg);
               // Only update UI if this is the currently viewed session
               if (currentSessionId === sessionId) {
