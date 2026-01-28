@@ -274,7 +274,15 @@ fn get_session_history(session_id: &str) -> Option<Vec<serde_json::Value>> {
     // Load the raw buffer
     let buffer = load_terminal_buffer(session_id.to_string()).ok()??;
 
-    // Parse the NDJSON buffer into messages
+    // Try to parse as JSON array first (desktop format)
+    if let Ok(messages) = serde_json::from_str::<Vec<serde_json::Value>>(&buffer) {
+        if messages.is_empty() {
+            return None;
+        }
+        return Some(messages);
+    }
+
+    // Fall back to NDJSON format (one JSON object per line)
     let mut messages = Vec::new();
     for line in buffer.lines() {
         if line.trim().is_empty() {
