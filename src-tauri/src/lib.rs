@@ -36,6 +36,8 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 #[cfg(not(target_os = "ios"))]
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
+#[cfg(not(target_os = "ios"))]
+use tower_http::services::ServeDir;
 
 // MCP server module for Claude Code integration
 #[cfg(not(target_os = "ios"))]
@@ -110,6 +112,20 @@ static MCP_HTTP_RESULTS: Lazy<Mutex<HashMap<String, Option<String>>>> =
 static PIN_RATE_LIMIT: Lazy<Mutex<HashMap<String, (u32, std::time::Instant)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+// Mobile WebSocket: Channel for sending messages to mobile clients
+// Each mobile client gets a sender that the server can use to push messages
+#[cfg(not(target_os = "ios"))]
+type MobileSender = tokio::sync::mpsc::UnboundedSender<String>;
+#[cfg(not(target_os = "ios"))]
+static MOBILE_CLIENTS: Lazy<Mutex<HashMap<String, MobileClient>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(not(target_os = "ios"))]
+struct MobileClient {
+    sender: MobileSender,
+    subscribed_sessions: std::collections::HashSet<String>,
+}
+
 /// Broadcast a session event to all connected WebSocket clients
 #[cfg(not(target_os = "ios"))]
 fn broadcast_session_event(event_type: &str, data: serde_json::Value) {
@@ -127,6 +143,16 @@ fn broadcast_session_status(session_id: &str, running: bool) {
         "session_id": session_id,
         "running": running
     }));
+
+    // Also broadcast to mobile clients subscribed to this session
+    let msg = serde_json::json!({
+        "type": "session_status",
+        "sessionId": session_id,
+        "status": {
+            "running": running
+        }
+    }).to_string();
+    broadcast_to_session_subscribers(session_id, &msg);
 }
 
 /// Broadcast processing state change (thinking started/stopped)
@@ -136,12 +162,29 @@ fn broadcast_processing_status(session_id: &str, processing: bool) {
         "session_id": session_id,
         "processing": processing
     }));
+
+    // Also broadcast to mobile clients subscribed to this session
+    let msg = serde_json::json!({
+        "type": "session_status",
+        "sessionId": session_id,
+        "status": {
+            "isProcessing": processing
+        }
+    }).to_string();
+    broadcast_to_session_subscribers(session_id, &msg);
 }
 
 /// Broadcast that a session was created
 #[cfg(not(target_os = "ios"))]
 fn broadcast_session_created(session: &SessionData) {
     broadcast_session_event("session_created", serde_json::json!(session));
+
+    // Also broadcast to all mobile clients
+    let msg = serde_json::json!({
+        "type": "session_created",
+        "session": session
+    }).to_string();
+    broadcast_to_mobile_clients(&msg);
 }
 
 /// Broadcast that a session was deleted
@@ -150,12 +193,103 @@ fn broadcast_session_deleted(session_id: &str) {
     broadcast_session_event("session_deleted", serde_json::json!({
         "session_id": session_id
     }));
+
+    // Also broadcast to all mobile clients
+    let msg = serde_json::json!({
+        "type": "session_deleted",
+        "sessionId": session_id
+    }).to_string();
+    broadcast_to_mobile_clients(&msg);
 }
 
 /// Broadcast that a session was updated
 #[cfg(not(target_os = "ios"))]
 fn broadcast_session_updated(session: &SessionData) {
     broadcast_session_event("session_updated", serde_json::json!(session));
+
+    // Also broadcast to all mobile clients
+    let msg = serde_json::json!({
+        "type": "session_updated",
+        "session": session
+    }).to_string();
+    broadcast_to_mobile_clients(&msg);
+}
+
+/// Send a message to all mobile clients
+#[cfg(not(target_os = "ios"))]
+fn broadcast_to_mobile_clients(msg: &str) {
+    let clients = MOBILE_CLIENTS.lock();
+    for client in clients.values() {
+        let _ = client.sender.send(msg.to_string());
+    }
+}
+
+/// Send a message to mobile clients subscribed to a specific session
+#[cfg(not(target_os = "ios"))]
+fn broadcast_to_session_subscribers(session_id: &str, msg: &str) {
+    let clients = MOBILE_CLIENTS.lock();
+    for client in clients.values() {
+        if client.subscribed_sessions.contains(session_id) {
+            let _ = client.sender.send(msg.to_string());
+        }
+    }
+}
+
+/// Broadcast session list to all mobile clients
+#[cfg(not(target_os = "ios"))]
+fn broadcast_session_list_to_mobile() {
+    let sessions = load_sessions().unwrap_or_default();
+    let json_running: std::collections::HashSet<String> = {
+        let broadcasters = JSON_BROADCASTERS.lock();
+        broadcasters.keys().cloned().collect()
+    };
+    let pty_running: std::collections::HashSet<String> = {
+        let pty_sessions = PTY_SESSIONS.lock();
+        pty_sessions.keys().cloned().collect()
+    };
+
+    let sessions_with_status: Vec<serde_json::Value> = sessions.iter().map(|s| {
+        let running = json_running.contains(&s.id) || pty_running.contains(&s.id);
+        serde_json::json!({
+            "id": s.id,
+            "name": s.name,
+            "created_at": s.created_at,
+            "agent_type": s.agent_type,
+            "working_dir": s.working_dir,
+            "running": running,
+        })
+    }).collect();
+
+    let msg = serde_json::json!({
+        "type": "session_list",
+        "sessions": sessions_with_status
+    }).to_string();
+
+    broadcast_to_mobile_clients(&msg);
+}
+
+/// Get session history for mobile clients (returns JSON messages parsed from buffer)
+#[cfg(not(target_os = "ios"))]
+fn get_session_history(session_id: &str) -> Option<Vec<serde_json::Value>> {
+    // Load the raw buffer
+    let buffer = load_terminal_buffer(session_id.to_string()).ok()??;
+
+    // Parse the NDJSON buffer into messages
+    let mut messages = Vec::new();
+    for line in buffer.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+            messages.push(json);
+        }
+    }
+
+    if messages.is_empty() {
+        None
+    } else {
+        Some(messages)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1310,8 +1444,15 @@ fn spawn_json_process(
                         "session_id": session_id_stdout,
                         "data": &data
                     }));
-                    // Broadcast to WebSocket clients (for mobile web)
-                    let _ = broadcast_stdout.send(data);
+                    // Broadcast to WebSocket clients (for mobile web - legacy single-session connections)
+                    let _ = broadcast_stdout.send(data.clone());
+                    // Broadcast to mobile WebSocket subscribers (new multiplexed connections)
+                    let msg = serde_json::json!({
+                        "type": "chat_message",
+                        "sessionId": session_id_stdout,
+                        "message": &data
+                    }).to_string();
+                    broadcast_to_session_subscribers(&session_id_stdout, &msg);
                 }
             });
 
@@ -1328,8 +1469,15 @@ fn spawn_json_process(
                         "session_id": session_id_stderr,
                         "data": &data
                     }));
-                    // Broadcast to WebSocket clients (for mobile web)
-                    let _ = broadcast_stderr.send(data);
+                    // Broadcast to WebSocket clients (for mobile web - legacy single-session connections)
+                    let _ = broadcast_stderr.send(data.clone());
+                    // Broadcast to mobile WebSocket subscribers (new multiplexed connections)
+                    let msg = serde_json::json!({
+                        "type": "chat_message",
+                        "sessionId": session_id_stderr,
+                        "message": &data
+                    }).to_string();
+                    broadcast_to_session_subscribers(&session_id_stderr, &msg);
                 }
             });
 
@@ -1872,2040 +2020,40 @@ const WEB_PORT_MAX_ATTEMPTS: u16 = 10;
 #[cfg(not(debug_assertions))]
 const WEB_PORT_MAX_ATTEMPTS: u16 = 1; // Prod doesn't fallback - it owns port 3847
 
-// Mobile web client with Messages-style navigation
-const MOBILE_HTML: &str = r#"<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <title>{{APP_NAME}}</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body {
-      background: #1a1a1a;
-      color: #e6e6e6;
-      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-      height: 100%;
-      width: 100%;
-      overflow: hidden;
-      position: fixed;
-    }
-
-    /* Navigation container - handles slide transitions */
-    #nav-container {
-      display: flex;
-      width: 200%;
-      height: 100%;
-      transition: transform 0.3s ease-out;
-    }
-    #nav-container.show-session {
-      transform: translateX(-50%);
-    }
-
-    /* Sessions List View */
-    #sessions-view {
-      width: 50%;
-      height: 100%;
-      display: flex;
-      flex-direction: column;
-      flex-shrink: 0;
-    }
-
-    .view-header {
-      padding: 12px 16px;
-      padding-top: max(12px, env(safe-area-inset-top));
-      background: #252526;
-      border-bottom: 1px solid #3c3c3c;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      flex-shrink: 0;
-    }
-    .view-header h1 {
-      font-size: 20px;
-      font-weight: 600;
-    }
-    .view-header-actions {
-      display: flex;
-      gap: 8px;
-    }
-    .view-header button {
-      padding: 8px 12px;
-      background: transparent;
-      border: none;
-      color: #0e9fd8;
-      font-size: 16px;
-      cursor: pointer;
-    }
-    .view-header button:active {
-      opacity: 0.6;
-    }
-
-    #session-list {
-      flex: 1;
-      overflow-y: auto;
-      -webkit-overflow-scrolling: touch;
-    }
-    .session-item {
-      display: flex;
-      align-items: center;
-      padding: 14px 16px;
-      border-bottom: 1px solid #3c3c3c;
-      cursor: pointer;
-      transition: background-color 0.1s;
-    }
-    .session-item:active {
-      background: #2a2a2a;
-    }
-    .session-status {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      margin-right: 12px;
-      flex-shrink: 0;
-    }
-    .session-status.running { background: #4ec9b0; }
-    .session-status.stopped { background: #555; }
-    .session-info {
-      flex: 1;
-      min-width: 0;
-    }
-    .session-name {
-      font-size: 16px;
-      font-weight: 500;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .session-meta {
-      font-size: 13px;
-      color: #808080;
-      margin-top: 2px;
-    }
-    .session-chevron {
-      color: #555;
-      font-size: 18px;
-      margin-left: 8px;
-    }
-
-    .empty-state {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      padding: 40px;
-      color: #808080;
-    }
-    .empty-state-icon { font-size: 48px; margin-bottom: 16px; opacity: 0.5; }
-    .empty-state h2 { font-size: 18px; margin-bottom: 8px; color: #aaa; }
-
-    /* Session Detail View */
-    #session-view {
-      width: 50%;
-      height: 100%;
-      display: flex;
-      flex-direction: column;
-      flex-shrink: 0;
-    }
-
-    .session-header {
-      padding: 12px 16px;
-      padding-top: max(12px, env(safe-area-inset-top));
-      background: #252526;
-      border-bottom: 1px solid #3c3c3c;
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      flex-shrink: 0;
-    }
-    .back-btn {
-      padding: 8px;
-      margin: -8px;
-      margin-right: 0;
-      background: none;
-      border: none;
-      color: #0e9fd8;
-      font-size: 18px;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      gap: 4px;
-    }
-    .back-btn:active { opacity: 0.6; }
-    .session-title {
-      flex: 1;
-      font-size: 17px;
-      font-weight: 600;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .start-btn {
-      padding: 6px 14px;
-      background: #388a34;
-      border: none;
-      border-radius: 6px;
-      color: white;
-      font-size: 14px;
-      font-weight: 500;
-      cursor: pointer;
-    }
-    .start-btn:disabled { background: #555; }
-
-    #terminal-container {
-      flex: 1;
-      padding: 4px;
-      overflow: hidden;
-      position: relative;
-      /* Shrinks when keyboard appears */
-      min-height: 0;
-    }
-
-    /* Chat container for JSON sessions */
-    #chat-container {
-      flex: 1;
-      display: none;
-      flex-direction: column;
-      min-height: 0;
-    }
-    #chat-container.active {
-      display: flex;
-    }
-    #chat-messages {
-      flex: 1;
-      overflow-y: auto;
-      -webkit-overflow-scrolling: touch;
-      padding: 12px;
-    }
-    .chat-msg {
-      margin-bottom: 12px;
-      padding: 10px 14px;
-      border-radius: 12px;
-      max-width: 85%;
-      word-wrap: break-word;
-    }
-    .chat-msg.user {
-      background: #0e9fd8;
-      color: white;
-      margin-left: auto;
-      border-bottom-right-radius: 4px;
-    }
-    .chat-msg.user .user-images {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-bottom: 8px;
-    }
-    .chat-msg.user .user-image {
-      max-width: 150px;
-      max-height: 100px;
-      border-radius: 6px;
-      object-fit: cover;
-    }
-    .chat-msg.user .user-images:last-child {
-      margin-bottom: 0;
-    }
-    .chat-msg.assistant {
-      background: #2a2a2a;
-      color: #e6e6e6;
-      border-bottom-left-radius: 4px;
-    }
-    .chat-msg.system {
-      background: transparent;
-      color: #808080;
-      font-size: 12px;
-      text-align: center;
-      max-width: 100%;
-      padding: 4px;
-    }
-    .chat-msg.tool-use {
-      background: #1e3a4c;
-      color: #4ec9b0;
-      font-size: 13px;
-    }
-    .chat-msg pre {
-      margin: 8px 0 0 0;
-      padding: 8px;
-      background: rgba(0,0,0,0.3);
-      border-radius: 6px;
-      overflow-x: auto;
-      white-space: pre-wrap;
-      font-size: 12px;
-    }
-    .chat-msg code {
-      font-family: Menlo, Monaco, monospace;
-      font-size: 13px;
-    }
-    .chat-msg :not(pre) > code {
-      background: rgba(0,0,0,0.3);
-      padding: 2px 6px;
-      border-radius: 4px;
-    }
-    .chat-msg p { margin: 0 0 8px 0; }
-    .chat-msg p:last-child { margin-bottom: 0; }
-    #chat-input-container {
-      display: flex;
-      gap: 8px;
-      padding: 8px 12px;
-      padding-bottom: max(8px, env(safe-area-inset-bottom));
-      background: #252526;
-      border-top: 1px solid #3c3c3c;
-    }
-    #chat-input {
-      flex: 1;
-      padding: 10px 14px;
-      border: 1px solid #3c3c3c;
-      border-radius: 20px;
-      background: #1a1a1a;
-      color: #e6e6e6;
-      font-size: 16px;
-      resize: none;
-      min-height: 40px;
-      max-height: 120px;
-      font-family: inherit;
-    }
-    #chat-input:focus {
-      outline: none;
-      border-color: #0e9fd8;
-    }
-    #chat-send, #chat-stop {
-      padding: 10px 16px;
-      color: white;
-      border: none;
-      border-radius: 20px;
-      font-size: 14px;
-      font-weight: 500;
-      cursor: pointer;
-    }
-    #chat-send {
-      background: #0e9fd8;
-    }
-    #chat-send:disabled {
-      background: #555;
-    }
-    #chat-stop {
-      background: #e74c3c;
-      margin-right: 8px;
-    }
-
-    /* Image preview in chat input */
-    .image-preview {
-      position: relative;
-      margin-bottom: 8px;
-      display: inline-block;
-    }
-    .image-preview img {
-      max-width: 150px;
-      max-height: 100px;
-      border-radius: 8px;
-      object-fit: cover;
-    }
-    .image-preview .remove-preview {
-      position: absolute;
-      top: -8px;
-      right: -8px;
-      width: 24px;
-      height: 24px;
-      border-radius: 50%;
-      background: #e74c3c;
-      color: white;
-      border: none;
-      font-size: 16px;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    #chat-input-container {
-      flex-direction: column;
-    }
-    #chat-input-row {
-      display: flex;
-      gap: 8px;
-      align-items: flex-end;
-    }
-
-    /* Paste indicator (shows on long-press) */
-    #paste-indicator {
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%);
-      padding: 12px 24px;
-      background: rgba(14, 99, 156, 0.95);
-      border-radius: 8px;
-      color: white;
-      font-size: 16px;
-      font-weight: 500;
-      z-index: 30;
-      display: none;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
-    }
-    #paste-indicator.visible { display: block; }
-    #terminal-container .xterm { height: 100%; width: 100%; }
-    #terminal-container .xterm-viewport {
-      overflow-y: auto !important;
-    }
-    /* Touch overlay for iOS scroll fix */
-    #touch-overlay {
-      display: none;
-      position: absolute;
-      top: 0; left: 0; right: 0; bottom: 0;
-      z-index: 10;
-      touch-action: pan-y;
-    }
-    @media (pointer: coarse) {
-      #touch-overlay { display: block; }
-    }
-
-    #status {
-      padding: 6px 16px;
-      padding-bottom: max(6px, env(safe-area-inset-bottom));
-      background: #252526;
-      font-size: 12px;
-      color: #808080;
-      flex-shrink: 0;
-    }
-    .connected { color: #4ec9b0 !important; }
-    .disconnected { color: #f14c4c !important; }
-
-    /* Pairing screen */
-    #pairing-screen {
-      display: none;
-      position: fixed;
-      top: 0; left: 0; right: 0; bottom: 0;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      padding: 20px;
-      text-align: center;
-      background: #1a1a1a;
-      z-index: 100;
-    }
-    #pairing-screen h2 { margin-bottom: 20px; font-size: 24px; }
-    #pairing-screen p { margin-bottom: 20px; color: #808080; }
-    #pairing-screen input {
-      width: 200px;
-      padding: 12px;
-      font-size: 24px;
-      text-align: center;
-      letter-spacing: 8px;
-      background: #3c3c3c;
-      border: 1px solid #5a5a5a;
-      border-radius: 8px;
-      color: #e6e6e6;
-      margin-bottom: 16px;
-    }
-    #pairing-screen button {
-      padding: 14px 28px;
-      font-size: 16px;
-      background: #0e639c;
-      border: none;
-      border-radius: 8px;
-      color: white;
-      cursor: pointer;
-    }
-    #pairing-screen button:disabled { background: #555; }
-    #pairing-screen .error { color: #f14c4c; margin-top: 12px; }
-
-    /* Auth Tabs */
-    #auth-tabs {
-      display: flex;
-      gap: 8px;
-      margin-bottom: 20px;
-    }
-    .auth-tab {
-      flex: 1;
-      padding: 10px;
-      background: #3c3c3c;
-      border: 1px solid #5a5a5a;
-      border-radius: 8px;
-      color: #808080;
-      font-size: 14px;
-      cursor: pointer;
-    }
-    .auth-tab.active {
-      background: #0e639c;
-      border-color: #1177bb;
-      color: white;
-    }
-    #pin-auth input, #pairing-auth input {
-      width: 100%;
-      padding: 16px;
-      font-size: 24px;
-      text-align: center;
-      letter-spacing: 8px;
-      background: #3c3c3c;
-      border: 1px solid #5a5a5a;
-      border-radius: 8px;
-      color: #e6e6e6;
-      margin-bottom: 16px;
-    }
-    #pin-auth input { letter-spacing: 2px; }
-
-    /* New Session Modal */
-    .modal-overlay {
-      display: none;
-      position: fixed;
-      top: 0; left: 0; right: 0; bottom: 0;
-      background: rgba(0,0,0,0.7);
-      z-index: 1000;
-      align-items: flex-end;
-      justify-content: center;
-    }
-    .modal-overlay.visible { display: flex; }
-    .modal-content {
-      background: #252526;
-      border-radius: 12px 12px 0 0;
-      padding: 20px;
-      padding-bottom: max(20px, env(safe-area-inset-bottom));
-      width: 100%;
-      max-height: 80vh;
-      overflow-y: auto;
-    }
-    .modal-content h3 { margin-bottom: 20px; font-size: 20px; text-align: center; }
-    .modal-content .form-group { margin-bottom: 16px; }
-    .modal-content label { display: block; margin-bottom: 6px; font-size: 14px; color: #808080; }
-    .modal-content input, .modal-content select {
-      width: 100%;
-      padding: 12px;
-      background: #3c3c3c;
-      border: 1px solid #5a5a5a;
-      border-radius: 8px;
-      color: #e6e6e6;
-      font-size: 16px;
-    }
-    .modal-content .modal-actions {
-      display: flex;
-      gap: 10px;
-      margin-top: 24px;
-    }
-    .modal-content .modal-actions button {
-      flex: 1;
-      padding: 14px;
-      border: none;
-      border-radius: 8px;
-      font-size: 16px;
-      font-weight: 500;
-      cursor: pointer;
-    }
-    .modal-content .cancel-btn { background: #5a5a5a; color: #e6e6e6; }
-    .modal-content .create-btn { background: #388a34; color: white; }
-    .modal-content .create-btn:disabled { background: #555; }
-    .modal-content .error { color: #f14c4c; margin-top: 8px; font-size: 14px; text-align: center; }
-
-    #main-app { display: none; height: 100%; }
-  </style>
-</head>
-<body>
-  <!-- Pairing Screen -->
-  <div id="pairing-screen">
-    <h2>Connect to Agent Hub</h2>
-    <div id="auth-tabs" style="display:none;">
-      <button class="auth-tab active" data-tab="pin">PIN</button>
-      <button class="auth-tab" data-tab="pairing">Pairing Code</button>
-    </div>
-    <!-- PIN Auth -->
-    <div id="pin-auth" style="display:none;">
-      <p id="pin-status">Enter your remote access PIN</p>
-      <input type="password" id="pin-input" maxlength="20" placeholder="PIN" autocomplete="off" inputmode="numeric">
-      <button id="pin-submit">Connect</button>
-      <p class="error" id="pin-error"></p>
-    </div>
-    <!-- Pairing Code Auth (existing) -->
-    <div id="pairing-auth">
-      <p id="pairing-status">Enter the code shown on your desktop</p>
-      <input type="text" id="pairing-code" maxlength="6" placeholder="000000" autocomplete="off" inputmode="numeric">
-      <button id="pairing-submit">Pair</button>
-      <p class="error" id="pairing-error"></p>
-    </div>
-  </div>
-
-  <!-- New Session Modal -->
-  <div id="new-session-modal" class="modal-overlay">
-    <div class="modal-content">
-      <h3>New Session</h3>
-      <div class="form-group">
-        <label for="new-session-name">Session Name (optional)</label>
-        <input type="text" id="new-session-name" placeholder="My Session">
-      </div>
-      <div class="form-group">
-        <label for="new-session-agent">Agent Type</label>
-        <select id="new-session-agent">
-          <option value="claude-json">Claude</option>
-          <option value="claude">Claude (xterm)</option>
-          <option value="aider">Aider</option>
-          <option value="shell">Shell</option>
-          <option value="custom">Custom</option>
-        </select>
-      </div>
-      <div class="form-group" id="custom-command-group" style="display:none;">
-        <label for="new-session-command">Custom Command</label>
-        <input type="text" id="new-session-command" placeholder="/bin/zsh">
-      </div>
-      <div class="form-group">
-        <label for="new-session-dir">Working Directory (optional)</label>
-        <input type="text" id="new-session-dir" placeholder="~/dev/pplsi">
-      </div>
-      <p class="error" id="new-session-error"></p>
-      <div class="modal-actions">
-        <button class="cancel-btn" id="new-session-cancel">Cancel</button>
-        <button class="create-btn" id="new-session-create">Create</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Main App with slide navigation -->
-  <div id="main-app">
-    <div id="nav-container">
-      <!-- Sessions List View -->
-      <div id="sessions-view">
-        <div class="view-header">
-          <h1>Sessions</h1>
-          <div class="view-header-actions">
-            <button id="refresh-btn" title="Refresh">↻</button>
-            <button id="new-btn" title="New Session">+</button>
-          </div>
-        </div>
-        <div id="session-list"></div>
-      </div>
-
-      <!-- Session Detail View -->
-      <div id="session-view">
-        <div class="session-header">
-          <button class="back-btn" id="back-btn">‹ Back</button>
-          <span class="session-title" id="session-title">Session</span>
-          <button class="start-btn" id="start-btn" style="display:none;">Start</button>
-        </div>
-        <div id="terminal-container">
-          <div id="touch-overlay"></div>
-          <div id="paste-indicator">Paste</div>
-        </div>
-        <div id="chat-container">
-          <div id="chat-messages"></div>
-          <div id="chat-input-container">
-            <div id="chat-input-row">
-              <textarea id="chat-input" placeholder="Type a message..." rows="1"></textarea>
-              <button id="chat-stop" style="display: none;">Stop</button>
-              <button id="chat-send">Send</button>
-            </div>
-          </div>
-        </div>
-        <div id="status" class="disconnected">Disconnected</div>
-      </div>
-    </div>
-  </div>
-
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
-  <script>
-    // Auth token management
-    const TOKEN_KEY = 'agent_hub_token';
-    function getToken() { return localStorage.getItem(TOKEN_KEY); }
-    function setToken(t) { localStorage.setItem(TOKEN_KEY, t); }
-    function clearToken() { localStorage.removeItem(TOKEN_KEY); }
-
-    // Fetch with auth
-    async function authFetch(url, options = {}) {
-      const token = getToken();
-      const headers = { ...options.headers };
-      if (token) headers['Authorization'] = `Bearer ${token}`;
-      const res = await fetch(url, { ...options, headers });
-      if (res.status === 401) {
-        clearToken();
-        showPairingScreen();
-        throw new Error('Unauthorized');
-      }
-      return res;
-    }
-
-    // UI elements
-    const pairingScreen = document.getElementById('pairing-screen');
-    const mainApp = document.getElementById('main-app');
-    const navContainer = document.getElementById('nav-container');
-    const sessionList = document.getElementById('session-list');
-    const sessionTitle = document.getElementById('session-title');
-    const startBtn = document.getElementById('start-btn');
-    const status = document.getElementById('status');
-    let pairingId = null;
-
-    function showPairingScreen() {
-      pairingScreen.style.display = 'flex';
-      mainApp.style.display = 'none';
-    }
-
-    function showMainApp() {
-      pairingScreen.style.display = 'none';
-      mainApp.style.display = 'block';
-      initMainApp();
-    }
-
-    // Navigation functions
-    function showSessionsList() {
-      navContainer.classList.remove('show-session');
-      // Don't close WebSockets - keep them alive for background updates
-      // if (ws) ws.close();
-      history.replaceState(null, '', window.location.pathname);
-    }
-
-    function showSessionView(sessionId) {
-      navContainer.classList.add('show-session');
-      window.location.hash = sessionId;
-      // Fit terminal after transition
-      setTimeout(() => {
-        if (fitAddon) fitAddon.fit();
-      }, 350);
-    }
-
-    // Pairing flow
-    async function requestPairing() {
-      document.getElementById('pairing-status').textContent = 'Requesting pairing code...';
-      try {
-        const res = await fetch('/api/auth/request-pairing', { method: 'POST' });
-        const data = await res.json();
-        pairingId = data.pairing_id;
-        document.getElementById('pairing-status').textContent = 'Enter the code shown on your desktop';
-        document.getElementById('pairing-code').focus();
-      } catch (e) {
-        document.getElementById('pairing-error').textContent = 'Failed to request pairing';
-      }
-    }
-
-    async function submitPairing() {
-      const code = document.getElementById('pairing-code').value;
-      const btn = document.getElementById('pairing-submit');
-      const error = document.getElementById('pairing-error');
-
-      if (!code || code.length !== 6) {
-        error.textContent = 'Please enter a 6-digit code';
-        return;
-      }
-      if (!pairingId) {
-        error.textContent = 'No pairing request active';
-        return;
-      }
-
-      btn.disabled = true;
-      btn.textContent = 'Pairing...';
-      error.textContent = '';
-
-      try {
-        const res = await fetch('/api/auth/pair', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pairing_id: pairingId, code, device_name: 'Mobile Browser' })
-        });
-        const data = await res.json();
-        if (data.token) {
-          setToken(data.token);
-          showMainApp();
-        } else {
-          error.textContent = data.message || 'Pairing failed';
-        }
-      } catch (e) {
-        error.textContent = 'Failed to pair';
-      }
-      btn.disabled = false;
-      btn.textContent = 'Pair';
-    }
-
-    // Check auth on load
-    async function checkAuth() {
-      // First check if PIN is configured
-      await checkPinStatus();
-
-      if (!getToken()) {
-        showPairingScreen();
-        // Only auto-request pairing if PIN is not configured
-        if (!pinConfigured) {
-          requestPairing();
-        }
-        return;
-      }
-
-      try {
-        const res = await fetch('/api/auth/check', {
-          headers: { 'Authorization': `Bearer ${getToken()}` }
-        });
-        const data = await res.json();
-        if (data.authenticated) {
-          showMainApp();
-        } else {
-          localStorage.removeItem('agent_hub_token');
-          showPairingScreen();
-          if (!pinConfigured) {
-            requestPairing();
-          }
-        }
-      } catch (e) {
-        showPairingScreen();
-        if (!pinConfigured) {
-          requestPairing();
-        }
-      }
-    }
-
-    // PIN authentication
-    let pinConfigured = false;
-
-    async function checkPinStatus() {
-      try {
-        const res = await fetch('/api/auth/pin-status');
-        const data = await res.json();
-        pinConfigured = data.pin_configured;
-        if (pinConfigured) {
-          document.getElementById('auth-tabs').style.display = 'flex';
-          document.getElementById('pin-auth').style.display = 'block';
-          document.getElementById('pairing-auth').style.display = 'none';
-        }
-      } catch (e) {
-        // PIN status check failed - fall through to pairing auth
-      }
-    }
-
-    function switchAuthTab(tab) {
-      document.querySelectorAll('.auth-tab').forEach(t => t.classList.remove('active'));
-      document.querySelector(`.auth-tab[data-tab="${tab}"]`).classList.add('active');
-
-      if (tab === 'pin') {
-        document.getElementById('pin-auth').style.display = 'block';
-        document.getElementById('pairing-auth').style.display = 'none';
-        document.getElementById('pin-input').focus();
-      } else {
-        document.getElementById('pin-auth').style.display = 'none';
-        document.getElementById('pairing-auth').style.display = 'block';
-        document.getElementById('pairing-code').focus();
-        if (!pairingId) requestPairing();
-      }
-    }
-
-    async function submitPin() {
-      const pin = document.getElementById('pin-input').value;
-      const btn = document.getElementById('pin-submit');
-      const error = document.getElementById('pin-error');
-
-      if (!pin) {
-        error.textContent = 'Please enter your PIN';
-        return;
-      }
-
-      btn.disabled = true;
-      btn.textContent = 'Connecting...';
-      error.textContent = '';
-
-      try {
-        const res = await fetch('/api/auth/pin-login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pin, device_name: 'Mobile Browser (PIN)' })
-        });
-        const data = await res.json();
-        if (data.token) {
-          setToken(data.token);
-          showMainApp();
-        } else {
-          error.textContent = data.message || 'Invalid PIN';
-        }
-      } catch (e) {
-        error.textContent = 'Failed to connect';
-      }
-      btn.disabled = false;
-      btn.textContent = 'Connect';
-    }
-
-    // Auth tab event listeners
-    document.querySelectorAll('.auth-tab').forEach(tab => {
-      tab.addEventListener('click', () => switchAuthTab(tab.dataset.tab));
-    });
-
-    // PIN event listeners
-    document.getElementById('pin-submit').addEventListener('click', submitPin);
-    document.getElementById('pin-input').addEventListener('keyup', (e) => {
-      if (e.key === 'Enter') submitPin();
-    });
-
-    // Pairing event listeners
-    document.getElementById('pairing-submit').addEventListener('click', submitPairing);
-    document.getElementById('pairing-code').addEventListener('keyup', (e) => {
-      if (e.key === 'Enter') submitPairing();
-    });
-
-    // Main app initialization
-    let term, fitAddon;
-    let ws = null;
-    let sessionsData = [];
-    let currentSessionId = null;
-    let dataHandler = null;
-    let resizeHandler = null;
-
-    // Global status WebSocket - stays connected for status updates
-    let statusWs = null;
-    const runningSessionIds = new Set();
-    const processingSessionIds = new Set();
-
-    // Per-session state management (keeps connections alive across navigation)
-    const sessionStates = new Map(); // sessionId -> { chatWs, messages: [], isProcessing, isAtBottom }
-
-    // Connect to global status WebSocket for session events
-    function connectStatusWebSocket() {
-      if (statusWs && statusWs.readyState === WebSocket.OPEN) return;
-      if (statusWs) statusWs.close();
-
-      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      statusWs = new WebSocket(`${protocol}//${location.host}/api/ws/status`);
-
-      statusWs.onopen = () => {
-        console.log('Status WebSocket connected');
-      };
-
-      statusWs.onclose = () => {
-        console.log('Status WebSocket closed, reconnecting in 2s...');
-        setTimeout(connectStatusWebSocket, 2000);
-      };
-
-      statusWs.onmessage = (e) => {
-        try {
-          const event = JSON.parse(e.data);
-          handleStatusEvent(event);
-        } catch (err) {
-          console.warn('Failed to parse status event:', e.data);
-        }
-      };
-    }
-
-    function handleStatusEvent(event) {
-      const { type, data } = event;
-
-      switch (type) {
-        case 'session_status': {
-          const { session_id, running } = data;
-          if (running) {
-            runningSessionIds.add(session_id);
-          } else {
-            runningSessionIds.delete(session_id);
-            processingSessionIds.delete(session_id);
-          }
-          // Update session list UI
-          updateSessionListUI();
-          // Update current session UI if applicable
-          if (currentSessionId === session_id) {
-            updateCurrentSessionUI();
-          }
-          break;
-        }
-
-        case 'processing_status': {
-          const { session_id, processing } = data;
-          if (processing) {
-            processingSessionIds.add(session_id);
-          } else {
-            processingSessionIds.delete(session_id);
-          }
-          // Update current session UI if this is the viewed session
-          if (currentSessionId === session_id) {
-            const state = getSessionState(session_id);
-            state.isProcessing = processing;
-            updateProcessingUI(processing);
-          }
-          break;
-        }
-
-        case 'session_created':
-        case 'session_deleted':
-        case 'session_updated':
-          // Reload session list
-          loadSessions();
-          break;
-      }
-    }
-
-    function updateSessionListUI() {
-      // Update the running indicators in the session list
-      document.querySelectorAll('.session-item').forEach(item => {
-        const sessionId = item.dataset.sessionId;
-        const statusDot = item.querySelector('.session-status');
-        if (statusDot) {
-          const isRunning = runningSessionIds.has(sessionId);
-          statusDot.className = 'session-status ' + (isRunning ? 'running' : 'stopped');
-        }
-      });
-    }
-
-    function updateCurrentSessionUI() {
-      if (!currentSessionId) return;
-      const session = sessionsData.find(s => s.id === currentSessionId);
-      if (!session) return;
-
-      const isRunning = runningSessionIds.has(currentSessionId);
-      const isProcessing = processingSessionIds.has(currentSessionId);
-
-      // Update start button visibility
-      startBtn.style.display = isRunning ? 'none' : 'inline-block';
-
-      // Update processing UI
-      const state = getSessionState(currentSessionId);
-      state.isProcessing = isProcessing;
-      updateProcessingUI(isProcessing);
-
-      // Update connection status
-      if (isRunning && state.chatWs && state.chatWs.readyState === WebSocket.OPEN) {
-        status.textContent = isProcessing ? 'Thinking...' : 'Connected';
-        status.className = 'connected';
-      } else if (isRunning) {
-        status.textContent = 'Connecting...';
-        status.className = '';
-      } else {
-        status.textContent = 'Session stopped';
-        status.className = 'disconnected';
-      }
-    }
-
-    function initMainApp() {
-      if (term) return;
-
-      // Connect global status WebSocket immediately
-      connectStatusWebSocket();
-
-      term = new Terminal({
-        fontSize: 14,
-        fontFamily: 'Menlo, Monaco, monospace',
-        theme: { background: '#1a1a1a', foreground: '#e6e6e6' },
-        scrollback: 5000
-      });
-      fitAddon = new FitAddon.FitAddon();
-      term.loadAddon(fitAddon);
-      term.open(document.getElementById('terminal-container'));
-
-      // Fix iOS keyboard input - enable autocorrect/autocomplete
-      const textarea = document.querySelector('#terminal-container textarea');
-      if (textarea) {
-        textarea.setAttribute('autocomplete', 'on');
-        textarea.setAttribute('autocorrect', 'on');
-        textarea.setAttribute('autocapitalize', 'sentences');
-        textarea.setAttribute('spellcheck', 'true');
-      }
-
-      // Mobile momentum scrolling
-      setupMobileTouchScroll();
-
-      // Long-press to paste handler
-      const pasteIndicator = document.getElementById('paste-indicator');
-      let longPressTimer = null;
-      const LONG_PRESS_DURATION = 500; // ms
-
-      async function doPaste() {
-        try {
-          const text = await navigator.clipboard.readText();
-          if (text && ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(text);
-            // Brief feedback
-            pasteIndicator.textContent = 'Pasted!';
-            pasteIndicator.classList.add('visible');
-            setTimeout(() => {
-              pasteIndicator.classList.remove('visible');
-              pasteIndicator.textContent = 'Paste';
-            }, 500);
-          }
-        } catch (e) {
-          console.error('Paste failed:', e);
-          pasteIndicator.textContent = 'Paste failed';
-          pasteIndicator.classList.add('visible');
-          setTimeout(() => {
-            pasteIndicator.classList.remove('visible');
-            pasteIndicator.textContent = 'Paste';
-          }, 1000);
-        }
-      }
-
-      // Add long-press detection to touch overlay
-      const overlay = document.getElementById('touch-overlay');
-      overlay.addEventListener('touchstart', (e) => {
-        longPressTimer = setTimeout(() => {
-          pasteIndicator.classList.add('visible');
-          doPaste();
-          longPressTimer = null;
-        }, LONG_PRESS_DURATION);
-      }, { passive: true });
-
-      overlay.addEventListener('touchend', () => {
-        if (longPressTimer) {
-          clearTimeout(longPressTimer);
-          longPressTimer = null;
-        }
-      }, { passive: true });
-
-      overlay.addEventListener('touchmove', () => {
-        // Cancel long-press if user moves finger (scrolling)
-        if (longPressTimer) {
-          clearTimeout(longPressTimer);
-          longPressTimer = null;
-        }
-      }, { passive: true });
-
-      // Handle iOS keyboard resize using visualViewport
-      if (window.visualViewport) {
-        const sessionView = document.getElementById('session-view');
-        window.visualViewport.addEventListener('resize', () => {
-          if (navContainer.classList.contains('show-session')) {
-            // Adjust height when keyboard appears/disappears
-            const vh = window.visualViewport.height;
-            sessionView.style.height = vh + 'px';
-            fitAddon.fit();
-            term.scrollToBottom();
-          }
-        });
-        window.visualViewport.addEventListener('scroll', () => {
-          // Prevent iOS from scrolling the page when keyboard opens
-          window.scrollTo(0, 0);
-        });
-      }
-
-      window.addEventListener('resize', () => {
-        if (navContainer.classList.contains('show-session')) {
-          fitAddon.fit();
-        }
-      });
-
-      initSessionHandlers();
-    }
-
-    // Mobile touch scrolling with momentum
-    // Uses a touch overlay to capture events before xterm.js
-    function setupMobileTouchScroll() {
-      const overlay = document.getElementById('touch-overlay');
-      if (!overlay || !('ontouchstart' in window)) return;
-
-      let touchStartY = 0, touchStartX = 0, lastTouchY = 0, lastTouchTime = 0;
-      let velocity = 0, momentumId = null, isScrolling = false;
-      let accumulatedScroll = 0;
-      const velocitySamples = [];
-      const friction = 0.94, minVelocity = 0.3;
-      const SCROLL_THRESHOLD = 5; // Pixels before we decide it's a scroll vs tap
-
-      function cancelMomentum() {
-        if (momentumId) { cancelAnimationFrame(momentumId); momentumId = null; }
-        velocity = 0;
-        accumulatedScroll = 0;
-      }
-
-      function scrollByPixels(pixels) {
-        if (!term) return;
-        const lineHeight = 17; // Approximate, works well enough
-        accumulatedScroll += pixels / lineHeight;
-        const lines = Math.trunc(accumulatedScroll);
-        if (lines !== 0) {
-          term.scrollLines(lines);
-          accumulatedScroll -= lines;
-        }
-      }
-
-      overlay.addEventListener('touchstart', (e) => {
-        cancelMomentum();
-        const touch = e.touches[0];
-        touchStartY = lastTouchY = touch.clientY;
-        touchStartX = touch.clientX;
-        lastTouchTime = performance.now();
-        velocitySamples.length = 0;
-        isScrolling = false;
-      }, { passive: true });
-
-      overlay.addEventListener('touchmove', (e) => {
-        const touch = e.touches[0];
-        const deltaY = lastTouchY - touch.clientY;
-        const totalDeltaY = touchStartY - touch.clientY;
-        const totalDeltaX = touchStartX - touch.clientX;
-        const currentTime = performance.now();
-        const deltaTime = currentTime - lastTouchTime;
-
-        // Determine if this is a scroll gesture (vertical) vs something else
-        if (!isScrolling && Math.abs(totalDeltaY) > SCROLL_THRESHOLD) {
-          // More vertical than horizontal = scroll
-          if (Math.abs(totalDeltaY) > Math.abs(totalDeltaX)) {
-            isScrolling = true;
-          }
-        }
-
-        if (isScrolling) {
-          scrollByPixels(deltaY);
-          e.preventDefault(); // Prevent page scroll
-
-          if (deltaTime > 0) {
-            velocitySamples.push({ dy: deltaY, dt: deltaTime });
-            if (velocitySamples.length > 5) velocitySamples.shift();
-          }
-        }
-
-        lastTouchY = touch.clientY;
-        lastTouchTime = currentTime;
-      }, { passive: false });
-
-      overlay.addEventListener('touchend', (e) => {
-        // If it was a tap (not a scroll), focus terminal for keyboard
-        if (!isScrolling) {
-          term?.focus();
-        }
-
-        if (!isScrolling) return;
-
-        // Calculate momentum
-        if (velocitySamples.length > 0) {
-          let totalDy = 0, totalDt = 0;
-          velocitySamples.forEach(s => { totalDy += s.dy; totalDt += s.dt; });
-          velocity = totalDt > 0 ? (totalDy / totalDt) * 16 : 0;
-        }
-
-        if (Math.abs(velocity) > minVelocity) {
-          function animate() {
-            if (Math.abs(velocity) < minVelocity) { cancelMomentum(); return; }
-            scrollByPixels(velocity);
-            velocity *= friction;
-            momentumId = requestAnimationFrame(animate);
-          }
-          momentumId = requestAnimationFrame(animate);
-        }
-
-        isScrolling = false;
-      }, { passive: true });
-    }
-
-    function initSessionHandlers() {
-      // Check if a session has an active WebSocket connection
-      function isSessionConnected(sessionId) {
-        const state = sessionStates.get(sessionId);
-        if (!state) return false;
-        // Check chat WebSocket for JSON sessions
-        if (state.chatWs && state.chatWs.readyState === WebSocket.OPEN) return true;
-        return false;
-      }
-
-      // Render sessions list
-      function renderSessionsList() {
-        if (sessionsData.length === 0) {
-          sessionList.innerHTML = `
-            <div class="empty-state">
-              <div class="empty-state-icon">⌘</div>
-              <h2>No Sessions</h2>
-              <p>Tap + to create your first session</p>
-            </div>
-          `;
-          return;
-        }
-
-        sessionList.innerHTML = sessionsData.map(s => {
-          // Use actual connection state OR API running state
-          const isRunning = s.running || isSessionConnected(s.id);
-          return `
-          <div class="session-item" data-id="${s.id}">
-            <div class="session-status ${isRunning ? 'running' : 'stopped'}"></div>
-            <div class="session-info">
-              <div class="session-name">${escapeHtml(s.name)}</div>
-              <div class="session-meta">${s.agent_type}${s.working_dir ? ' • ' + s.working_dir : ''}</div>
-            </div>
-            <span class="session-chevron">›</span>
-          </div>
-        `}).join('');
-
-        // Add click handlers
-        sessionList.querySelectorAll('.session-item').forEach(item => {
-          item.addEventListener('click', () => openSession(item.dataset.id));
-        });
-      }
-
-      function escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
-      }
-
-      async function loadSessions() {
-        try {
-          const res = await authFetch('/api/sessions');
-          sessionsData = await res.json();
-          // Sync running state from session data
-          runningSessionIds.clear();
-          sessionsData.forEach(s => {
-            if (s.running) runningSessionIds.add(s.id);
-          });
-          renderSessionsList();
-        } catch (e) {
-          console.error('Failed to load sessions', e);
-        }
-      }
-
-      // Check if session uses JSON chat interface
-      function isJsonSession(session) {
-        return session.agent_type === 'claude-json';
-      }
-
-      async function openSession(sessionId, autoStart = false) {
-        // Save current input value before switching
-        if (currentSessionId) {
-          const prevState = getSessionState(currentSessionId);
-          prevState.inputValue = chatInput.value;
-        }
-
-        currentSessionId = sessionId;
-        const session = sessionsData.find(s => s.id === sessionId);
-        if (!session) return;
-
-        // Restore input value for new session
-        const newState = getSessionState(sessionId);
-        chatInput.value = newState.inputValue || '';
-
-        sessionTitle.textContent = session.name;
-        showSessionView(sessionId);
-
-        // Toggle between terminal and chat UI based on session type
-        const terminalContainer = document.getElementById('terminal-container');
-        const chatContainer = document.getElementById('chat-container');
-
-        // Check actual connection state, not just API data
-        const isConnected = isSessionConnected(sessionId);
-        const isRunning = session.running || isConnected;
-
-        if (isJsonSession(session)) {
-          terminalContainer.style.display = 'none';
-          chatContainer.classList.add('active');
-          if (isRunning) {
-            // Session is running - always refresh history and ensure WebSocket is connected
-            startBtn.style.display = 'none';
-            await loadChatHistory(sessionId);
-            if (!isConnected) {
-              connectChatWebSocket(sessionId);
-            } else {
-              // Already connected - just update status
-              status.textContent = 'Connected';
-              status.className = 'connected';
-              chatSend.disabled = false;
-            }
-          } else if (autoStart) {
-            startBtn.style.display = 'none';
-            await startCurrentSession();
-          } else {
-            startBtn.style.display = 'inline-block';
-            await loadChatHistory(sessionId);
-          }
-        } else {
-          chatContainer.classList.remove('active');
-          terminalContainer.style.display = 'block';
-          if (session.running) {
-            startBtn.style.display = 'none';
-            connectWebSocket(sessionId);
-          } else if (autoStart) {
-            startBtn.style.display = 'none';
-            await startCurrentSession();
-          } else {
-            startBtn.style.display = 'inline-block';
-            await showBuffer(sessionId);
-          }
-        }
-      }
-
-      async function showBuffer(sessionId) {
-        term.clear();
-        status.textContent = 'Loading history...';
-        status.className = 'disconnected';
-        try {
-          const res = await authFetch(`/api/sessions/${sessionId}/buffer`);
-          const data = await res.json();
-          if (data.buffer) {
-            term.write(data.buffer);
-            term.scrollToBottom(); // Scroll to latest content
-            status.textContent = 'Viewing saved history (tap Start to resume)';
-          } else {
-            status.textContent = 'No history - tap Start to begin';
-          }
-        } catch (e) {
-          status.textContent = 'Failed to load history';
-        }
-      }
-
-      function connectWebSocket(sessionId) {
-        if (ws) ws.close();
-        if (dataHandler) dataHandler.dispose();
-        if (resizeHandler) resizeHandler.dispose();
-
-        term.clear();
-        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = new WebSocket(`${protocol}//${location.host}/api/ws/${sessionId}`);
-        ws.binaryType = 'arraybuffer';
-
-        ws.onopen = () => {
-          status.textContent = 'Connected';
-          status.className = 'connected';
-          ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
-        };
-        ws.onclose = () => {
-          status.textContent = 'Disconnected';
-          status.className = 'disconnected';
-
-          // Auto-reconnect if session is still running
-          const session = sessionsData.find(s => s.id === sessionId);
-          if (session && session.running) {
-            console.log('Terminal WebSocket closed, reconnecting in 2s...');
-            setTimeout(() => {
-              if (currentSessionId === sessionId) {
-                connectWebSocket(sessionId);
-              }
-            }, 2000);
-          }
-        };
-        ws.onmessage = (e) => {
-          if (e.data instanceof ArrayBuffer) {
-            term.write(new Uint8Array(e.data));
-            // Auto-scroll to bottom on new output
-            term.scrollToBottom();
-          }
-        };
-
-        dataHandler = term.onData(data => {
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(data);
-          }
-        });
-
-        resizeHandler = term.onResize(({ cols, rows }) => {
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'resize', cols, rows }));
-          }
-        });
-      }
-
-      // Chat functions for JSON sessions
-      const chatMessagesContainer = document.getElementById('chat-messages');
-      const chatInput = document.getElementById('chat-input');
-      const chatSend = document.getElementById('chat-send');
-      const chatStop = document.getElementById('chat-stop');
-
-      // Update UI based on processing state - separate Stop and Send buttons
-      function updateProcessingUI(isProcessing) {
-        // Show/hide stop button based on processing state
-        chatStop.style.display = isProcessing ? 'inline-block' : 'none';
-        // Send button always available when there's text (input never disabled)
-        chatSend.disabled = !chatInput.value.trim();
-      }
-
-      // Interrupt handler
-      async function interruptSession() {
-        if (!currentSessionId) return;
-        const state = getSessionState(currentSessionId);
-
-        try {
-          await authFetch(`/api/sessions/${currentSessionId}/interrupt`, { method: 'POST' });
-          // UI will update when we receive the result message or websocket closes
-        } catch (e) {
-          console.error('Failed to interrupt:', e);
-          // Reset UI anyway
-          state.isProcessing = false;
-          updateProcessingUI(false);
-          status.textContent = 'Interrupted';
-        }
-      }
-
-      // Handle page visibility changes - reset stuck state
-      document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible' && currentSessionId) {
-          const state = getSessionState(currentSessionId);
-          // If we think we're processing but WebSocket is not open, reset
-          if (state.isProcessing && (!state.chatWs || state.chatWs.readyState !== WebSocket.OPEN)) {
-            state.isProcessing = false;
-            updateProcessingUI(false);
-            status.textContent = 'Disconnected';
-            status.className = 'disconnected';
-          }
-        }
-      });
-
-      function getSessionState(sessionId) {
-        if (!sessionStates.has(sessionId)) {
-          sessionStates.set(sessionId, {
-            chatWs: null,
-            messages: [],
-            isProcessing: false,
-            inputValue: '',
-            isAtBottom: true
-          });
-        }
-        return sessionStates.get(sessionId);
-      }
-
-      // Check if chat container is scrolled to bottom (with tolerance)
-      function isScrolledToBottom() {
-        const tolerance = 50; // pixels
-        return chatMessagesContainer.scrollHeight - chatMessagesContainer.scrollTop - chatMessagesContainer.clientHeight < tolerance;
-      }
-
-      // Smart scroll - only auto-scroll if user was already at bottom
-      function smartScrollToBottom(forceScroll = false) {
-        if (!currentSessionId) return;
-        const state = getSessionState(currentSessionId);
-        if (forceScroll || state.isAtBottom) {
-          chatMessagesContainer.scrollTop = chatMessagesContainer.scrollHeight;
-        }
-      }
-
-      // Track scroll position
-      chatMessagesContainer.addEventListener('scroll', () => {
-        if (!currentSessionId) return;
-        const state = getSessionState(currentSessionId);
-        state.isAtBottom = isScrolledToBottom();
-      });
-
-      function renderSessionMessages(sessionId) {
-        const state = getSessionState(sessionId);
-        chatMessagesContainer.innerHTML = '';
-        state.messages.forEach(msg => {
-          const div = createMessageElement(msg);
-          if (div) chatMessagesContainer.appendChild(div);
-        });
-        // Always scroll to bottom on initial render
-        chatMessagesContainer.scrollTop = chatMessagesContainer.scrollHeight;
-        state.isAtBottom = true;
-      }
-
-      async function loadChatHistory(sessionId) {
-        const state = getSessionState(sessionId);
-        status.textContent = 'Loading chat history...';
-        status.className = 'disconnected';
-
-        // If we already have messages cached, just render them
-        if (state.messages.length > 0) {
-          renderSessionMessages(sessionId);
-          if (state.chatWs && state.chatWs.readyState === WebSocket.OPEN) {
-            status.textContent = 'Connected';
-            status.className = 'connected';
-          } else {
-            status.textContent = 'Viewing chat history (tap Start to resume)';
-          }
-          return;
-        }
-
-        try {
-          const res = await authFetch(`/api/sessions/${sessionId}/buffer`);
-          const data = await res.json();
-          if (data.buffer) {
-            try {
-              const messages = JSON.parse(data.buffer);
-              state.messages = messages;
-              renderSessionMessages(sessionId);
-              status.textContent = 'Viewing chat history (tap Start to resume)';
-            } catch (e) {
-              status.textContent = 'Chat history format error';
-            }
-          } else {
-            status.textContent = 'No chat history - tap Start to begin';
-          }
-        } catch (e) {
-          status.textContent = 'Failed to load chat history';
-        }
-      }
-
-      function connectChatWebSocket(sessionId) {
-        const state = getSessionState(sessionId);
-
-        // If already connected, just update UI
-        if (state.chatWs && state.chatWs.readyState === WebSocket.OPEN) {
-          status.textContent = 'Connected';
-          status.className = 'connected';
-          updateProcessingUI(state.isProcessing);
-          return;
-        }
-
-        // Close old connection if exists
-        if (state.chatWs) state.chatWs.close();
-
-        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        state.chatWs = new WebSocket(`${protocol}//${location.host}/api/ws/${sessionId}`);
-
-        state.chatWs.onopen = () => {
-          if (currentSessionId === sessionId) {
-            status.textContent = 'Connected';
-            status.className = 'connected';
-            updateProcessingUI(state.isProcessing);
-          }
-        };
-        state.chatWs.onclose = () => {
-          if (currentSessionId === sessionId) {
-            status.textContent = 'Disconnected';
-            status.className = 'disconnected';
-            state.isProcessing = false;
-            updateProcessingUI(false);
-
-            // Auto-reconnect if session is still running
-            const session = sessionsData.find(s => s.id === sessionId);
-            if (session && session.running) {
-              console.log('Chat WebSocket closed, reconnecting in 2s...');
-              setTimeout(() => {
-                if (currentSessionId === sessionId) {
-                  connectChatWebSocket(sessionId);
-                }
-              }, 2000);
-            }
-          }
-        };
-        state.chatWs.onmessage = (e) => {
-          if (typeof e.data === 'string') {
-            try {
-              const msg = JSON.parse(e.data);
-              // Skip user messages that we sent ourselves (they have localId we set)
-              // But allow user messages from other clients (they won't have our localId)
-              if (msg.type === 'user') {
-                const incomingContent = msg.message?.content || msg.result;
-                // Check if this matches a message we recently sent (within last 5 messages)
-                const recentUserMsgs = state.messages.filter(m => m.type === 'user').slice(-5);
-                const isDuplicate = recentUserMsgs.some(m => {
-                  const existingContent = m.message?.content || m.result;
-                  return existingContent === incomingContent;
-                });
-                if (isDuplicate) return; // Skip - we already have this message
-              }
-
-              state.messages.push(msg);
-              // Only update UI if this is the currently viewed session
-              if (currentSessionId === sessionId) {
-                const div = createMessageElement(msg);
-                if (div) {
-                  chatMessagesContainer.appendChild(div);
-                  smartScrollToBottom(); // Only scroll if user was at bottom
-                }
-                if (msg.type === 'result') {
-                  state.isProcessing = false;
-                  processingSessionIds.delete(sessionId);
-                  updateProcessingUI(false);
-                  status.textContent = 'Done';
-                  status.className = 'connected';
-                }
-              }
-            } catch (err) {
-              console.warn('Failed to parse message:', e.data);
-            }
-          }
-        };
-      }
-
-      function createMessageElement(msg) {
-        const div = document.createElement('div');
-        div.className = 'chat-msg';
-
-        if (msg.type === 'user') {
-          // Handle multiple formats:
-          // Desktop: {"type": "user", "result": "text"}
-          // iOS: {"type": "user", "message": {"role": "user", "content": "text"}}
-          // Claude array format: {"type": "user", "message": {"content": [{"type": "text", "text": "..."}]}}
-          let userText = msg.result;
-          let userImages = msg.images || [];
-
-          if (!userText && msg.message?.content) {
-            if (typeof msg.message.content === 'string') {
-              userText = msg.message.content;
-            } else if (Array.isArray(msg.message.content)) {
-              // Extract text and images from content array
-              for (const block of msg.message.content) {
-                if (block.type === 'text' && block.text) {
-                  userText = (userText || '') + block.text;
-                } else if (block.type === 'image' && block.source) {
-                  userImages.push({
-                    mediaType: block.source.media_type,
-                    base64Data: block.source.data
-                  });
-                }
-              }
-            }
-          }
-
-          const hasImages = userImages.length > 0;
-          if (!userText?.trim() && !hasImages) return null; // Skip empty
-          div.classList.add('user');
-
-          let html = '';
-          if (hasImages) {
-            html += '<div class="user-images">';
-            for (const img of userImages) {
-              html += '<img src="data:' + img.mediaType + ';base64,' + img.base64Data + '" alt="Image" class="user-image" />';
-            }
-            html += '</div>';
-          }
-          if (userText?.trim()) {
-            html += '<div class="user-text">' + escapeHtml(userText) + '</div>';
-          }
-          div.innerHTML = html;
-        } else if (msg.type === 'assistant' && msg.message?.content) {
-          div.classList.add('assistant');
-          let html = '';
-          for (const block of msg.message.content) {
-            if (block.type === 'text' && block.text) {
-              // Simple markdown: code blocks, inline code, bold
-              let text = escapeHtml(block.text);
-              // Code blocks
-              text = text.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
-              // Inline code
-              text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
-              // Bold
-              text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-              // Paragraphs
-              text = text.split('\n\n').map(p => '<p>' + p + '</p>').join('');
-              html += text;
-            } else if (block.type === 'tool_use') {
-              div.classList.remove('assistant');
-              div.classList.add('tool-use');
-              html += '<strong>' + escapeHtml(block.name || 'Tool') + '</strong>';
-              if (block.input) {
-                html += '<pre><code>' + escapeHtml(JSON.stringify(block.input, null, 2)) + '</code></pre>';
-              }
-            }
-          }
-          div.innerHTML = html || '(empty)';
-        } else if (msg.type === 'system' && msg.subtype === 'init') {
-          div.classList.add('system');
-          div.textContent = 'Session started • ' + (msg.model || 'Claude');
-        } else if (msg.type === 'result' && msg.is_error) {
-          div.classList.add('system');
-          div.style.color = '#f14c4c';
-          div.textContent = 'Error: ' + msg.result;
-        } else {
-          return null; // Skip other types
-        }
-        return div;
-      }
-
-      async function sendChatMessage() {
-        if (!currentSessionId) return;
-        const state = getSessionState(currentSessionId);
-        const text = chatInput.value.trim();
-        if (!text && !pendingImage) return;
-        // Allow sending while processing - Claude can queue messages
-
-        // Build message content (text or array with images)
-        let messageContent;
-        const currentImage = pendingImage;
-        if (currentImage) {
-          messageContent = [];
-          messageContent.push({
-            type: 'image',
-            source: {
-              type: 'base64',
-              media_type: currentImage.mediaType,
-              data: currentImage.base64Data
-            }
-          });
-          if (text) {
-            messageContent.push({ type: 'text', text: text });
-          }
-          // Clear image preview
-          pendingImage = null;
-          const preview = document.querySelector('.image-preview');
-          if (preview) preview.remove();
-        } else {
-          messageContent = text;
-        }
-
-        // Auto-start if not connected
-        if (!state.chatWs || state.chatWs.readyState !== WebSocket.OPEN) {
-          // Store the message we want to send
-          const pendingMessageContent = messageContent;
-          chatInput.value = '';
-          chatInput.style.height = 'auto';
-          state.inputValue = '';
-
-          // Show user message immediately (with image if present)
-          const userMsg = { type: 'user', result: text, images: currentImage ? [currentImage] : undefined };
-          state.messages.push(userMsg);
-          const div = createMessageElement(userMsg);
-          if (div) {
-            chatMessagesContainer.appendChild(div);
-            smartScrollToBottom(true); // Force scroll for user's own message
-          }
-
-          state.isProcessing = true;
-          updateProcessingUI(true);
-          status.textContent = 'Starting session...';
-          status.className = '';
-
-          // Start the session
-          try {
-            const res = await authFetch(`/api/sessions/${currentSessionId}/start`, { method: 'POST' });
-            const data = await res.json();
-            if (data.status === 'started' || data.status === 'already_running') {
-              await loadSessions();
-              startBtn.style.display = 'none';
-
-              // Connect and wait for WebSocket to open
-              await new Promise((resolve, reject) => {
-                connectChatWebSocket(currentSessionId);
-                const checkInterval = setInterval(() => {
-                  const newState = getSessionState(currentSessionId);
-                  if (newState.chatWs && newState.chatWs.readyState === WebSocket.OPEN) {
-                    clearInterval(checkInterval);
-                    resolve();
-                  }
-                }, 100);
-                // Timeout after 10 seconds
-                setTimeout(() => {
-                  clearInterval(checkInterval);
-                  reject(new Error('Connection timeout'));
-                }, 10000);
-              });
-
-              // Now send the pending message
-              const jsonMsg = JSON.stringify({
-                type: 'user',
-                message: { role: 'user', content: pendingMessageContent }
-              }) + '\n';
-              state.chatWs.send(jsonMsg);
-              status.textContent = 'Thinking...';
-            } else {
-              status.textContent = 'Failed to start session';
-              state.isProcessing = false;
-              updateProcessingUI(false);
-            }
-          } catch (e) {
-            status.textContent = 'Failed to start session';
-            state.isProcessing = false;
-            updateProcessingUI(false);
-          }
-          return;
-        }
-
-        // Show user message (with image if present)
-        const userMsg = { type: 'user', result: text, images: currentImage ? [currentImage] : undefined };
-        state.messages.push(userMsg);
-        const div = createMessageElement(userMsg);
-        if (div) {
-          chatMessagesContainer.appendChild(div);
-          smartScrollToBottom(true); // Force scroll for user's own message
-        }
-        chatInput.value = '';
-        chatInput.style.height = 'auto';
-        state.inputValue = '';
-
-        // Send to server
-        state.isProcessing = true;
-        updateProcessingUI(true);
-        status.textContent = 'Thinking...';
-        status.className = '';
-
-        const jsonMsg = JSON.stringify({
-          type: 'user',
-          message: { role: 'user', content: messageContent }
-        }) + '\n';
-        state.chatWs.send(jsonMsg);
-      }
-
-      // Separate buttons for send and stop
-      chatSend.addEventListener('click', () => {
-        sendChatMessage();
-      });
-      chatStop.addEventListener('click', () => {
-        interruptSession();
-      });
-      chatInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
-          e.preventDefault();
-          sendChatMessage();
-        }
-      });
-      // Update send button state and auto-resize as user types
-      chatInput.addEventListener('input', () => {
-        chatSend.disabled = !chatInput.value.trim();
-        // Auto-resize textarea
-        chatInput.style.height = 'auto';
-        chatInput.style.height = Math.min(chatInput.scrollHeight, 120) + 'px';
-      });
-
-      // Handle paste for images
-      let pendingImage = null;
-      chatInput.addEventListener('paste', async (e) => {
-        const items = e.clipboardData?.items;
-        if (!items) return;
-
-        for (const item of items) {
-          if (item.type.startsWith('image/')) {
-            e.preventDefault();
-            const file = item.getAsFile();
-            if (!file) continue;
-
-            const reader = new FileReader();
-            reader.onload = () => {
-              const dataUrl = reader.result;
-              // Extract base64 and media type
-              const matches = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
-              if (matches) {
-                pendingImage = {
-                  mediaType: matches[1],
-                  base64Data: matches[2]
-                };
-                // Show preview
-                showImagePreview(dataUrl);
-                chatSend.disabled = false;
-              }
-            };
-            reader.readAsDataURL(file);
-            return;
-          }
-        }
-      });
-
-      function showImagePreview(dataUrl) {
-        // Remove any existing preview
-        const existing = document.querySelector('.image-preview');
-        if (existing) existing.remove();
-
-        const preview = document.createElement('div');
-        preview.className = 'image-preview';
-        preview.innerHTML = \`
-          <img src="\${dataUrl}" alt="Pasted image" />
-          <button class="remove-preview">×</button>
-        \`;
-        preview.querySelector('.remove-preview').addEventListener('click', () => {
-          pendingImage = null;
-          preview.remove();
-          chatSend.disabled = !chatInput.value.trim();
-        });
-        document.getElementById('chat-input-container').prepend(preview);
-      }
-
-      async function startCurrentSession() {
-        if (!currentSessionId) return;
-        const session = sessionsData.find(s => s.id === currentSessionId);
-        if (!session) return;
-
-        startBtn.disabled = true;
-        startBtn.textContent = 'Starting...';
-        try {
-          const res = await authFetch(`/api/sessions/${currentSessionId}/start`, { method: 'POST' });
-          const data = await res.json();
-          if (data.status === 'started' || data.status === 'already_running') {
-            await loadSessions();
-            startBtn.style.display = 'none';
-            // Use appropriate connection for session type
-            if (isJsonSession(session)) {
-              connectChatWebSocket(currentSessionId);
-            } else {
-              connectWebSocket(currentSessionId);
-            }
-          } else {
-            status.textContent = 'Failed to start session';
-          }
-        } catch (e) {
-          status.textContent = 'Failed to start session';
-        }
-        startBtn.disabled = false;
-        startBtn.textContent = 'Start';
-      }
-
-      // Event listeners
-      document.getElementById('back-btn').addEventListener('click', () => {
-        showSessionsList();
-        loadSessions(); // Refresh list when going back
-      });
-
-      startBtn.addEventListener('click', startCurrentSession);
-      document.getElementById('refresh-btn').addEventListener('click', loadSessions);
-
-      // Handle browser back button
-      window.addEventListener('popstate', () => {
-        if (!window.location.hash) {
-          showSessionsList();
-        }
-      });
-
-      // New Session Modal handlers
-      const newSessionModal = document.getElementById('new-session-modal');
-      const newSessionName = document.getElementById('new-session-name');
-      const newSessionAgent = document.getElementById('new-session-agent');
-      const newSessionCommand = document.getElementById('new-session-command');
-      const newSessionDir = document.getElementById('new-session-dir');
-      const customCommandGroup = document.getElementById('custom-command-group');
-      const newSessionError = document.getElementById('new-session-error');
-      const newSessionCreate = document.getElementById('new-session-create');
-
-      newSessionAgent.addEventListener('change', () => {
-        customCommandGroup.style.display = newSessionAgent.value === 'custom' ? 'block' : 'none';
-      });
-
-      document.getElementById('new-btn').addEventListener('click', () => {
-        newSessionModal.classList.add('visible');
-        newSessionName.value = '';
-        newSessionAgent.value = 'claude';
-        newSessionCommand.value = '';
-        newSessionDir.value = '';
-        newSessionError.textContent = '';
-        customCommandGroup.style.display = 'none';
-        setTimeout(() => newSessionName.focus(), 100);
-      });
-
-      document.getElementById('new-session-cancel').addEventListener('click', () => {
-        newSessionModal.classList.remove('visible');
-      });
-      newSessionModal.addEventListener('click', (e) => {
-        if (e.target === newSessionModal) newSessionModal.classList.remove('visible');
-      });
-
-      async function createNewSession() {
-        const name = newSessionName.value.trim();
-        const agentType = newSessionAgent.value;
-        const customCommand = newSessionCommand.value.trim();
-        const workingDir = newSessionDir.value.trim() || '~/dev/pplsi';
-
-        newSessionCreate.disabled = true;
-        newSessionCreate.textContent = 'Creating...';
-        newSessionError.textContent = '';
-
-        try {
-          const res = await authFetch('/api/sessions', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              name: name || null,
-              agent_type: agentType,
-              custom_command: agentType === 'custom' ? customCommand : null,
-              working_dir: workingDir
-            })
-          });
-          const data = await res.json();
-          if (data.id) {
-            newSessionModal.classList.remove('visible');
-            await loadSessions();
-            // Open and auto-start the new session
-            openSession(data.id, true);
-          } else {
-            newSessionError.textContent = data.error || 'Failed to create session';
-          }
-        } catch (e) {
-          newSessionError.textContent = 'Failed to create session';
-        }
-        newSessionCreate.disabled = false;
-        newSessionCreate.textContent = 'Create';
-      }
-
-      newSessionCreate.addEventListener('click', createNewSession);
-
-      // Load sessions and check for deep link
-      loadSessions().then(() => {
-        const sessionId = window.location.hash.slice(1);
-        if (sessionId) {
-          openSession(sessionId);
-        }
-      });
-
-      // Connect to status WebSocket for real-time session updates
-      connectStatusWebSocket();
-    }
-
-    // Start auth check
-    checkAuth();
-  </script>
-</body>
-</html>"#;
 
 // GET / - Serve mobile web client
 async fn web_index() -> impl IntoResponse {
-    let html = MOBILE_HTML.replace("{{APP_NAME}}", APP_NAME);
-    axum::response::Html(html)
+    // Find the React app's index.html
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+
+    // Try multiple locations for the mobile-web-dist directory
+    let possible_paths = [
+        exe_dir.as_ref().map(|d| d.join("mobile-web-dist/index.html")),
+        exe_dir.as_ref().map(|d| d.join("../Resources/mobile-web-dist/index.html")),
+        Some(std::path::PathBuf::from("mobile-web-dist/index.html")),
+    ];
+
+    for path_opt in possible_paths.iter().flatten() {
+        if path_opt.exists() {
+            if let Ok(contents) = std::fs::read_to_string(path_opt) {
+                return axum::response::Html(contents);
+            }
+        }
+    }
+
+    // Error - mobile-web-dist not found
+    axum::response::Html(format!(
+        r#"<!DOCTYPE html>
+<html><head><title>{}</title></head>
+<body style="background:#1a1a1a;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+<div style="text-align:center">
+<h1>Mobile Web Not Found</h1>
+<p>The mobile-web-dist directory was not found. Please rebuild the application.</p>
+</div></body></html>"#,
+        APP_NAME
+    ))
 }
 
 // Extract auth token from request headers
@@ -4704,7 +2852,6 @@ async fn handle_ws(socket: WebSocket, session_id: String) {
         });
 
         // Handle incoming messages from WebSocket (user input for JSON process)
-        let session_id_for_recv = session_id.clone();
         let recv_task = tokio::spawn(async move {
             while let Some(Ok(msg)) = receiver.next().await {
                 match msg {
@@ -4899,6 +3046,270 @@ async fn ws_status_handler(_ws: WebSocketUpgrade) -> impl IntoResponse {
     (StatusCode::NOT_IMPLEMENTED, "Status WebSocket not supported on iOS")
 }
 
+// Mobile WebSocket handler - multiplexed connection with auth and subscriptions
+#[cfg(not(target_os = "ios"))]
+async fn ws_mobile_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(handle_ws_mobile)
+}
+
+#[cfg(not(target_os = "ios"))]
+async fn handle_ws_mobile(socket: WebSocket) {
+    use tokio::time::{interval, Duration};
+
+    let (mut sender, mut receiver) = socket.split();
+    let client_id = generate_token();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    // We'll authenticate on first message, so track auth state
+    let mut authenticated = false;
+
+    // Register client (not yet authenticated)
+    {
+        let mut clients = MOBILE_CLIENTS.lock();
+        clients.insert(client_id.clone(), MobileClient {
+            sender: tx.clone(),
+            subscribed_sessions: std::collections::HashSet::new(),
+        });
+    }
+
+    let client_id_for_cleanup = client_id.clone();
+
+    // Spawn task to forward messages from channel to WebSocket
+    let send_task = tokio::spawn(async move {
+        let mut ping_interval = interval(Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Some(text) => {
+                            if sender.send(Message::Text(text)).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    if sender.send(Message::Ping(vec![])).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Handle incoming messages
+    while let Some(msg) = receiver.next().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                // Parse JSON message
+                let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    let _ = tx.send(serde_json::json!({
+                        "type": "error",
+                        "message": "Invalid JSON"
+                    }).to_string());
+                    continue;
+                };
+
+                let msg_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+                match msg_type {
+                    "auth" => {
+                        // Authenticate with token
+                        let token = json.get("token").and_then(|v| v.as_str()).unwrap_or("");
+
+                        // Check if no devices paired (allow access for setup)
+                        let no_devices = {
+                            let devices = PAIRED_DEVICES.lock();
+                            devices.is_empty()
+                        };
+
+                        if no_devices || is_valid_token(token) {
+                            authenticated = true;
+                            let _ = tx.send(serde_json::json!({
+                                "type": "auth_success"
+                            }).to_string());
+
+                            // Send initial session list
+                            let sessions = load_sessions().unwrap_or_default();
+                            let json_running: std::collections::HashSet<String> = {
+                                let broadcasters = JSON_BROADCASTERS.lock();
+                                broadcasters.keys().cloned().collect()
+                            };
+                            let pty_running: std::collections::HashSet<String> = {
+                                let pty_sessions = PTY_SESSIONS.lock();
+                                pty_sessions.keys().cloned().collect()
+                            };
+
+                            let sessions_with_status: Vec<serde_json::Value> = sessions.iter().map(|s| {
+                                let running = json_running.contains(&s.id) || pty_running.contains(&s.id);
+                                serde_json::json!({
+                                    "id": s.id,
+                                    "name": s.name,
+                                    "created_at": s.created_at,
+                                    "agent_type": s.agent_type,
+                                    "working_dir": s.working_dir,
+                                    "running": running,
+                                })
+                            }).collect();
+
+                            let _ = tx.send(serde_json::json!({
+                                "type": "session_list",
+                                "sessions": sessions_with_status
+                            }).to_string());
+                        } else {
+                            let _ = tx.send(serde_json::json!({
+                                "type": "auth_error",
+                                "message": "Invalid token"
+                            }).to_string());
+                        }
+                    }
+
+                    "subscribe" => {
+                        if !authenticated {
+                            let _ = tx.send(serde_json::json!({
+                                "type": "error",
+                                "message": "Not authenticated"
+                            }).to_string());
+                            continue;
+                        }
+
+                        let session_id = json.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+                        if session_id.is_empty() {
+                            let _ = tx.send(serde_json::json!({
+                                "type": "error",
+                                "message": "sessionId required"
+                            }).to_string());
+                            continue;
+                        }
+
+                        // Add subscription
+                        {
+                            let mut clients = MOBILE_CLIENTS.lock();
+                            if let Some(client) = clients.get_mut(&client_id) {
+                                client.subscribed_sessions.insert(session_id.to_string());
+                            }
+                        }
+
+                        // Send chat history for this session
+                        if let Some(history) = get_session_history(session_id) {
+                            let _ = tx.send(serde_json::json!({
+                                "type": "chat_history",
+                                "sessionId": session_id,
+                                "messages": history
+                            }).to_string());
+                        }
+
+                        // Send current session status
+                        let is_running = {
+                            let json_broadcasters = JSON_BROADCASTERS.lock();
+                            json_broadcasters.contains_key(session_id)
+                        };
+                        let _ = tx.send(serde_json::json!({
+                            "type": "session_status",
+                            "sessionId": session_id,
+                            "status": {
+                                "running": is_running,
+                                "isProcessing": false  // We'd need to track this properly
+                            }
+                        }).to_string());
+                    }
+
+                    "unsubscribe" => {
+                        let session_id = json.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+                        {
+                            let mut clients = MOBILE_CLIENTS.lock();
+                            if let Some(client) = clients.get_mut(&client_id) {
+                                client.subscribed_sessions.remove(session_id);
+                            }
+                        }
+                    }
+
+                    "send_message" => {
+                        if !authenticated {
+                            let _ = tx.send(serde_json::json!({
+                                "type": "error",
+                                "message": "Not authenticated"
+                            }).to_string());
+                            continue;
+                        }
+
+                        let session_id = json.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+                        let content = json.get("content");
+
+                        if session_id.is_empty() || content.is_none() {
+                            let _ = tx.send(serde_json::json!({
+                                "type": "error",
+                                "message": "sessionId and content required"
+                            }).to_string());
+                            continue;
+                        }
+
+                        // Convert content to string for the process
+                        let content_str = content.unwrap().to_string();
+
+                        // Write to the session's process
+                        let _ = write_to_process(session_id.to_string(), content_str.clone());
+
+                        // Broadcast to other clients watching this session
+                        if let Some(broadcaster) = {
+                            let broadcasters = JSON_BROADCASTERS.lock();
+                            broadcasters.get(session_id).cloned()
+                        } {
+                            let _ = broadcaster.send(content_str.clone());
+                        }
+
+                        // Emit Tauri event so desktop sees mobile messages
+                        if let Some(app) = APP_HANDLE.lock().as_ref() {
+                            let _ = app.emit("json-process-output", serde_json::json!({
+                                "session_id": session_id,
+                                "data": content_str,
+                            }));
+                        }
+                    }
+
+                    "interrupt" => {
+                        if !authenticated {
+                            continue;
+                        }
+
+                        let session_id = json.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+                        if !session_id.is_empty() {
+                            let _ = interrupt_json_process(session_id.to_string());
+                        }
+                    }
+
+                    _ => {
+                        let _ = tx.send(serde_json::json!({
+                            "type": "error",
+                            "message": format!("Unknown message type: {}", msg_type)
+                        }).to_string());
+                    }
+                }
+            }
+            Ok(Message::Pong(_)) => {
+                // Connection alive
+            }
+            Ok(Message::Close(_)) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    // Cleanup
+    send_task.abort();
+    {
+        let mut clients = MOBILE_CLIENTS.lock();
+        clients.remove(&client_id_for_cleanup);
+    }
+}
+
+// iOS stub for mobile WebSocket
+#[cfg(target_os = "ios")]
+async fn ws_mobile_handler(_ws: WebSocketUpgrade) -> impl IntoResponse {
+    (StatusCode::NOT_IMPLEMENTED, "Mobile WebSocket not supported on iOS")
+}
+
 #[cfg(not(target_os = "ios"))]
 fn start_web_server() {
     // Load paired devices from database
@@ -4909,8 +3320,25 @@ fn start_web_server() {
     thread::spawn(|| {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime for web server");
         rt.block_on(async {
+            // Find mobile-web-dist directory for serving static assets
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+
+            let mobile_web_dir = [
+                exe_dir.as_ref().map(|d| d.join("mobile-web-dist")),
+                exe_dir.as_ref().map(|d| d.join("../Resources/mobile-web-dist")),
+                Some(std::path::PathBuf::from("mobile-web-dist")),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|p| p.exists())
+            .unwrap_or_else(|| std::path::PathBuf::from("mobile-web-dist"));
+
             let app = Router::new()
                 .route("/", get(web_index))
+                // Serve static assets from mobile-web-dist
+                .nest_service("/assets", ServeDir::new(mobile_web_dir.join("assets")))
                 // Auth endpoints (no auth required)
                 .route("/api/auth/check", get(api_auth_check))
                 .route("/api/auth/request-pairing", axum::routing::post(api_request_pairing))
@@ -4924,6 +3352,7 @@ fn start_web_server() {
                 .route("/api/sessions/:session_id/interrupt", axum::routing::post(api_interrupt_session))
                 .route("/api/ws/:session_id", get(ws_handler))
                 .route("/api/ws/status", get(ws_status_handler))
+                .route("/api/ws/mobile", get(ws_mobile_handler))
                 // MCP HTTP endpoints for external control
                 .route("/api/mcp/execute", axum::routing::post(api_mcp_execute))
                 .route("/api/mcp/result", axum::routing::post(api_mcp_result))
@@ -4986,8 +3415,25 @@ fn start_web_server() {
     thread::spawn(|| {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime for web server");
         rt.block_on(async {
+            // Find mobile-web-dist directory for serving static assets
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+
+            let mobile_web_dir = [
+                exe_dir.as_ref().map(|d| d.join("mobile-web-dist")),
+                exe_dir.as_ref().map(|d| d.join("../Resources/mobile-web-dist")),
+                Some(std::path::PathBuf::from("mobile-web-dist")),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|p| p.exists())
+            .unwrap_or_else(|| std::path::PathBuf::from("mobile-web-dist"));
+
             let app = Router::new()
                 .route("/", get(web_index))
+                // Serve static assets from mobile-web-dist
+                .nest_service("/assets", tower_http::services::ServeDir::new(mobile_web_dir.join("assets")))
                 // Auth endpoints (no auth required)
                 .route("/api/auth/check", get(api_auth_check))
                 .route("/api/auth/request-pairing", axum::routing::post(api_request_pairing))
@@ -5001,6 +3447,7 @@ fn start_web_server() {
                 .route("/api/sessions/:session_id/interrupt", axum::routing::post(api_interrupt_session))
                 .route("/api/ws/:session_id", get(ws_handler))
                 .route("/api/ws/status", get(ws_status_handler))
+                .route("/api/ws/mobile", get(ws_mobile_handler))
                 .layer(CorsLayer::permissive());
 
             // Try ports starting from WEB_PORT_BASE until we find one available
