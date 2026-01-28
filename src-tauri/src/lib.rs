@@ -3492,18 +3492,39 @@ const MOBILE_HTML: &str = r#"<!DOCTYPE html>
         div.className = 'chat-msg';
 
         if (msg.type === 'user') {
-          // Handle both formats:
+          // Handle multiple formats:
           // Desktop: {"type": "user", "result": "text"}
           // iOS: {"type": "user", "message": {"role": "user", "content": "text"}}
-          const userText = msg.result || msg.message?.content;
-          const hasImages = msg.images && msg.images.length > 0;
+          // Claude array format: {"type": "user", "message": {"content": [{"type": "text", "text": "..."}]}}
+          let userText = msg.result;
+          let userImages = msg.images || [];
+
+          if (!userText && msg.message?.content) {
+            if (typeof msg.message.content === 'string') {
+              userText = msg.message.content;
+            } else if (Array.isArray(msg.message.content)) {
+              // Extract text and images from content array
+              for (const block of msg.message.content) {
+                if (block.type === 'text' && block.text) {
+                  userText = (userText || '') + block.text;
+                } else if (block.type === 'image' && block.source) {
+                  userImages.push({
+                    mediaType: block.source.media_type,
+                    base64Data: block.source.data
+                  });
+                }
+              }
+            }
+          }
+
+          const hasImages = userImages.length > 0;
           if (!userText?.trim() && !hasImages) return null; // Skip empty
           div.classList.add('user');
 
           let html = '';
           if (hasImages) {
             html += '<div class="user-images">';
-            for (const img of msg.images) {
+            for (const img of userImages) {
               html += '<img src="data:' + img.mediaType + ';base64,' + img.base64Data + '" alt="Image" class="user-image" />';
             }
             html += '</div>';
