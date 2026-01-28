@@ -659,11 +659,12 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   // Handle dropdown menu item clicks
-  dropdownMenu.querySelectorAll("button").forEach((btn) => {
+  dropdownMenu.querySelectorAll("button[data-agent]").forEach((btn) => {
     btn.addEventListener("click", async (e) => {
       e.stopPropagation();
       dropdownMenu.classList.remove("visible");
       const agentType = (btn as HTMLElement).dataset.agent as Session["agentType"];
+      if (!agentType) return; // Safety check
       if (agentType === "custom") {
         // Show modal for custom command
         showNewSessionModal("custom");
@@ -674,11 +675,23 @@ document.addEventListener("DOMContentLoaded", async () => {
     });
   });
 
-  // Handle "Open Claude Code in Directory" button
+  // Handle "Claude in Directory" button - creates a Claude session in a custom directory
   document.getElementById("open-claude-in-dir")?.addEventListener("click", async (e) => {
     e.stopPropagation();
     dropdownMenu.classList.remove("visible");
-    await openClaudeCodeInDirectory();
+
+    const directory = prompt(
+      "Enter directory path for the Claude session:\n\n" +
+      "Claude will run with this as the working directory, " +
+      "loading any MCP servers from that directory's .mcp.json.",
+      "~/dev/"
+    );
+
+    if (!directory) return;
+
+    // Create a new session with claude-json in the specified directory
+    const dirName = directory.split("/").filter(Boolean).pop() || "Custom";
+    await createSessionWithDirectory("claude-json", dirName, directory);
   });
 
   // Close dropdowns when clicking outside
@@ -1518,35 +1531,43 @@ async function createQuickSessionWithAgent(agentType: Session["agentType"]) {
 }
 
 /**
- * Open Claude Code in a specific directory (launches a new terminal window)
- * This is useful when you need the MCP servers from that directory's .mcp.json
+ * Create a new session with a custom working directory
  */
-async function openClaudeCodeInDirectory() {
-  const directory = prompt(
-    "Enter directory path to open Claude Code in:\n\n" +
-    "This launches a new terminal with Claude Code in the specified directory, " +
-    "which will load MCP servers from that directory's .mcp.json if present.",
-    "~/dev/agent-hub-tauri"
-  );
+async function createSessionWithDirectory(agentType: Session["agentType"], name: string, workingDir: string) {
+  const minSortOrder = Math.min(0, ...Array.from(sessions.values()).map(s => s.sortOrder));
 
-  if (!directory) return;
-
-  // Expand ~ to home directory
-  const expandedDir = directory.startsWith("~")
-    ? directory.replace("~", await invoke<string>("get_home_dir"))
-    : directory;
-
-  try {
-    // Use osascript to open Terminal.app with Claude Code in the specified directory
-    // This creates a new terminal window that's separate from Agent Hub
-    await invoke("open_terminal_with_command", {
-      directory: expandedDir,
-      command: "claude"
-    });
-  } catch (err) {
-    console.error("Failed to open Claude Code:", err);
-    alert(`Failed to open Claude Code: ${err}`);
+  // Expand ~ to home directory if needed
+  let expandedDir = workingDir;
+  if (workingDir.startsWith("~")) {
+    try {
+      const homeDir = await invoke<string>("get_home_dir");
+      expandedDir = workingDir.replace("~", homeDir);
+    } catch (e) {
+      console.error("Failed to expand home directory:", e);
+    }
   }
+
+  // Generate a Claude session ID for Claude sessions
+  const claudeSessionId = (agentType === "claude" || agentType === "claude-json") ? crypto.randomUUID() : undefined;
+
+  const session: Session = {
+    id: crypto.randomUUID(),
+    name,
+    agentType,
+    command: AGENT_COMMANDS[agentType],
+    workingDir: expandedDir,
+    createdAt: new Date(),
+    isRunning: false,
+    claudeSessionId,
+    hasBeenStarted: false,
+    sortOrder: minSortOrder - 1,
+  };
+
+  sessions.set(session.id, session);
+  await saveSessionToDb(session);
+  await switchToSession(session.id);
+  await startSessionProcess(session);
+  renderSessionList();
 }
 
 // Edit session modal state
@@ -2261,7 +2282,19 @@ async function startJsonProcess(session: Session) {
 
 async function closeSession(sessionId: string) {
   const session = sessions.get(sessionId);
-  if (!session) return;
+  if (!session) {
+    console.warn("closeSession: session not found in Map, cleaning up orphaned UI", sessionId);
+    // Clean up any orphaned UI elements
+    const orphanedItem = sessionListEl.querySelector(`[data-session-id="${sessionId}"]`);
+    if (orphanedItem) orphanedItem.remove();
+    // Also try to delete from database in case it's there
+    try {
+      await deleteSessionFromDb(sessionId);
+    } catch (e) {
+      // Ignore - may not exist
+    }
+    return;
+  }
 
   // Save to recently closed database before deleting
   const closedSession: RecentlyClosedSession = {

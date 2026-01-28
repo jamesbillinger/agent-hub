@@ -623,30 +623,6 @@ fn get_home_dir() -> Result<String, String> {
         .ok_or_else(|| "Could not find home directory".to_string())
 }
 
-/// Open a new Terminal window with a command in a specific directory
-#[cfg(target_os = "macos")]
-#[tauri::command]
-fn open_terminal_with_command(directory: String, command: String) -> Result<(), String> {
-    use std::process::Command;
-
-    // Use osascript to open Terminal.app in the specified directory and run the command
-    let script = format!(
-        r#"tell application "Terminal"
-            activate
-            do script "cd '{}' && {}"
-        end tell"#,
-        directory.replace("'", "'\\''"),
-        command.replace("'", "'\\''")
-    );
-
-    Command::new("osascript")
-        .args(["-e", &script])
-        .spawn()
-        .map_err(|e| format!("Failed to open terminal: {}", e))?;
-
-    Ok(())
-}
-
 /// List Claude sessions for a given working directory
 #[cfg(not(target_os = "ios"))]
 #[tauri::command]
@@ -5031,7 +5007,6 @@ pub fn run() {
             delete_session,
             update_session_claude_id,
             get_home_dir,
-            open_terminal_with_command,
             list_claude_sessions,
             load_claude_session_history,
             update_session_orders,
