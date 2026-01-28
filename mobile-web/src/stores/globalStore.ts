@@ -45,12 +45,13 @@ export const useGlobalStore = create<GlobalState>((set, get) => ({
     for (const session of sorted) {
       sessionsMap.set(session.id, session);
       order.push(session.id);
-      // Initialize status if not exists
-      if (!get().sessionStatus.has(session.id)) {
-        statusMap.set(session.id, { running: false, isProcessing: false });
-      } else {
-        statusMap.set(session.id, get().sessionStatus.get(session.id)!);
-      }
+      // Use running status from server, preserve isProcessing if we have it
+      const existing = get().sessionStatus.get(session.id);
+      const running = (session as Session & { running?: boolean }).running ?? false;
+      statusMap.set(session.id, {
+        running,
+        isProcessing: existing?.isProcessing ?? false,
+      });
     }
 
     set({ sessions: sessionsMap, sessionsOrder: order, sessionStatus: statusMap });
