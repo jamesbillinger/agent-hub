@@ -14,6 +14,25 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { marked, Tokens } from "marked";
 import "@xterm/xterm/css/xterm.css";
 
+// Performance profiling - set to true to log timing info
+const PERF_DEBUG = false;
+const perfTimers: Map<string, number> = new Map();
+
+function perfStart(label: string) {
+  if (PERF_DEBUG) perfTimers.set(label, performance.now());
+}
+
+function perfEnd(label: string, warnThreshold = 16) {
+  if (!PERF_DEBUG) return;
+  const start = perfTimers.get(label);
+  if (start) {
+    const duration = performance.now() - start;
+    const style = duration > warnThreshold ? 'color: red; font-weight: bold' : 'color: gray';
+    console.log(`%c[PERF] ${label}: ${duration.toFixed(2)}ms`, style);
+    perfTimers.delete(label);
+  }
+}
+
 // Configure marked for safe rendering with copy buttons on code blocks
 const renderer = new marked.Renderer();
 const originalCodeRenderer = renderer.code.bind(renderer);
@@ -142,6 +161,7 @@ interface ChatSession {
   inputEl: HTMLTextAreaElement;
   sendBtn: HTMLButtonElement;
   statusEl: HTMLElement;
+  contextEl: HTMLElement; // Context percentage indicator
   containerEl: HTMLElement;
   attachmentsEl: HTMLElement; // Preview area for pending images
   todosEl: HTMLElement; // Todo panel for TodoWrite tracking
@@ -157,6 +177,9 @@ interface ChatSession {
   toolUseCount: number;
   streamingTokens: number;
   startTime: number | null;
+  // Context tracking
+  totalInputTokens: number; // Cumulative input tokens for context %
+  totalOutputTokens: number;
 }
 
 interface WindowState {
@@ -936,12 +959,24 @@ document.addEventListener("DOMContentLoaded", async () => {
       session.isRunning = false;
       const chatSession = chatSessions.get(event.payload.session_id);
       if (chatSession) {
-        chatSession.statusEl.textContent = `Process exited (${event.payload.exit_code ?? "unknown"})`;
-        chatSession.statusEl.className = "chat-status";
+        const wasProcessing = chatSession.isProcessing;
         chatSession.isProcessing = false;
         updateSessionActivityIndicator(event.payload.session_id, false);
         const thinkingEl = chatSession.containerEl.querySelector(".chat-thinking") as HTMLElement;
         if (thinkingEl) thinkingEl.style.display = "none";
+
+        // If we were processing a request when the session stopped, show a warning
+        if (wasProcessing) {
+          chatSession.statusEl.textContent = "Session stopped unexpectedly";
+          chatSession.statusEl.className = "chat-status error";
+          addChatMessage(event.payload.session_id, {
+            type: "system",
+            result: "**Session stopped while processing.** The request may not have completed. Try sending your message again.",
+          });
+        } else {
+          chatSession.statusEl.textContent = `Process exited (${event.payload.exit_code ?? "unknown"})`;
+          chatSession.statusEl.className = "chat-status";
+        }
 
         // Add session stopped event
         addSessionEvent(event.payload.session_id, "stopped");
@@ -2519,6 +2554,7 @@ function scheduleRenderSessionList() {
  * Render the session list immediately (use scheduleRenderSessionList for coalescing).
  */
 function renderSessionListImmediate() {
+  perfStart("renderSessionList");
   sessionListEl.innerHTML = "";
 
   const sortedSessions = getFilteredAndSortedSessions();
@@ -2613,6 +2649,7 @@ function renderSessionListImmediate() {
       updateSessionActivityIndicator(sessionId, true);
     }
   }
+  perfEnd("renderSessionList");
 }
 
 /**
@@ -2808,7 +2845,10 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
       <textarea class="chat-input" placeholder="Type a message..." rows="1"></textarea>
       <button class="chat-send-btn">Send</button>
     </div>
-    <div class="chat-status">Ready</div>
+    <div class="chat-footer">
+      <div class="chat-status">Ready</div>
+      <div class="chat-context" title="Context usage">—</div>
+    </div>
   `;
 
   chatContainerEl.appendChild(containerEl);
@@ -2817,6 +2857,7 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
   const inputEl = containerEl.querySelector(".chat-input") as HTMLTextAreaElement;
   const sendBtn = containerEl.querySelector(".chat-send-btn") as HTMLButtonElement;
   const statusEl = containerEl.querySelector(".chat-status") as HTMLElement;
+  const contextEl = containerEl.querySelector(".chat-context") as HTMLElement;
   const attachmentsEl = containerEl.querySelector(".chat-attachments") as HTMLElement;
   const todosEl = containerEl.querySelector(".chat-todos") as HTMLElement;
   const attachBtn = containerEl.querySelector(".chat-attach-btn") as HTMLButtonElement;
@@ -2827,6 +2868,7 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
     inputEl,
     sendBtn,
     statusEl,
+    contextEl,
     containerEl,
     attachmentsEl,
     todosEl,
@@ -2841,6 +2883,8 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
     toolUseCount: 0,
     streamingTokens: 0,
     startTime: null,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
   };
 
   // File attachment button click opens file picker
@@ -2983,6 +3027,11 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
     }
   });
 
+  // Context indicator click - show detailed breakdown
+  contextEl.addEventListener("click", () => {
+    showContextDetails(session.id);
+  });
+
   chatSessions.set(session.id, chatSession);
 
   // Always try to load existing messages - buffer may exist even if claudeSessionId is missing
@@ -3017,13 +3066,14 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
         result: `**App Commands (handled locally):**
 • \`/help\` - Show this help message
 • \`/clear\` - Clear chat display (keeps conversation in Claude's context)
+• \`/reset\` - Reset Claude's context (keeps chat history visible)
 • \`/restart\` - Restart an inactive session process
 • \`/status\` - Show session status
 
 **Claude Commands (passed through):**
 • \`/compact [instructions]\` - Compact conversation context
 • \`/cost\` - Show token usage and cost
-• \`/context\` - Show context usage
+• \`/context\` - Show detailed context usage (MCP, tools, skills, etc.)
 • \`/review\` - Review code changes
 • \`/init\` - Reinitialize session
 
@@ -3050,6 +3100,51 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
       } else {
         addChatMessage(sessionId, { type: "system", result: "Session is already running." });
       }
+      return true;
+
+    case "reset":
+      // Reset Claude's context while keeping chat history visible
+      if (session.agentType !== "claude-json" && session.agentType !== "claude") {
+        addChatMessage(sessionId, {
+          type: "system",
+          result: "`/reset` is only available for Claude sessions.",
+        });
+        return true;
+      }
+
+      // Kill the current process if running
+      if (session.isRunning) {
+        await invoke("kill_json_process", { sessionId });
+        session.isRunning = false;
+      }
+
+      // Generate a new Claude session ID - this means next start won't resume
+      const oldSessionId = session.claudeSessionId;
+      session.claudeSessionId = crypto.randomUUID();
+      session.hasBeenStarted = false;
+
+      // Reset token tracking for context indicator
+      if (chatSession) {
+        chatSession.totalInputTokens = 0;
+        chatSession.totalOutputTokens = 0;
+        updateContextIndicator(chatSession);
+      }
+
+      // Save to database
+      await saveSessionToDb(session);
+
+      // Add visual indicator
+      const timestamp = new Date().toLocaleTimeString();
+      addChatMessage(sessionId, {
+        type: "system",
+        subtype: "stopped",
+        result: `--- Context reset at ${timestamp} ---\nPrevious session: ${oldSessionId?.substring(0, 8)}...\nNew session: ${session.claudeSessionId.substring(0, 8)}...\nChat history preserved. Claude will start fresh on next message.`,
+      });
+
+      // Update status
+      chatSession.statusEl.textContent = "Context reset - ready";
+      chatSession.statusEl.className = "chat-status";
+
       return true;
 
     case "status":
@@ -3861,8 +3956,12 @@ function addSessionEvent(sessionId: string, eventType: "resumed" | "stopped") {
  * Add a message to the chat UI
  */
 function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
+  perfStart(`addChatMessage:${message.type}`);
   const chatSession = chatSessions.get(sessionId);
-  if (!chatSession) return;
+  if (!chatSession) {
+    perfEnd(`addChatMessage:${message.type}`);
+    return;
+  }
 
   // For init messages, only save the first one - ignore subsequent ones
   if (message.type === "system" && message.subtype === "init") {
@@ -4067,14 +4166,19 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
 
   // Save messages after every message for safety
   saveChatMessages(sessionId);
+  perfEnd(`addChatMessage:${message.type}`);
 }
 
 /**
  * Process incoming JSON data for a chat session
  */
 function processChatOutput(sessionId: string, data: string) {
+  perfStart("processChatOutput");
   const chatSession = chatSessions.get(sessionId);
-  if (!chatSession) return;
+  if (!chatSession) {
+    perfEnd("processChatOutput");
+    return;
+  }
 
   // Add to buffer and process complete lines
   chatSession.inputBuffer += data;
@@ -4129,6 +4233,12 @@ function processChatOutput(sessionId: string, data: string) {
           if (tokenDetails.length > 0) {
             parts.push(tokenDetails.join("/"));
           }
+
+          // Update cumulative tokens for context indicator
+          // The result message contains the cumulative usage for the entire turn
+          chatSession.totalInputTokens = totalIn;
+          chatSession.totalOutputTokens = usage.output_tokens || 0;
+          updateContextIndicator(chatSession);
         }
 
         // Duration from API
@@ -4156,6 +4266,7 @@ function processChatOutput(sessionId: string, data: string) {
       console.warn("Failed to parse JSON line:", line, err);
     }
   }
+  perfEnd("processChatOutput");
 }
 
 /**
@@ -4264,6 +4375,145 @@ function formatTokens(tokens: number): string {
     return `${(tokens / 1000).toFixed(1)}k`;
   }
   return tokens.toString();
+}
+
+// Max context by model (conservative estimates for display)
+const MODEL_MAX_CONTEXT: Record<string, number> = {
+  "claude-opus-4-5-20251101": 200000,
+  "claude-sonnet-4-20250514": 200000,
+  "claude-3-5-sonnet-20241022": 200000,
+  "claude-3-5-haiku-20241022": 200000,
+  default: 200000,
+};
+
+// Autocompact buffer (reserved space)
+const AUTOCOMPACT_BUFFER = 45000;
+
+/**
+ * Update the context percentage indicator for a chat session
+ */
+function updateContextIndicator(chatSession: ChatSession, model?: string): void {
+  const maxContext = MODEL_MAX_CONTEXT[model || "default"] || MODEL_MAX_CONTEXT.default;
+  const usableContext = maxContext - AUTOCOMPACT_BUFFER;
+
+  const totalTokens = chatSession.totalInputTokens;
+  const percentage = Math.round((totalTokens / usableContext) * 100);
+
+  // Calculate "% left to auto-compact"
+  const percentLeft = Math.max(0, 100 - percentage);
+
+  if (totalTokens === 0) {
+    chatSession.contextEl.textContent = "—";
+    chatSession.contextEl.title = "Context usage (no data yet)";
+    chatSession.contextEl.className = "chat-context";
+  } else {
+    chatSession.contextEl.textContent = `${percentLeft}% left`;
+    chatSession.contextEl.title = `Context: ${formatTokens(totalTokens)}/${formatTokens(usableContext)} tokens (${percentage}% used)\nAuto-compact triggers at ~95%`;
+
+    // Color coding based on remaining space
+    if (percentLeft <= 10) {
+      chatSession.contextEl.className = "chat-context critical";
+    } else if (percentLeft <= 25) {
+      chatSession.contextEl.className = "chat-context warning";
+    } else {
+      chatSession.contextEl.className = "chat-context";
+    }
+  }
+}
+
+/**
+ * Show context usage modal
+ */
+function showContextDetails(sessionId: string): void {
+  const session = sessions.get(sessionId);
+  const chatSession = chatSessions.get(sessionId);
+  if (!session || !chatSession) return;
+
+  const maxContext = MODEL_MAX_CONTEXT.default;
+  const usableContext = maxContext - AUTOCOMPACT_BUFFER;
+  const totalTokens = chatSession.totalInputTokens;
+  const percentage = Math.round((totalTokens / usableContext) * 100);
+  const percentLeft = Math.max(0, 100 - percentage);
+
+  // Build visual bar
+  const filledSegments = Math.round(percentage / 10);
+  const barSegments: string[] = [];
+  for (let i = 0; i < 10; i++) {
+    if (i < filledSegments) {
+      barSegments.push("█");
+    } else if (i < 10 - Math.round((AUTOCOMPACT_BUFFER / maxContext) * 10)) {
+      barSegments.push("░");
+    } else {
+      barSegments.push("▒"); // Reserved for autocompact
+    }
+  }
+  const bar = barSegments.join("");
+
+  // Create modal
+  const modal = document.createElement("div");
+  modal.className = "context-modal-overlay";
+  modal.innerHTML = `
+    <div class="context-modal">
+      <div class="context-modal-header">
+        <h3>Context Usage</h3>
+        <button class="context-modal-close">&times;</button>
+      </div>
+      <div class="context-modal-body">
+        <div class="context-bar-container">
+          <code class="context-bar">${bar}</code>
+          <span class="context-stats">${formatTokens(totalTokens)} / ${formatTokens(usableContext)} tokens (${percentage}%)</span>
+        </div>
+        <div class="context-remaining ${percentLeft <= 10 ? 'critical' : percentLeft <= 25 ? 'warning' : ''}">
+          <strong>${percentLeft}%</strong> remaining before auto-compact
+        </div>
+        <div class="context-hint">
+          Use <code>/context</code> for detailed breakdown (MCP, tools, skills)
+        </div>
+      </div>
+      <div class="context-modal-footer">
+        <button class="context-action-btn details-btn">Show Details</button>
+        <button class="context-action-btn compact-btn">Compact</button>
+        <button class="context-action-btn reset-btn">Reset Context</button>
+      </div>
+    </div>
+  `;
+
+  // Close handlers
+  const closeModal = () => modal.remove();
+
+  modal.querySelector(".context-modal-close")!.addEventListener("click", closeModal);
+  modal.addEventListener("click", (e) => {
+    if (e.target === modal) closeModal();
+  });
+
+  // Escape key to close
+  const escHandler = (e: KeyboardEvent) => {
+    if (e.key === "Escape") {
+      closeModal();
+      document.removeEventListener("keydown", escHandler);
+    }
+  };
+  document.addEventListener("keydown", escHandler);
+
+  // Action buttons
+  modal.querySelector(".details-btn")!.addEventListener("click", () => {
+    closeModal();
+    chatSession.inputEl.value = "/context";
+    sendChatMessage(sessionId);
+  });
+
+  modal.querySelector(".compact-btn")!.addEventListener("click", () => {
+    closeModal();
+    chatSession.inputEl.value = "/compact";
+    sendChatMessage(sessionId);
+  });
+
+  modal.querySelector(".reset-btn")!.addEventListener("click", () => {
+    closeModal();
+    handleSlashCommand(sessionId, "/reset");
+  });
+
+  document.body.appendChild(modal);
 }
 
 /**
@@ -4464,6 +4714,20 @@ async function loadChatMessages(sessionId: string, chatSession: ChatSession): Pr
       for (const msg of nonInitMessages) {
         chatSession.messages.push(msg);
         renderChatMessage(chatSession, msg);
+      }
+
+      // Restore context indicator from the most recent result message with usage
+      // Look backwards through messages to find the latest usage data
+      for (let i = nonInitMessages.length - 1; i >= 0; i--) {
+        const msg = nonInitMessages[i];
+        if (msg.type === "result" && msg.usage) {
+          const usage = msg.usage;
+          const totalIn = (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0);
+          chatSession.totalInputTokens = totalIn;
+          chatSession.totalOutputTokens = usage.output_tokens || 0;
+          updateContextIndicator(chatSession);
+          break;
+        }
       }
     }
   } catch (err) {
