@@ -14,9 +14,18 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { marked, Tokens } from "marked";
 import "@xterm/xterm/css/xterm.css";
 
-// Performance profiling - set to true to log timing info
-const PERF_DEBUG = false;
+// Performance profiling - enable at runtime with: window.PERF_DEBUG = true
+let PERF_DEBUG = false;
 const perfTimers: Map<string, number> = new Map();
+
+// Allow toggling at runtime from console
+Object.defineProperty(window, 'PERF_DEBUG', {
+  get: () => PERF_DEBUG,
+  set: (v: boolean) => {
+    PERF_DEBUG = v;
+    console.log(`[PERF] Profiling ${v ? 'enabled' : 'disabled'}`);
+  }
+});
 
 function perfStart(label: string) {
   if (PERF_DEBUG) perfTimers.set(label, performance.now());
