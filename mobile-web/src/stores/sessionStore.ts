@@ -63,14 +63,38 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   setMessages: (sessionId, messages) => {
     const messagesMap = new Map(get().messages);
-    messagesMap.set(sessionId, messages);
+    const existingMessages = messagesMap.get(sessionId) || [];
+    const existingSeenKeys = get().seenMessageKeys.get(sessionId) || new Set();
 
-    // Build seen keys from loaded messages
-    const seenKeys = new Set<string>();
+    // Build seen keys from incoming messages
+    const incomingKeys = new Set<string>();
     for (const msg of messages) {
+      const key = getMessageKey(msg);
+      if (key) incomingKeys.add(key);
+    }
+
+    // Find locally-added messages not in the incoming history
+    // These are messages we added locally that the server hasn't echoed back yet
+    const pendingLocalMessages: Message[] = [];
+    for (const msg of existingMessages) {
+      const key = getMessageKey(msg);
+      if (key && existingSeenKeys.has(key) && !incomingKeys.has(key)) {
+        // This message was added locally but isn't in server history yet
+        pendingLocalMessages.push(msg);
+      }
+    }
+
+    // Merge: server history + pending local messages
+    const mergedMessages = [...messages, ...pendingLocalMessages];
+
+    // Update seen keys to include both
+    const seenKeys = new Set<string>();
+    for (const msg of mergedMessages) {
       const key = getMessageKey(msg);
       if (key) seenKeys.add(key);
     }
+
+    messagesMap.set(sessionId, mergedMessages);
     const seenMap = new Map(get().seenMessageKeys);
     seenMap.set(sessionId, seenKeys);
 

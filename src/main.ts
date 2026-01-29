@@ -678,23 +678,13 @@ document.addEventListener("DOMContentLoaded", async () => {
     });
   });
 
-  // Handle "Claude in Directory" button - creates a Claude session in a custom directory
-  document.getElementById("open-claude-in-dir")?.addEventListener("click", async (e) => {
+  // Handle "Claude in Directory" button - opens modal focused on directory input
+  document.getElementById("open-claude-in-dir")?.addEventListener("click", (e) => {
     e.stopPropagation();
     dropdownMenu.classList.remove("visible");
 
-    const directory = prompt(
-      "Enter directory path for the Claude session:\n\n" +
-      "Claude will run with this as the working directory, " +
-      "loading any MCP servers from that directory's .mcp.json.",
-      "~/dev/"
-    );
-
-    if (!directory) return;
-
-    // Create a new session with claude-json in the specified directory
-    const dirName = directory.split("/").filter(Boolean).pop() || "Custom";
-    await createSessionWithDirectory("claude-json", dirName, directory);
+    // Show the new session modal with claude-json pre-selected, focused on working dir
+    showNewSessionModal("claude-json", { workingDir: "~/dev/", focusWorkingDir: true });
   });
 
   // Close dropdowns when clicking outside
@@ -1598,12 +1588,12 @@ function showEditSessionModal(sessionId: string) {
   sessionNameInput.select();
 }
 
-function showNewSessionModal(agentType: Session["agentType"] = "claude") {
+function showNewSessionModal(agentType: Session["agentType"] = "claude", options?: { workingDir?: string; focusWorkingDir?: boolean }) {
   editingSessionId = null;
   sessionNameInput.value = "";
   agentTypeSelect.value = agentType;
   customCommandInput.value = "";
-  workingDirInput.value = DEFAULT_WORKING_DIR;
+  workingDirInput.value = options?.workingDir || DEFAULT_WORKING_DIR;
   customCommandGroup.style.display = agentType === "custom" ? "block" : "none";
 
   // Update modal title and button for new
@@ -1613,7 +1603,13 @@ function showNewSessionModal(agentType: Session["agentType"] = "claude") {
   if (createBtn) createBtn.textContent = "Create";
 
   newSessionModal.classList.add("visible");
-  sessionNameInput.focus();
+
+  if (options?.focusWorkingDir) {
+    workingDirInput.focus();
+    workingDirInput.select();
+  } else {
+    sessionNameInput.focus();
+  }
 }
 
 function hideNewSessionModal() {
@@ -1622,7 +1618,10 @@ function hideNewSessionModal() {
 }
 
 async function saveSessionFromModal() {
-  const name = sessionNameInput.value.trim() || `Session ${sessions.size + 1}`;
+  const workingDir = workingDirInput.value.trim() || DEFAULT_WORKING_DIR;
+  // If no name provided, use the directory name (last component of the path)
+  const dirName = workingDir.split("/").filter(Boolean).pop() || "Project";
+  const name = sessionNameInput.value.trim() || dirName;
   const agentType = agentTypeSelect.value as Session["agentType"];
   let command = AGENT_COMMANDS[agentType];
 

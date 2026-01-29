@@ -1,4 +1,12 @@
+import { useMemo } from 'react';
+import { marked } from 'marked';
 import type { Message, TextContent, ToolUseContent } from '../../types';
+
+// Configure marked for safe rendering
+marked.setOptions({
+  breaks: true,
+  gfm: true,
+});
 
 interface MessageBubbleProps {
   message: Message;
@@ -79,13 +87,7 @@ export function MessageBubble({ message }: MessageBubbleProps) {
 
     if (!textContent) return null;
 
-    return (
-      <div className="px-4 py-2">
-        <div className="max-w-[85%] bg-[#2a2a2a] text-gray-200 rounded-2xl rounded-bl px-4 py-2">
-          <div className="whitespace-pre-wrap break-words">{textContent}</div>
-        </div>
-      </div>
-    );
+    return <AssistantMessageContent text={textContent} />;
   }
 
   if (message.type === 'result' && message.is_error) {
@@ -98,6 +100,23 @@ export function MessageBubble({ message }: MessageBubbleProps) {
 
   // Skip other message types
   return null;
+}
+
+function AssistantMessageContent({ text }: { text: string }) {
+  const html = useMemo(() => {
+    return marked.parse(text) as string;
+  }, [text]);
+
+  return (
+    <div className="px-4 py-2">
+      <div className="max-w-[85%] bg-[#2a2a2a] text-gray-200 rounded-2xl rounded-bl px-4 py-2">
+        <div
+          className="markdown-content break-words"
+          dangerouslySetInnerHTML={{ __html: html }}
+        />
+      </div>
+    </div>
+  );
 }
 
 function ToolUseBlock({ block }: { block: ToolUseContent }) {

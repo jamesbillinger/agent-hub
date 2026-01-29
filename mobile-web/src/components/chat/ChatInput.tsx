@@ -2,6 +2,7 @@ import { useRef, useEffect, useCallback } from 'react';
 import { useSessionStore, useGlobalStore } from '../../stores';
 import { api } from '../../services/api';
 import { websocketService } from '../../services/websocket';
+import type { Message } from '../../types';
 
 interface ChatInputProps {
   sessionId: string;
@@ -10,7 +11,7 @@ interface ChatInputProps {
 export function ChatInput({ sessionId }: ChatInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const { inputText, pendingImages, setInputText, clearPendingImages, removePendingImage, addPendingImage } = useSessionStore();
+  const { inputText, pendingImages, setInputText, clearPendingImages, removePendingImage, addPendingImage, addMessage } = useSessionStore();
   const { sessionStatus, updateSessionStatus } = useGlobalStore();
 
   const text = inputText.get(sessionId) || '';
@@ -50,6 +51,17 @@ export function ChatInput({ sessionId }: ChatInputProps) {
       content = text.trim();
     }
 
+    // Add user message to local state immediately (like desktop does)
+    const userMessage: Message = {
+      type: 'user',
+      result: text.trim() || undefined,
+      images: images.length > 0 ? images.map(img => ({
+        mediaType: img.mediaType,
+        base64Data: img.base64Data,
+      })) : undefined,
+    };
+    addMessage(sessionId, userMessage);
+
     // Clear input
     setInputText(sessionId, '');
     clearPendingImages(sessionId);
@@ -69,7 +81,7 @@ export function ChatInput({ sessionId }: ChatInputProps) {
     // Send via WebSocket
     websocketService.sendMessage(sessionId, content);
     updateSessionStatus(sessionId, { isProcessing: true });
-  }, [sessionId, text, images, hasContent, sessionStatus, setInputText, clearPendingImages, updateSessionStatus]);
+  }, [sessionId, text, images, hasContent, sessionStatus, setInputText, clearPendingImages, updateSessionStatus, addMessage]);
 
   const handleInterrupt = useCallback(() => {
     websocketService.interrupt(sessionId);
