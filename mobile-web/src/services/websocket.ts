@@ -10,6 +10,8 @@ class WebSocketService {
   private maxReconnectAttempts = 5;
   private reconnectDelay = 1000;
   private pingInterval: ReturnType<typeof setInterval> | null = null;
+  private isAuthenticated = false;
+  private pendingMessages: ClientMessage[] = [];
 
   connect() {
     const token = useAuthStore.getState().authToken;
@@ -47,6 +49,7 @@ class WebSocketService {
 
     this.ws.onclose = (event) => {
       console.log('WebSocket closed:', event.code, event.reason);
+      this.isAuthenticated = false;
       useGlobalStore.getState().setConnected(false);
       this.cleanup();
 
@@ -86,6 +89,9 @@ class WebSocketService {
     switch (message.type) {
       case 'auth_success':
         console.log('WebSocket authenticated');
+        this.isAuthenticated = true;
+        // Flush any pending messages that were queued before auth
+        this.flushPendingMessages();
         break;
 
       case 'auth_error':
@@ -165,7 +171,16 @@ class WebSocketService {
   }
 
   sendMessage(sessionId: string, content: unknown) {
-    this.send({ type: 'send_message', sessionId, content });
+    // Format message the same way desktop does:
+    // {"type":"user","message":{"role":"user","content":"..."}}
+    const formattedMessage = JSON.stringify({
+      type: 'user',
+      message: {
+        role: 'user',
+        content,
+      },
+    }) + '\n';
+    this.send({ type: 'send_message', sessionId, content: formattedMessage });
   }
 
   interrupt(sessionId: string) {
@@ -173,10 +188,37 @@ class WebSocketService {
   }
 
   private send(message: ClientMessage) {
+    // Auth messages should always go through immediately
+    if (message.type === 'auth') {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify(message));
+      }
+      return;
+    }
+
+    // Queue other messages if not authenticated yet
+    if (!this.isAuthenticated) {
+      console.log('Queueing message until authenticated:', message.type);
+      this.pendingMessages.push(message);
+      return;
+    }
+
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(message));
     } else {
       console.warn('WebSocket not connected, cannot send:', message);
+    }
+  }
+
+  private flushPendingMessages() {
+    if (this.pendingMessages.length > 0) {
+      console.log(`Flushing ${this.pendingMessages.length} pending messages`);
+      for (const msg of this.pendingMessages) {
+        if (this.ws?.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify(msg));
+        }
+      }
+      this.pendingMessages = [];
     }
   }
 

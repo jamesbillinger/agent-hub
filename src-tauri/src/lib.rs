@@ -3254,7 +3254,12 @@ async fn handle_ws_mobile(socket: WebSocket) {
                         }
 
                         // Convert content to string for the process
-                        let content_str = content.unwrap().to_string();
+                        // If content is already a string (pre-formatted JSON from mobile), use it directly
+                        // Otherwise serialize it as JSON
+                        let content_str = match content.unwrap() {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
 
                         // Write to the session's process
                         let _ = write_to_process(session_id.to_string(), content_str.clone());
