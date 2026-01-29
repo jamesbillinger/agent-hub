@@ -42,6 +42,108 @@ function perfEnd(label: string, warnThreshold = 16) {
   }
 }
 
+// Input lag debugging - measures time between native input event and next paint
+let INPUT_DEBUG = false;
+let pendingInputTimestamps: number[] = [];
+let rafId: number | null = null;
+
+Object.defineProperty(window, 'INPUT_DEBUG', {
+  get: () => INPUT_DEBUG,
+  set: (v: boolean) => {
+    INPUT_DEBUG = v;
+    console.log(`[INPUT] Input lag debugging ${v ? 'enabled' : 'disabled'}`);
+    if (v) {
+      // Add global input listener
+      document.addEventListener('input', inputDebugHandler, true);
+      console.log('[INPUT] Listening for input events. Type in any text field to measure lag.');
+    } else {
+      document.removeEventListener('input', inputDebugHandler, true);
+      pendingInputTimestamps = [];
+      if (rafId) cancelAnimationFrame(rafId);
+    }
+  }
+});
+
+function inputDebugHandler(e: Event) {
+  if (!INPUT_DEBUG) return;
+  const now = performance.now();
+  pendingInputTimestamps.push(now);
+
+  // Schedule measurement after paint
+  if (rafId === null) {
+    rafId = requestAnimationFrame(() => {
+      rafId = null;
+      const paintTime = performance.now();
+      for (const inputTime of pendingInputTimestamps) {
+        const lag = paintTime - inputTime;
+        const style = lag > 50 ? 'color: red; font-weight: bold' : lag > 16 ? 'color: orange' : 'color: green';
+        console.log(`%c[INPUT] Event -> Paint: ${lag.toFixed(2)}ms`, style);
+      }
+      pendingInputTimestamps = [];
+    });
+  }
+}
+
+// Deep event debugging - logs every keystroke event to find where delay happens
+let KEY_DEBUG = false;
+let keyTimings: Map<string, number> = new Map();
+
+Object.defineProperty(window, 'KEY_DEBUG', {
+  get: () => KEY_DEBUG,
+  set: (v: boolean) => {
+    KEY_DEBUG = v;
+    console.log(`[KEY] Keystroke event debugging ${v ? 'enabled' : 'disabled'}`);
+    if (v) {
+      document.addEventListener('keydown', keyDebugDown, true);
+      document.addEventListener('keypress', keyDebugPress, true);
+      document.addEventListener('keyup', keyDebugUp, true);
+      document.addEventListener('input', keyDebugInput, true);
+      console.log('[KEY] Monitoring keydown -> keypress -> input -> keyup sequence');
+    } else {
+      document.removeEventListener('keydown', keyDebugDown, true);
+      document.removeEventListener('keypress', keyDebugPress, true);
+      document.removeEventListener('keyup', keyDebugUp, true);
+      document.removeEventListener('input', keyDebugInput, true);
+      keyTimings.clear();
+    }
+  }
+});
+
+function keyDebugDown(e: KeyboardEvent) {
+  if (!KEY_DEBUG || e.key.length > 1) return; // Skip modifier keys
+  const now = performance.now();
+  keyTimings.set(e.key, now);
+  console.log(`[KEY] keydown "${e.key}" @ ${now.toFixed(2)}`);
+}
+
+function keyDebugPress(e: KeyboardEvent) {
+  if (!KEY_DEBUG) return;
+  const now = performance.now();
+  const downTime = keyTimings.get(e.key);
+  const delta = downTime ? now - downTime : 0;
+  console.log(`[KEY] keypress "${e.key}" @ ${now.toFixed(2)} (${delta.toFixed(2)}ms after keydown)`);
+}
+
+function keyDebugInput(e: Event) {
+  if (!KEY_DEBUG) return;
+  const now = performance.now();
+  const input = e.target as HTMLInputElement | HTMLTextAreaElement;
+  const lastChar = input.value.slice(-1);
+  const downTime = keyTimings.get(lastChar);
+  const delta = downTime ? now - downTime : 0;
+  const style = delta > 100 ? 'color: red; font-weight: bold' : delta > 50 ? 'color: orange' : 'color: green';
+  console.log(`%c[KEY] input event @ ${now.toFixed(2)} (${delta.toFixed(2)}ms after keydown)`, style);
+}
+
+function keyDebugUp(e: KeyboardEvent) {
+  if (!KEY_DEBUG || e.key.length > 1) return;
+  const now = performance.now();
+  const downTime = keyTimings.get(e.key);
+  const delta = downTime ? now - downTime : 0;
+  console.log(`[KEY] keyup "${e.key}" @ ${now.toFixed(2)} (${delta.toFixed(2)}ms total)`);
+  keyTimings.delete(e.key);
+}
+
 // Configure marked for safe rendering with copy buttons on code blocks
 const renderer = new marked.Renderer();
 const originalCodeRenderer = renderer.code.bind(renderer);
