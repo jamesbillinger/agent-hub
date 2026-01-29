@@ -1044,9 +1044,36 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   // JSON process event listeners (for claude-json sessions)
+  // Buffer output events and process in batches to reduce main thread pressure
+  const outputBuffer: Map<string, string[]> = new Map();
+  let outputFlushScheduled = false;
+
+  function flushOutputBuffer() {
+    outputFlushScheduled = false;
+    for (const [sessionId, chunks] of outputBuffer) {
+      if (chunks.length > 0) {
+        // Process all buffered chunks for this session at once
+        const combined = chunks.join("");
+        processChatOutput(sessionId, combined);
+      }
+    }
+    outputBuffer.clear();
+  }
+
   await listen<{ session_id: string; data: string }>("json-process-output", (event) => {
     const { session_id, data } = event.payload;
-    processChatOutput(session_id, data);
+
+    // Add to buffer
+    if (!outputBuffer.has(session_id)) {
+      outputBuffer.set(session_id, []);
+    }
+    outputBuffer.get(session_id)!.push(data);
+
+    // Schedule flush on next animation frame if not already scheduled
+    if (!outputFlushScheduled) {
+      outputFlushScheduled = true;
+      requestAnimationFrame(flushOutputBuffer);
+    }
   });
 
   await listen<{ session_id: string }>("json-process-started", (event) => {
