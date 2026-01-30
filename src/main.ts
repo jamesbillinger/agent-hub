@@ -3204,6 +3204,8 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
         result: `**App Commands (handled locally):**
 • \`/help\` - Show this help message
 • \`/clear\` - Clear chat display (keeps conversation in Claude's context)
+• \`/exit\` - Suspend session (frees memory, resumes on next message)
+• \`/exitall\` - Suspend all other sessions
 • \`/reset\` - Reset Claude's context (keeps chat history visible)
 • \`/restart\` - Restart an inactive session process
 • \`/status\` - Show session status
@@ -3228,6 +3230,37 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
       addChatMessage(sessionId, {
         type: "system",
         result: "Chat display cleared. Claude still remembers the conversation.",
+      });
+      return true;
+
+    case "exit":
+    case "suspend":
+    case "sleep":
+      // Suspend the session - kill process but keep session for later resume
+      if (!session.isRunning) {
+        addChatMessage(sessionId, {
+          type: "system",
+          result: "Session is not running.",
+        });
+        return true;
+      }
+
+      // Kill the process
+      try {
+        await invoke("kill_json_process", { sessionId });
+      } catch {
+        // Might already be dead
+      }
+      session.isRunning = false;
+
+      // Update UI
+      chatSession.statusEl.textContent = "Suspended";
+      chatSession.statusEl.className = "chat-status";
+
+      addChatMessage(sessionId, {
+        type: "system",
+        subtype: "stopped",
+        result: "Session suspended. Send a message to resume.",
       });
       return true;
 
@@ -3294,6 +3327,32 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
         session.claudeSessionId ? `**Claude Session:** ${session.claudeSessionId}` : null,
       ].filter(Boolean).join("\n");
       addChatMessage(sessionId, { type: "system", result: statusInfo });
+      return true;
+
+    case "exitall":
+    case "suspendall":
+      // Suspend all running sessions to free memory
+      let suspendedCount = 0;
+      for (const [sid, sess] of sessions) {
+        if (sess.isRunning && sid !== sessionId) {
+          try {
+            await invoke("kill_json_process", { sessionId: sid });
+            sess.isRunning = false;
+            const cs = chatSessions.get(sid);
+            if (cs) {
+              cs.statusEl.textContent = "Suspended";
+              cs.statusEl.className = "chat-status";
+            }
+            suspendedCount++;
+          } catch {
+            // Ignore errors
+          }
+        }
+      }
+      addChatMessage(sessionId, {
+        type: "system",
+        result: `Suspended ${suspendedCount} other session(s). Send a message in any session to resume it.`,
+      });
       return true;
 
     // These commands work in JSON mode and are passed through to Claude
