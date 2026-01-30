@@ -38,15 +38,16 @@ export default function App() {
     };
   }, [isAuthenticated]);
 
-  // Restore session from URL on mount
+  // Restore session from URL on mount only (not on every activeSessionId change)
   useEffect(() => {
     if (isAuthenticated) {
       const sessionIdFromUrl = getSessionIdFromHash();
-      if (sessionIdFromUrl && !activeSessionId) {
+      if (sessionIdFromUrl) {
         setActiveSession(sessionIdFromUrl);
       }
     }
-  }, [isAuthenticated, activeSessionId, setActiveSession]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAuthenticated]); // Only run on mount/auth change, NOT on activeSessionId change
 
   // Sync URL when active session changes
   useEffect(() => {
