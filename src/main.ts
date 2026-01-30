@@ -5096,10 +5096,14 @@ async function populateWebInterfaceUrl(): Promise<void> {
 
   try {
     // Get port and local IPs from backend
-    const [port, ips] = await Promise.all([
-      invoke<number | null>("get_web_server_port"),
-      invoke<string[]>("get_local_ips"),
-    ]);
+    // Retry a few times in case web server is still starting up
+    let port: number | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      port = await invoke<number | null>("get_web_server_port");
+      if (port) break;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    const ips = await invoke<string[]>("get_local_ips");
 
     if (!port) {
       urlContainer.innerHTML = `<span class="loading-text">Web server not running</span>`;
