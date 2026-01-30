@@ -388,6 +388,115 @@ struct SessionData {
     sort_order: i32,
 }
 
+/// Claude JSON message content item (text, tool_use, tool_result, image)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClaudeContentItem {
+    #[serde(rename = "type")]
+    content_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_use_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_error: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<serde_json::Value>,
+}
+
+/// Claude JSON message usage stats
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ClaudeUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_creation_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_read_input_tokens: Option<u64>,
+}
+
+/// Claude JSON message inner message structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClaudeMessageInner {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    message_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<Vec<ClaudeContentItem>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<ClaudeUsage>,
+}
+
+/// Claude JSON message - the outer envelope
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClaudeJsonMessage {
+    #[serde(rename = "type")]
+    msg_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subtype: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<ClaudeMessageInner>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_error: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_api_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_output_tokens: Option<u64>,
+    // Init message fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude_code_version: Option<String>,
+    #[serde(rename = "permissionMode", skip_serializing_if = "Option::is_none")]
+    permission_mode: Option<String>,
+    // Result message fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_turns: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<ClaudeUsage>,
+}
+
+/// Parse a raw JSON line from Claude, handling escape codes
+fn parse_claude_json(line: &str) -> Option<ClaudeJsonMessage> {
+    // Strip iTerm2 shell integration escape codes that may prefix the JSON
+    // These look like: ]1337;RemoteHost=...]1337;CurrentDir=...{"type":...}
+    let json_str = if let Some(json_start) = line.find('{') {
+        &line[json_start..]
+    } else {
+        line
+    };
+
+    serde_json::from_str(json_str).ok()
+}
+
 /// Get the app data directory name based on build type
 /// In debug builds, use "agent-hub-dev" to separate data from production
 fn get_app_data_dir_name() -> &'static str {
@@ -1429,63 +1538,80 @@ fn spawn_json_process(
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
-                    // Parse JSON to detect processing state changes
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
-                        if let Some(msg_type) = json.get("type").and_then(|t| t.as_str()) {
-                            match msg_type {
-                                "assistant" => {
-                                    // Assistant message = processing started
-                                    broadcast_processing_status(&session_id_stdout, true);
-                                }
-                                "result" => {
-                                    // Result = processing finished
-                                    broadcast_processing_status(&session_id_stdout, false);
-                                }
-                                _ => {}
+                    // Parse JSON and emit structured message (new event)
+                    // This offloads JSON parsing from the frontend
+                    if let Some(parsed) = parse_claude_json(&line) {
+                        // Detect processing state changes
+                        match parsed.msg_type.as_str() {
+                            "assistant" => {
+                                broadcast_processing_status(&session_id_stdout, true);
                             }
+                            "result" => {
+                                broadcast_processing_status(&session_id_stdout, false);
+                            }
+                            _ => {}
                         }
-                    }
 
-                    let data = line + "\n";
-                    // Emit to Tauri (for desktop app)
-                    let _ = app_stdout.emit("json-process-output", serde_json::json!({
-                        "session_id": session_id_stdout,
-                        "data": &data
-                    }));
-                    // Broadcast to WebSocket clients (for mobile web - legacy single-session connections)
-                    let _ = broadcast_stdout.send(data.clone());
-                    // Broadcast to mobile WebSocket subscribers (new multiplexed connections)
-                    let msg = serde_json::json!({
-                        "type": "chat_message",
-                        "sessionId": session_id_stdout,
-                        "message": &data
-                    }).to_string();
-                    broadcast_to_session_subscribers(&session_id_stdout, &msg);
+                        // Emit pre-parsed message to Tauri frontend
+                        let _ = app_stdout.emit("json-process-message", serde_json::json!({
+                            "session_id": session_id_stdout,
+                            "message": parsed
+                        }));
+
+                        // Broadcast to mobile WebSocket subscribers (pre-parsed)
+                        let msg = serde_json::json!({
+                            "type": "chat_message",
+                            "sessionId": session_id_stdout,
+                            "message": parsed
+                        }).to_string();
+                        broadcast_to_session_subscribers(&session_id_stdout, &msg);
+
+                        // Broadcast to legacy WebSocket clients (raw string for backward compat)
+                        let data = line.clone() + "\n";
+                        let _ = broadcast_stdout.send(data);
+                    } else {
+                        // Failed to parse - emit raw line for debugging
+                        eprintln!("Failed to parse Claude JSON: {}", &line);
+                        let data = line + "\n";
+                        let _ = app_stdout.emit("json-process-output", serde_json::json!({
+                            "session_id": session_id_stdout,
+                            "data": &data
+                        }));
+                        let _ = broadcast_stdout.send(data);
+                    }
                 }
             });
 
-            // Spawn task to handle stderr
+            // Spawn task to handle stderr (usually non-JSON debug output)
             let app_stderr = app_clone.clone();
             let session_id_stderr = session_id_clone.clone();
             let broadcast_stderr = broadcast_tx.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
-                    let data = line + "\n";
-                    // Emit to Tauri (for desktop app)
-                    let _ = app_stderr.emit("json-process-output", serde_json::json!({
-                        "session_id": session_id_stderr,
-                        "data": &data
-                    }));
-                    // Broadcast to WebSocket clients (for mobile web - legacy single-session connections)
-                    let _ = broadcast_stderr.send(data.clone());
-                    // Broadcast to mobile WebSocket subscribers (new multiplexed connections)
-                    let msg = serde_json::json!({
-                        "type": "chat_message",
-                        "sessionId": session_id_stderr,
-                        "message": &data
-                    }).to_string();
-                    broadcast_to_session_subscribers(&session_id_stderr, &msg);
+                    // Try to parse as JSON first (some errors come as JSON)
+                    if let Some(parsed) = parse_claude_json(&line) {
+                        let _ = app_stderr.emit("json-process-message", serde_json::json!({
+                            "session_id": session_id_stderr,
+                            "message": parsed
+                        }));
+                        let msg = serde_json::json!({
+                            "type": "chat_message",
+                            "sessionId": session_id_stderr,
+                            "message": parsed
+                        }).to_string();
+                        broadcast_to_session_subscribers(&session_id_stderr, &msg);
+                        let data = line.clone() + "\n";
+                        let _ = broadcast_stderr.send(data);
+                    } else {
+                        // Non-JSON stderr - emit as raw output
+                        let data = line + "\n";
+                        let _ = app_stderr.emit("json-process-output", serde_json::json!({
+                            "session_id": session_id_stderr,
+                            "data": &data
+                        }));
+                        let _ = broadcast_stderr.send(data);
+                    }
                 }
             });
 

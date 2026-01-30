@@ -1044,7 +1044,98 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   // JSON process event listeners (for claude-json sessions)
-  // Buffer output events and process in batches to reduce main thread pressure
+  // NEW: Pre-parsed messages from Rust - no JSON parsing needed in JS
+  const messageBuffer: Map<string, ClaudeJsonMessage[]> = new Map();
+  let messageFlushScheduled = false;
+
+  function flushMessageBuffer() {
+    messageFlushScheduled = false;
+    for (const [sessionId, messages] of messageBuffer) {
+      for (const message of messages) {
+        addChatMessage(sessionId, message);
+        // Handle result message completion
+        handleResultMessage(sessionId, message);
+      }
+    }
+    messageBuffer.clear();
+  }
+
+  // Handle result message to update session status
+  function handleResultMessage(sessionId: string, message: ClaudeJsonMessage) {
+    const chatSession = chatSessions.get(sessionId);
+    if (!chatSession) return;
+
+    // Check if this is a final result (has num_turns, total_cost_usd, or duration_ms)
+    const isFinalResult = message.type === "result" && (message.num_turns !== undefined || message.total_cost_usd !== undefined || message.duration_ms !== undefined);
+    if (!isFinalResult) return;
+
+    chatSession.isProcessing = false;
+    updateSessionActivityIndicator(sessionId, false);
+    const thinkingEl = chatSession.containerEl.querySelector(".chat-thinking") as HTMLElement;
+    if (thinkingEl) thinkingEl.style.display = "none";
+
+    // Update status with detailed usage info
+    const parts: string[] = ["Done"];
+
+    if (message.num_turns && message.num_turns > 1) {
+      parts.push(`${message.num_turns} turns`);
+    }
+
+    if (chatSession.toolUseCount > 0) {
+      parts.push(`${chatSession.toolUseCount} tool${chatSession.toolUseCount > 1 ? "s" : ""}`);
+    }
+
+    const usage = message.usage;
+    if (usage) {
+      const tokenDetails: string[] = [];
+      const totalIn = (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0);
+      if (totalIn > 0) tokenDetails.push(`${formatTokens(totalIn)} in`);
+      if (usage.output_tokens) tokenDetails.push(`${formatTokens(usage.output_tokens)} out`);
+      if (tokenDetails.length > 0) {
+        parts.push(tokenDetails.join("/"));
+      }
+
+      chatSession.totalInputTokens = totalIn;
+      chatSession.totalOutputTokens = usage.output_tokens || 0;
+      updateContextIndicator(chatSession);
+    }
+
+    if (message.duration_ms) {
+      const secs = (message.duration_ms / 1000).toFixed(1);
+      parts.push(`${secs}s`);
+    } else if (chatSession.startTime) {
+      const elapsed = Math.round((Date.now() - chatSession.startTime) / 1000);
+      parts.push(`${elapsed}s`);
+    }
+
+    if (message.total_cost_usd && message.total_cost_usd > 0) {
+      parts.push(`$${message.total_cost_usd.toFixed(4)}`);
+    }
+
+    chatSession.statusEl.textContent = parts.join(" · ");
+    chatSession.statusEl.className = "chat-status connected";
+    chatSession.startTime = null;
+
+    saveChatMessages(sessionId);
+  }
+
+  await listen<{ session_id: string; message: ClaudeJsonMessage }>("json-process-message", (event) => {
+    const { session_id, message } = event.payload;
+
+    // Add to buffer
+    if (!messageBuffer.has(session_id)) {
+      messageBuffer.set(session_id, []);
+    }
+    messageBuffer.get(session_id)!.push(message);
+
+    // Schedule flush on next animation frame if not already scheduled
+    if (!messageFlushScheduled) {
+      messageFlushScheduled = true;
+      requestAnimationFrame(flushMessageBuffer);
+    }
+  });
+
+  // LEGACY: Raw string output (fallback for unparseable messages)
   const outputBuffer: Map<string, string[]> = new Map();
   let outputFlushScheduled = false;
 
