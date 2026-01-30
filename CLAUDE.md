@@ -68,12 +68,38 @@ The pairing code appears in the desktop app's terminal output when requested.
 
 ## MCP Integration
 
-The desktop app includes an MCP server for Claude Code integration. The `agent-hub` MCP tools allow:
-- `take_screenshot` - Capture the current app state
+The `agent-hub` MCP server allows Claude Code to interact with the Agent Hub app.
+
+### Which App is MCP Connected To?
+
+**The MCP always connects to the DEV app (port 3857)**, not prod.
+
+This is configured in `.mcp.json` which runs `mcp-bridge.cjs`. The bridge connects to `AGENT_HUB_PORT` which defaults to 3857.
+
+To verify which app you're connected to:
+```bash
+# Check what's on port 3857 (dev)
+curl -s http://localhost:3857/api/auth/check
+
+# Check what's on port 3847 (prod)
+curl -s http://localhost:3847/api/auth/check
+```
+
+**IMPORTANT:** The window title shown in `take_screenshot` is always "Agent Hub" (from index.html), NOT "Agent Hub (Dev)". Don't rely on the title to determine which app you're connected to. Use the port check above instead.
+
+### MCP Tools
+
+- `take_screenshot` - Capture the current app state (title, URL, body text)
 - `execute_js` - Run JavaScript in the webview
 - `click_element`, `type_text` - Interact with UI elements
+- `list_elements` - List all interactive elements with selectors
+- `get_ui_state` - Get detailed UI state including buttons, inputs, links
 
-Use MCP to inspect app state when debugging.
+### Testing Dev App via MCP
+
+1. Make sure dev app is running: `npm run tauri dev`
+2. Verify it's on port 3857: `lsof -i :3857`
+3. Use MCP tools - they will interact with the dev app
 
 ## Debugging
 
