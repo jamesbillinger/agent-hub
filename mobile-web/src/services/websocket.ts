@@ -231,11 +231,25 @@ class WebSocketService {
 
   disconnect() {
     this.cleanup();
+    this.isAuthenticated = false;
     if (this.ws) {
       this.ws.close(1000, 'Client disconnecting');
       this.ws = null;
     }
-    this.reconnectAttempts = this.maxReconnectAttempts; // Prevent reconnect
+    this.reconnectAttempts = this.maxReconnectAttempts; // Prevent auto-reconnect
+  }
+
+  // Force reconnect - used when tab becomes visible to resync state
+  reconnect() {
+    this.cleanup();
+    this.isAuthenticated = false;
+    useGlobalStore.getState().setConnected(false);
+    if (this.ws) {
+      this.ws.close(1000, 'Reconnecting');
+      this.ws = null;
+    }
+    this.reconnectAttempts = 0; // Reset attempts for fresh connect
+    this.connect();
   }
 
   isConnected(): boolean {

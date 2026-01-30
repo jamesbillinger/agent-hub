@@ -38,6 +38,21 @@ export default function App() {
     };
   }, [isAuthenticated]);
 
+  // Reconnect when tab becomes visible (mobile browsers suspend WebSocket in background)
+  useEffect(() => {
+    if (!isAuthenticated) return;
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        console.log('Tab visible, reconnecting WebSocket');
+        websocketService.reconnect();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, [isAuthenticated]);
+
   // Restore session from URL on mount only (not on every activeSessionId change)
   useEffect(() => {
     if (isAuthenticated) {

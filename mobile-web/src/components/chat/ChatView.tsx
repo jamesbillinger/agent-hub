@@ -9,20 +9,22 @@ interface ChatViewProps {
 }
 
 export function ChatView({ sessionId }: ChatViewProps) {
-  const { sessions, sessionStatus, setActiveSession } = useGlobalStore();
+  const { sessions, sessionStatus, setActiveSession, isConnected } = useGlobalStore();
   const { messages } = useSessionStore();
 
   const session = sessions.get(sessionId);
   const status = sessionStatus.get(sessionId);
   const sessionMessages = messages.get(sessionId) || [];
 
-  // Subscribe to session on mount, unsubscribe on unmount
+  // Subscribe to session on mount and on reconnect, unsubscribe on unmount
   useEffect(() => {
-    websocketService.subscribe(sessionId);
+    if (isConnected) {
+      websocketService.subscribe(sessionId);
+    }
     return () => {
       websocketService.unsubscribe(sessionId);
     };
-  }, [sessionId]);
+  }, [sessionId, isConnected]);
 
   const handleBack = () => {
     setActiveSession(null);
