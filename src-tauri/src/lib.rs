@@ -533,6 +533,9 @@ fn init_db() -> rusqlite::Result<Connection> {
     // Migration: Add sort_order column if it doesn't exist
     let _ = conn.execute("ALTER TABLE sessions ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0", []);
 
+    // Migration: Add running_pid column to track process PIDs across restarts
+    let _ = conn.execute("ALTER TABLE sessions ADD COLUMN running_pid INTEGER", []);
+
     // Create terminal_buffers table for scrollback persistence
     // Stores compressed (gzip + base64) terminal buffer content
     conn.execute(
@@ -614,6 +617,66 @@ fn delete_paired_device_db(token: &str) -> Result<(), String> {
     conn.execute("DELETE FROM paired_devices WHERE token = ?1", params![token])
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Save/clear the running PID for a session
+#[cfg(not(target_os = "ios"))]
+fn save_session_pid(session_id: &str, pid: Option<u32>) {
+    if let Ok(conn) = init_db() {
+        let _ = conn.execute(
+            "UPDATE sessions SET running_pid = ?1 WHERE id = ?2",
+            params![pid.map(|p| p as i64), session_id],
+        );
+    }
+}
+
+/// Check if a process is still running
+#[cfg(not(target_os = "ios"))]
+fn is_process_running(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// On app startup, check for sessions with running PIDs and clean them up
+/// Since we can't reattach to orphaned processes (no stdin/stdout handles),
+/// we kill them and clear the PIDs so the user can restart cleanly
+#[cfg(not(target_os = "ios"))]
+fn cleanup_orphaned_processes() {
+    if let Ok(conn) = init_db() {
+        let mut stmt = match conn.prepare("SELECT id, running_pid FROM sessions WHERE running_pid IS NOT NULL") {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        let rows = match stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        }) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        for row in rows.flatten() {
+            let (session_id, pid) = row;
+            let pid = pid as u32;
+
+            if is_process_running(pid) {
+                // Kill the orphaned process - we can't reattach to it anyway
+                println!("Killing orphaned process for session {}: PID {}", session_id, pid);
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
+                // Give it a moment then force kill if needed
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+            } else {
+                println!("Clearing stale PID {} for session {}", pid, session_id);
+            }
+
+            // Clear the PID in either case
+            save_session_pid(&session_id, None);
+        }
+    }
 }
 
 // Generate a random 6-digit pairing code
@@ -1508,6 +1571,9 @@ fn spawn_json_process(
             // Signal that process is ready - WebSocket connections can now find it
             let _ = ready_tx.send(Ok(()));
 
+            // Save the PID to database for crash recovery
+            save_session_pid(&session_id_clone, Some(child_id));
+
             // Notify that process started
             let _ = app_clone.emit("json-process-started", serde_json::json!({
                 "session_id": session_id_clone
@@ -1640,6 +1706,8 @@ fn spawn_json_process(
                 let mut broadcasters = JSON_BROADCASTERS.lock();
                 broadcasters.remove(&session_id_clone);
             }
+            // Clear the PID from database
+            save_session_pid(&session_id_clone, None);
             // Notify WebSocket clients that session stopped
             broadcast_session_status(&session_id_clone, false);
         });
@@ -3721,6 +3789,12 @@ fn setup_app(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     // Start web server for remote access
     start_web_server();
+
+    // Clean up orphaned processes from previous app instance
+    // We can't reattach to them (no stdin/stdout handles), so kill them
+    std::thread::spawn(|| {
+        cleanup_orphaned_processes();
+    });
 
     // Start MCP server if --mcp flag was passed
     if MCP_MODE.load(std::sync::atomic::Ordering::Relaxed) {
