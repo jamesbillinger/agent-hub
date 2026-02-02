@@ -1701,9 +1701,19 @@ fn interrupt_json_process(session_id: String) -> Result<(), String> {
 #[tauri::command]
 fn kill_json_process(session_id: String) -> Result<(), String> {
     let mut processes = JSON_PROCESSES.lock();
-    processes.remove(&session_id);
-    // Note: This drops the stdin sender which should cause the process to eventually exit
-    // For force kill, we'd need to store the Child handle
+    if let Some(process) = processes.remove(&session_id) {
+        // Kill the process using its PID
+        unsafe {
+            libc::kill(process.child_id as i32, libc::SIGTERM);
+        }
+        // Give it a moment to terminate gracefully, then force kill
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            unsafe {
+                libc::kill(process.child_id as i32, libc::SIGKILL);
+            }
+        });
+    }
     Ok(())
 }
 
@@ -3797,8 +3807,27 @@ pub fn run() {
             get_local_ips,
             mcp_callback
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Kill all JSON processes on app exit
+                let processes = JSON_PROCESSES.lock();
+                for (session_id, process) in processes.iter() {
+                    println!("Cleaning up process for session {}", session_id);
+                    unsafe {
+                        libc::kill(process.child_id as i32, libc::SIGTERM);
+                    }
+                }
+                // Give processes a moment to terminate, then force kill
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                for (_session_id, process) in processes.iter() {
+                    unsafe {
+                        libc::kill(process.child_id as i32, libc::SIGKILL);
+                    }
+                }
+            }
+        });
 }
 
 // iOS version without PTY commands (PTY not supported on iOS)
