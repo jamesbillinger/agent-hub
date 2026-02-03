@@ -610,12 +610,27 @@ async function autoRecoverClaudeSession(sessionId: string): Promise<void> {
 
 /**
  * Reset a Claude session ID to start fresh.
+ * Kills the running process first if needed.
  */
 async function resetClaudeSessionId(sessionId: string): Promise<void> {
   const session = sessions.get(sessionId);
-  if (!session || session.agentType !== "claude") return;
+  if (!session) return;
+
+  // Only for Claude sessions
+  if (session.agentType !== "claude" && session.agentType !== "claude-json") return;
+
+  // Kill the current process if running
+  if (session.isRunning) {
+    try {
+      await invoke("kill_json_process", { sessionId });
+    } catch {
+      // Might already be dead
+    }
+    session.isRunning = false;
+  }
 
   // Generate new Claude session ID
+  const oldSessionId = session.claudeSessionId;
   session.claudeSessionId = crypto.randomUUID();
   session.hasBeenStarted = false;
 
@@ -623,10 +638,34 @@ async function resetClaudeSessionId(sessionId: string): Promise<void> {
   sessionErrorsDetected.delete(sessionId);
   errorDetectionBuffer.delete(sessionId);
 
+  // Reset token tracking for context indicator
+  const chatSession = chatSessions.get(sessionId);
+  if (chatSession) {
+    chatSession.totalInputTokens = 0;
+    chatSession.totalOutputTokens = 0;
+    updateContextIndicator(chatSession);
+
+    // Update status
+    chatSession.statusEl.textContent = "Context reset - ready";
+    chatSession.statusEl.className = "chat-status";
+
+    // Add visual indicator
+    const timestamp = new Date().toLocaleTimeString();
+    addChatMessage(sessionId, {
+      type: "system",
+      subtype: "stopped",
+      result: `--- Context reset at ${timestamp} ---\nPrevious session: ${oldSessionId?.substring(0, 8) || "none"}...\nNew session: ${session.claudeSessionId.substring(0, 8)}...\nChat history preserved. Claude will start fresh on next message.`,
+    });
+  }
+
   // Save to database
   await saveSessionToDb(session);
 
-  // Show message
+  // Update UI
+  renderSessionList();
+  updateStartBanner();
+
+  // For terminal-based Claude sessions
   session.terminal?.write("\r\n\x1b[32m[Session ID reset - ready to start fresh]\x1b[0m\r\n");
 }
 
