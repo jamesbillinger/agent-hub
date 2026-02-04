@@ -1504,14 +1504,27 @@ document.addEventListener("DOMContentLoaded", async () => {
       e.preventDefault();
       toggleSidebar();
     }
+    // Cmd+F to search in active chat session
+    if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+      if (activeSessionId) {
+        const chatSession = chatSessions.get(activeSessionId);
+        if (chatSession) {
+          e.preventDefault();
+          showChatSearch(activeSessionId);
+        }
+      }
+    }
     // Escape to close modals or interrupt processing
     if (e.key === "Escape") {
       const diffModal = document.getElementById("diff-modal");
       const planModal = document.getElementById("plan-modal");
       const pairingModal = document.getElementById("pairing-modal");
       const claudeSessionsModal = document.getElementById("claude-sessions-modal");
+      const chatSearchBar = document.querySelector(".chat-search-bar.visible");
 
-      if (settingsModal.classList.contains("visible")) {
+      if (chatSearchBar) {
+        hideChatSearch();
+      } else if (settingsModal.classList.contains("visible")) {
         hideSettingsModal();
       } else if (aboutModal.classList.contains("visible")) {
         hideAboutModal();
@@ -4846,11 +4859,17 @@ function showContextDetails(sessionId: string): void {
 /**
  * Render the todos panel for a chat session
  */
+// Track which sessions have dismissed todos
+const dismissedTodos = new Set<string>();
+
 function renderTodosPanel(chatSession: ChatSession): void {
   const { todosEl, todos } = chatSession;
 
-  // Hide if no todos
-  if (!todos || todos.length === 0) {
+  // Get session ID from the container
+  const sessionId = chatSession.containerEl.dataset.sessionId || "";
+
+  // Hide if no todos or if dismissed
+  if (!todos || todos.length === 0 || dismissedTodos.has(sessionId)) {
     todosEl.innerHTML = "";
     todosEl.style.display = "none";
     return;
@@ -4863,10 +4882,13 @@ function renderTodosPanel(chatSession: ChatSession): void {
   const inProgress = todos.find((t) => t.status === "in_progress");
   const total = todos.length;
 
-  // Build the HTML
+  // Build the HTML with dismiss button
   let html = `<div class="todos-header">
     <span class="todos-title">Tasks</span>
-    <span class="todos-progress">${completed}/${total}</span>
+    <div class="todos-header-right">
+      <span class="todos-progress">${completed}/${total}</span>
+      <button class="todos-dismiss" title="Dismiss tasks panel">×</button>
+    </div>
   </div>`;
 
   // Show current task prominently if there is one
@@ -4895,6 +4917,177 @@ function renderTodosPanel(chatSession: ChatSession): void {
   html += `</div>`;
 
   todosEl.innerHTML = html;
+
+  // Add dismiss button handler
+  const dismissBtn = todosEl.querySelector(".todos-dismiss");
+  if (dismissBtn) {
+    dismissBtn.addEventListener("click", () => {
+      dismissedTodos.add(sessionId);
+      todosEl.innerHTML = "";
+      todosEl.style.display = "none";
+    });
+  }
+}
+
+// ============================================
+// Chat Search (Cmd+F)
+// ============================================
+
+interface ChatSearchState {
+  sessionId: string;
+  matches: HTMLElement[];
+  currentIndex: number;
+}
+
+let chatSearchState: ChatSearchState | null = null;
+
+function showChatSearch(sessionId: string): void {
+  const chatSession = chatSessions.get(sessionId);
+  if (!chatSession) return;
+
+  // Check if search bar already exists
+  let searchBar = chatSession.containerEl.querySelector(".chat-search-bar") as HTMLElement;
+  if (!searchBar) {
+    // Create search bar
+    searchBar = document.createElement("div");
+    searchBar.className = "chat-search-bar";
+    searchBar.innerHTML = `
+      <input type="text" class="chat-search-input" placeholder="Search in conversation..." />
+      <span class="chat-search-count"></span>
+      <button class="chat-search-prev" title="Previous (Shift+Enter)">▲</button>
+      <button class="chat-search-next" title="Next (Enter)">▼</button>
+      <button class="chat-search-close" title="Close (Escape)">×</button>
+    `;
+
+    // Insert at the top of the chat session container
+    chatSession.containerEl.insertBefore(searchBar, chatSession.containerEl.firstChild);
+
+    const input = searchBar.querySelector(".chat-search-input") as HTMLInputElement;
+    const countEl = searchBar.querySelector(".chat-search-count") as HTMLElement;
+    const prevBtn = searchBar.querySelector(".chat-search-prev") as HTMLButtonElement;
+    const nextBtn = searchBar.querySelector(".chat-search-next") as HTMLButtonElement;
+    const closeBtn = searchBar.querySelector(".chat-search-close") as HTMLButtonElement;
+
+    // Search on input
+    input.addEventListener("input", () => {
+      performChatSearch(sessionId, input.value, countEl);
+    });
+
+    // Keyboard navigation
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        if (e.shiftKey) {
+          navigateChatSearch("prev");
+        } else {
+          navigateChatSearch("next");
+        }
+      } else if (e.key === "Escape") {
+        hideChatSearch();
+      }
+    });
+
+    // Button handlers
+    prevBtn.addEventListener("click", () => navigateChatSearch("prev"));
+    nextBtn.addEventListener("click", () => navigateChatSearch("next"));
+    closeBtn.addEventListener("click", () => hideChatSearch());
+  }
+
+  // Show and focus
+  searchBar.classList.add("visible");
+  const input = searchBar.querySelector(".chat-search-input") as HTMLInputElement;
+  input.focus();
+  input.select();
+}
+
+function hideChatSearch(): void {
+  const searchBar = document.querySelector(".chat-search-bar.visible");
+  if (searchBar) {
+    searchBar.classList.remove("visible");
+    // Clear highlights
+    clearChatSearchHighlights();
+    chatSearchState = null;
+  }
+}
+
+function performChatSearch(sessionId: string, query: string, countEl: HTMLElement): void {
+  const chatSession = chatSessions.get(sessionId);
+  if (!chatSession) return;
+
+  // Clear previous highlights
+  clearChatSearchHighlights();
+
+  if (!query.trim()) {
+    countEl.textContent = "";
+    chatSearchState = null;
+    return;
+  }
+
+  const matches: HTMLElement[] = [];
+  const searchLower = query.toLowerCase();
+
+  // Search through all message elements
+  const messageEls = chatSession.messagesEl.querySelectorAll(".chat-message");
+  messageEls.forEach((msgEl) => {
+    const contentEl = msgEl.querySelector(".message-content, .assistant-content, .tool-content, .error-content, .system-content");
+    if (contentEl) {
+      const text = contentEl.textContent || "";
+      if (text.toLowerCase().includes(searchLower)) {
+        (msgEl as HTMLElement).classList.add("search-match");
+        matches.push(msgEl as HTMLElement);
+      }
+    }
+  });
+
+  chatSearchState = {
+    sessionId,
+    matches,
+    currentIndex: -1,
+  };
+
+  if (matches.length > 0) {
+    countEl.textContent = `${matches.length} match${matches.length === 1 ? "" : "es"}`;
+    // Navigate to first match
+    navigateChatSearch("next");
+  } else {
+    countEl.textContent = "No matches";
+  }
+}
+
+function navigateChatSearch(direction: "prev" | "next"): void {
+  if (!chatSearchState || chatSearchState.matches.length === 0) return;
+
+  // Remove current highlight
+  if (chatSearchState.currentIndex >= 0) {
+    chatSearchState.matches[chatSearchState.currentIndex].classList.remove("search-current");
+  }
+
+  // Update index
+  if (direction === "next") {
+    chatSearchState.currentIndex = (chatSearchState.currentIndex + 1) % chatSearchState.matches.length;
+  } else {
+    chatSearchState.currentIndex = chatSearchState.currentIndex <= 0
+      ? chatSearchState.matches.length - 1
+      : chatSearchState.currentIndex - 1;
+  }
+
+  // Highlight and scroll to current
+  const current = chatSearchState.matches[chatSearchState.currentIndex];
+  current.classList.add("search-current");
+  current.scrollIntoView({ behavior: "smooth", block: "center" });
+
+  // Update count display
+  const searchBar = document.querySelector(".chat-search-bar.visible");
+  if (searchBar) {
+    const countEl = searchBar.querySelector(".chat-search-count") as HTMLElement;
+    countEl.textContent = `${chatSearchState.currentIndex + 1}/${chatSearchState.matches.length}`;
+  }
+}
+
+function clearChatSearchHighlights(): void {
+  document.querySelectorAll(".search-match, .search-current").forEach((el) => {
+    el.classList.remove("search-match", "search-current");
+  });
 }
 
 // Chat message persistence functions

@@ -2681,10 +2681,33 @@ body.resizing-sidebar {
   color: var(--text-secondary);
 }
 
+.todos-header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .todos-progress {
   color: var(--text-muted);
   font-family: 'Menlo', 'Monaco', monospace;
   font-size: 11px;
+}
+
+.todos-dismiss {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 4px;
+  opacity: 0.6;
+  transition: opacity 0.15s;
+}
+
+.todos-dismiss:hover {
+  opacity: 1;
+  color: var(--text-primary);
 }
 
 .todo-current {
@@ -2751,6 +2774,81 @@ body.resizing-sidebar {
 .todo-content {
   flex: 1;
   font-size: 11px;
+}
+
+/* ============================================
+   Chat Search (Cmd+F)
+   ============================================ */
+
+.chat-search-bar {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.chat-search-bar.visible {
+  display: flex;
+}
+
+.chat-search-input {
+  flex: 1;
+  min-width: 150px;
+  max-width: 300px;
+  padding: 6px 10px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-input);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 13px;
+  outline: none;
+}
+
+.chat-search-input:focus {
+  border-color: var(--accent-blue);
+}
+
+.chat-search-count {
+  color: var(--text-muted);
+  font-size: 12px;
+  min-width: 70px;
+}
+
+.chat-search-prev,
+.chat-search-next,
+.chat-search-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 4px 8px;
+  font-size: 12px;
+  border-radius: 4px;
+  transition: background 0.15s, color 0.15s;
+}
+
+.chat-search-prev:hover,
+.chat-search-next:hover,
+.chat-search-close:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.chat-search-close {
+  font-size: 16px;
+}
+
+/* Search match highlighting */
+.chat-message.search-match {
+  background: rgba(255, 200, 0, 0.1);
+  border-left: 3px solid var(--accent-yellow, #e5a800);
+}
+
+.chat-message.search-current {
+  background: rgba(255, 200, 0, 0.25);
+  border-left: 3px solid var(--accent-yellow, #e5a800);
 }
 
 /* ============================================
