@@ -5026,18 +5026,16 @@ function performChatSearch(sessionId: string, query: string, countEl: HTMLElemen
   const matches: HTMLElement[] = [];
   const searchLower = query.toLowerCase();
 
-  // Search through all message elements
-  const messageEls = chatSession.messagesEl.querySelectorAll(".chat-message");
-  messageEls.forEach((msgEl) => {
-    const contentEl = msgEl.querySelector(".message-content, .assistant-content, .tool-content, .error-content, .system-content");
-    if (contentEl) {
-      const text = contentEl.textContent || "";
-      if (text.toLowerCase().includes(searchLower)) {
-        (msgEl as HTMLElement).classList.add("search-match");
-        matches.push(msgEl as HTMLElement);
-      }
+  // Search through all message elements (direct children of messagesEl)
+  // Messages have classes like .user, .assistant, .tool-use, .tool-result, .system
+  const messageEls = chatSession.messagesEl.children;
+  for (const msgEl of messageEls) {
+    const text = msgEl.textContent || "";
+    if (text.toLowerCase().includes(searchLower)) {
+      (msgEl as HTMLElement).classList.add("search-match");
+      matches.push(msgEl as HTMLElement);
     }
-  });
+  }
 
   chatSearchState = {
     sessionId,
