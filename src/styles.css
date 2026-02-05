@@ -2444,6 +2444,10 @@ body.resizing-sidebar {
   color: var(--accent-green);
 }
 
+.chat-status.compacting {
+  color: var(--accent-yellow, #e5a800);
+}
+
 .chat-status.error {
   color: #f14c4c;
 }

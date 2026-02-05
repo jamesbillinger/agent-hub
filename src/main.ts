@@ -4539,6 +4539,16 @@ function processChatOutput(sessionId: string, data: string) {
 
     try {
       const message = JSON.parse(line) as ClaudeJsonMessage;
+
+      // Detect compaction messages and update status
+      if (message.type === "system" && message.result) {
+        const resultLower = message.result.toLowerCase();
+        if (resultLower.includes("compact") || resultLower.includes("summariz")) {
+          chatSession.statusEl.textContent = "Compacting context...";
+          chatSession.statusEl.className = "chat-status compacting";
+        }
+      }
+
       addChatMessage(sessionId, message);
 
       // Check if response is complete - only the FINAL result has num_turns or total_cost_usd
