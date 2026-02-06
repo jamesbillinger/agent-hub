@@ -978,6 +978,38 @@ document.addEventListener("DOMContentLoaded", async () => {
       }
       return;
     }
+
+    // Handle plan approve button
+    const planApproveBtn = (e.target as HTMLElement).closest(".plan-approve-btn") as HTMLButtonElement;
+    if (planApproveBtn && !planApproveBtn.disabled) {
+      e.preventDefault();
+      handlePlanApprove(planApproveBtn);
+      return;
+    }
+
+    // Handle plan request changes button
+    const planChangesBtn = (e.target as HTMLElement).closest(".plan-changes-btn") as HTMLButtonElement;
+    if (planChangesBtn && !planChangesBtn.disabled) {
+      e.preventDefault();
+      const container = planChangesBtn.closest(".exit-plan-mode") as HTMLElement;
+      if (container) {
+        const inputArea = container.querySelector(".plan-changes-input") as HTMLElement;
+        if (inputArea) {
+          inputArea.style.display = "block";
+          const textarea = inputArea.querySelector(".plan-changes-text") as HTMLTextAreaElement;
+          if (textarea) textarea.focus();
+        }
+      }
+      return;
+    }
+
+    // Handle plan changes submit button
+    const planChangesSubmit = (e.target as HTMLElement).closest(".plan-changes-submit") as HTMLButtonElement;
+    if (planChangesSubmit && !planChangesSubmit.disabled) {
+      e.preventDefault();
+      handlePlanChangesSubmit(planChangesSubmit);
+      return;
+    }
   });
 
   // Claude sessions modal event listeners
@@ -3855,6 +3887,115 @@ async function handleAskSubmit(submitBtn: HTMLButtonElement) {
 }
 
 /**
+ * Handle plan approve button click
+ */
+async function handlePlanApprove(approveBtn: HTMLButtonElement) {
+  const container = approveBtn.closest(".exit-plan-mode") as HTMLElement;
+  if (!container || !activeSessionId) return;
+
+  const chatSession = chatSessions.get(activeSessionId);
+  if (!chatSession) return;
+
+  // Disable buttons
+  container.classList.add("answered");
+  approveBtn.disabled = true;
+  approveBtn.textContent = "Approved";
+  const changesBtn = container.querySelector(".plan-changes-btn") as HTMLButtonElement;
+  if (changesBtn) changesBtn.style.display = "none";
+  const changesInput = container.querySelector(".plan-changes-input") as HTMLElement;
+  if (changesInput) changesInput.style.display = "none";
+
+  const responseText = "Plan approved. Proceed with implementation.";
+
+  // Add user's approval to chat display
+  addChatMessage(activeSessionId, { type: "user", result: responseText });
+
+  // Send as user message
+  const jsonMessage = JSON.stringify({
+    type: "user",
+    message: {
+      role: "user",
+      content: responseText,
+    }
+  }) + "\n";
+
+  // Show thinking indicator
+  chatSession.isProcessing = true;
+  chatSession.statusEl.textContent = "Processing...";
+  chatSession.statusEl.className = "chat-status";
+  updateSessionActivityIndicator(activeSessionId, true);
+  const thinkingEl = chatSession.containerEl.querySelector(".chat-thinking") as HTMLElement;
+  if (thinkingEl) thinkingEl.style.display = "flex";
+
+  try {
+    await invoke("write_to_process", { sessionId: activeSessionId, data: jsonMessage });
+  } catch (err) {
+    console.error("Failed to send plan approval:", err);
+    chatSession.statusEl.textContent = `Failed to send approval`;
+    chatSession.statusEl.className = "chat-status error";
+    chatSession.isProcessing = false;
+    updateSessionActivityIndicator(activeSessionId, false);
+    if (thinkingEl) thinkingEl.style.display = "none";
+  }
+}
+
+/**
+ * Handle plan changes submit button click
+ */
+async function handlePlanChangesSubmit(submitBtn: HTMLButtonElement) {
+  const container = submitBtn.closest(".exit-plan-mode") as HTMLElement;
+  if (!container || !activeSessionId) return;
+
+  const chatSession = chatSessions.get(activeSessionId);
+  if (!chatSession) return;
+
+  const textarea = container.querySelector(".plan-changes-text") as HTMLTextAreaElement;
+  const feedback = textarea?.value.trim();
+  if (!feedback) return;
+
+  // Disable everything
+  container.classList.add("answered");
+  submitBtn.disabled = true;
+  submitBtn.textContent = "Sent";
+  textarea.disabled = true;
+  const approveBtn = container.querySelector(".plan-approve-btn") as HTMLButtonElement;
+  if (approveBtn) approveBtn.style.display = "none";
+  const changesBtn = container.querySelector(".plan-changes-btn") as HTMLButtonElement;
+  if (changesBtn) changesBtn.style.display = "none";
+
+  // Add user's feedback to chat display
+  addChatMessage(activeSessionId, { type: "user", result: feedback });
+
+  // Send as user message
+  const jsonMessage = JSON.stringify({
+    type: "user",
+    message: {
+      role: "user",
+      content: feedback,
+    }
+  }) + "\n";
+
+  // Show thinking indicator
+  chatSession.isProcessing = true;
+  chatSession.statusEl.textContent = "Processing...";
+  chatSession.statusEl.className = "chat-status";
+  updateSessionActivityIndicator(activeSessionId, true);
+  const thinkingEl = chatSession.containerEl.querySelector(".chat-thinking") as HTMLElement;
+  if (thinkingEl) thinkingEl.style.display = "flex";
+
+  try {
+    await invoke("write_to_process", { sessionId: activeSessionId, data: jsonMessage });
+  } catch (err) {
+    console.error("Failed to send plan feedback:", err);
+    chatSession.statusEl.textContent = `Failed to send feedback`;
+    chatSession.statusEl.className = "chat-status error";
+    chatSession.isProcessing = false;
+    updateSessionActivityIndicator(activeSessionId, false);
+    if (thinkingEl) thinkingEl.style.display = "none";
+  }
+}
+
+/**
  * Paste image from clipboard (Ctrl+V)
  */
 async function pasteImageFromClipboard(sessionId: string) {
@@ -4155,6 +4296,14 @@ function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: s
       }
 
       html += `<div class="plan-content loading"><em>Loading plan...</em></div>`;
+      html += `<div class="plan-actions">`;
+      html += `<button class="plan-approve-btn">Approve Plan</button>`;
+      html += `<button class="plan-changes-btn">Request Changes</button>`;
+      html += `</div>`;
+      html += `<div class="plan-changes-input" style="display:none">`;
+      html += `<textarea class="plan-changes-text" placeholder="What changes would you like?"></textarea>`;
+      html += `<button class="plan-changes-submit">Send Feedback</button>`;
+      html += `</div>`;
       html += `</div>`;
 
       return html;
