@@ -183,6 +183,7 @@ interface Session {
   webglAddon?: WebglAddon;
   sortOrder: number;
   outputByteCount?: number; // Track bytes for periodic texture atlas clearing
+  folderId?: string;
 }
 
 interface SessionData {
@@ -194,6 +195,21 @@ interface SessionData {
   created_at: string;
   claude_session_id: string | null;
   sort_order: number;
+  folder_id: string | null;
+}
+
+interface Folder {
+  id: string;
+  name: string;
+  sortOrder: number;
+  collapsed: boolean;
+}
+
+interface FolderData {
+  id: string;
+  name: string;
+  sort_order: number;
+  collapsed: boolean;
 }
 
 type SortOption = "custom" | "name" | "date" | "agent";
@@ -328,6 +344,7 @@ interface RecentlyClosedSession {
 
 // State
 const sessions: Map<string, Session> = new Map();
+const folders: Map<string, Folder> = new Map();
 const chatSessions: Map<string, ChatSession> = new Map();
 let activeSessionId: string | null = null;
 let searchQuery = "";
@@ -858,6 +875,13 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     // Show the new session modal with claude-json pre-selected, focused on working dir
     showNewSessionModal("claude-json", { workingDir: "~/dev/", focusWorkingDir: true });
+  });
+
+  // Handle "New Folder" button
+  document.getElementById("create-folder-btn")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    dropdownMenu.classList.remove("visible");
+    createFolder();
   });
 
   // Close dropdowns when clicking outside
@@ -1637,13 +1661,24 @@ document.addEventListener("DOMContentLoaded", async () => {
   document.addEventListener("mousemove", (e) => {
     if (!isDragging || !draggedSessionId || currentSort !== "custom") return;
 
-    // Find the session item we're over
-    const target = document.elementFromPoint(e.clientX, e.clientY)?.closest(".session-item") as HTMLElement;
+    // Find the session item or folder header we're over
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    const target = el?.closest(".session-item") as HTMLElement;
+    const folderTarget = el?.closest(".folder-header") as HTMLElement;
 
     // Clear all indicators
     sessionListEl.querySelectorAll(".session-item").forEach(el => {
       el.classList.remove("drag-over", "drag-over-bottom");
     });
+    sessionListEl.querySelectorAll(".folder-header").forEach(el => {
+      el.classList.remove("drag-over");
+    });
+
+    // Highlight folder header if hovering over it
+    if (folderTarget) {
+      folderTarget.classList.add("drag-over");
+      return;
+    }
 
     if (!target || target.dataset.sessionId === draggedSessionId) return;
 
@@ -1664,14 +1699,30 @@ document.addEventListener("DOMContentLoaded", async () => {
       return;
     }
 
-    // Find the session item we're over
-    const target = document.elementFromPoint(e.clientX, e.clientY)?.closest(".session-item") as HTMLElement;
+    // Check if dropped on a folder header
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    const folderTarget = el?.closest(".folder-header") as HTMLElement;
 
     // Clear indicators and dragging state
     sessionListEl.querySelectorAll(".session-item").forEach(el => {
       el.classList.remove("drag-over", "drag-over-bottom", "dragging");
     });
+    sessionListEl.querySelectorAll(".folder-header").forEach(el => {
+      el.classList.remove("drag-over");
+    });
     document.body.style.cursor = "";
+
+    // If dropped on a folder header, move session to that folder
+    if (folderTarget && folderTarget.dataset.folderId) {
+      const folderId = folderTarget.dataset.folderId;
+      await moveSessionToFolder(draggedSessionId, folderId);
+      isDragging = false;
+      draggedSessionId = null;
+      return;
+    }
+
+    // Find the session item we're over
+    const target = el?.closest(".session-item") as HTMLElement;
 
     if (!target || target.dataset.sessionId === draggedSessionId) {
       isDragging = false;
@@ -1726,8 +1777,9 @@ document.addEventListener("DOMContentLoaded", async () => {
     renderSessionListImmediate(); // Immediate for drag-drop responsiveness
   });
 
-  // Load saved sessions from database
+  // Load saved sessions and folders from database
   await loadSavedSessions();
+  await loadFolders();
   await loadRecentlyClosed();
 
   // Initial render
@@ -1771,11 +1823,29 @@ async function loadSavedSessions() {
         // This ensures we use --resume when restarting
         hasBeenStarted: !!data.claude_session_id,
         sortOrder: data.sort_order,
+        folderId: data.folder_id || undefined,
       };
       sessions.set(session.id, session);
     }
   } catch (err) {
     console.error("Failed to load sessions:", err);
+  }
+}
+
+async function loadFolders() {
+  try {
+    const savedFolders: FolderData[] = await invoke("load_folders");
+    for (const data of savedFolders) {
+      const folder: Folder = {
+        id: data.id,
+        name: data.name,
+        sortOrder: data.sort_order,
+        collapsed: data.collapsed,
+      };
+      folders.set(folder.id, folder);
+    }
+  } catch (err) {
+    console.error("Failed to load folders:", err);
   }
 }
 
@@ -1790,11 +1860,58 @@ async function saveSessionToDb(session: Session) {
       created_at: session.createdAt.toISOString(),
       claude_session_id: session.claudeSessionId || null,
       sort_order: session.sortOrder,
+      folder_id: session.folderId || null,
     };
     await invoke("save_session", { session: data });
   } catch (err) {
     console.error("Failed to save session:", err);
   }
+}
+
+async function saveFolderToDb(folder: Folder) {
+  try {
+    const data: FolderData = {
+      id: folder.id,
+      name: folder.name,
+      sort_order: folder.sortOrder,
+      collapsed: folder.collapsed,
+    };
+    await invoke("save_folder", { folder: data });
+  } catch (err) {
+    console.error("Failed to save folder:", err);
+  }
+}
+
+async function deleteFolderFromDb(folderId: string) {
+  try {
+    await invoke("delete_folder", { folderId });
+  } catch (err) {
+    console.error("Failed to delete folder:", err);
+  }
+}
+
+async function moveSessionToFolder(sessionId: string, folderId: string | null) {
+  const session = sessions.get(sessionId);
+  if (!session) return;
+  session.folderId = folderId || undefined;
+  try {
+    await invoke("update_session_folder", { sessionId, folderId });
+  } catch (err) {
+    console.error("Failed to update session folder:", err);
+  }
+  renderSessionList();
+}
+
+async function toggleFolderCollapsed(folderId: string) {
+  const folder = folders.get(folderId);
+  if (!folder) return;
+  folder.collapsed = !folder.collapsed;
+  try {
+    await invoke("toggle_folder_collapsed", { folderId, collapsed: folder.collapsed });
+  } catch (err) {
+    console.error("Failed to toggle folder collapsed:", err);
+  }
+  renderSessionList();
 }
 
 async function updateSessionOrders(sessionOrders: [string, number][]) {
@@ -2881,78 +2998,69 @@ function renderSessionListImmediate() {
     return;
   }
 
-  for (let i = 0; i < sortedSessions.length; i++) {
-    const session = sortedSessions[i];
-    const item = document.createElement("div");
-    // Preserve activity state across re-renders
-    const isSessionActive = activityState.get(session.id)?.isActive || false;
-    item.className = `session-item${session.id === activeSessionId ? " active" : ""}${isSessionActive ? " session-active" : ""}`;
-    item.dataset.sessionId = session.id;
+  // Track visible index for keyboard shortcuts (⌘1-9)
+  let visibleIndex = 0;
 
-    // Only show agent badge for non-Claude sessions (most are Claude, so skip to save space)
-    const isClaudeSession = session.agentType === "claude" || session.agentType === "claude-json";
-    const agentBadgeClass = session.agentType === "codex" ? "codex" :
-                           session.agentType === "aider" ? "aider" : "";
-    const agentBadgeHtml = isClaudeSession ? "" :
-      `<div class="meta"><span class="agent-badge ${agentBadgeClass}">${getAgentLabel(session.agentType)}</span></div>`;
+  // When searching or sort != "custom", render flat list (no folder grouping)
+  const useFolders = !searchQuery && currentSort === "custom" && folders.size > 0;
 
-    // Show shortcut indicator for first 10 sessions (⌘1-9, ⌘0)
-    const shortcutKey = i < 9 ? String(i + 1) : i === 9 ? "0" : null;
-    const shortcutHtml = shortcutKey ? `<span class="shortcut-hint">⌘${shortcutKey}</span>` : "";
-
-    // Determine status class - for JSON sessions, show processing state with blue pulsing dot
-    const chatSession = chatSessions.get(session.id);
-    const isProcessing = chatSession?.isProcessing || false;
-    const statusClass = isProcessing ? "processing" : (session.isRunning ? "running" : "");
-
-    item.innerHTML = `
-      <div class="drag-handle" title="Drag to reorder">⋮⋮</div>
-      <div class="status ${statusClass}"></div>
-      <div class="details">
-        <div class="name">${escapeHtml(session.name)}</div>
-        ${agentBadgeHtml}
-      </div>
-      ${shortcutHtml}
-      <button class="close-btn" title="Close session">×</button>
-    `;
-
-    // Click to switch
-    item.addEventListener("click", (e) => {
-      const target = e.target as HTMLElement;
-      if (!target.classList.contains("close-btn") && !target.classList.contains("drag-handle")) {
-        switchToSession(session.id);
-      }
-    });
-
-    // Double-click to rename
-    const nameEl = item.querySelector(".name")!;
-    nameEl.addEventListener("dblclick", (e) => {
-      e.stopPropagation();
-      startRenaming(session.id, nameEl as HTMLElement);
-    });
-
-    // Close button
-    item.querySelector(".close-btn")!.addEventListener("click", (e) => {
-      e.stopPropagation();
-      closeSession(session.id);
-    });
-
-    // Mouse-based drag - start on drag handle mousedown
-    if (currentSort === "custom") {
-      const dragHandle = item.querySelector(".drag-handle") as HTMLElement;
-      if (dragHandle) {
-        dragHandle.addEventListener("mousedown", (e) => {
-          e.preventDefault();
-          isDragging = true;
-          draggedSessionId = session.id;
-          dragStartY = e.clientY;
-          item.classList.add("dragging");
-          document.body.style.cursor = "grabbing";
-        });
-      }
+  if (useFolders) {
+    // Render unfiled sessions first (no folder header)
+    const unfiled = sortedSessions.filter(s => !s.folderId);
+    for (const session of unfiled) {
+      sessionListEl.appendChild(createSessionItem(session, visibleIndex++));
     }
 
-    sessionListEl.appendChild(item);
+    // Render each folder with its sessions
+    const sortedFolders = Array.from(folders.values()).sort((a, b) => a.sortOrder - b.sortOrder);
+    for (const folder of sortedFolders) {
+      const folderSessions = sortedSessions.filter(s => s.folderId === folder.id);
+
+      // Render folder header
+      const headerEl = document.createElement("div");
+      headerEl.className = "folder-header";
+      headerEl.dataset.folderId = folder.id;
+      headerEl.innerHTML = `
+        <span class="folder-toggle">${folder.collapsed ? "▸" : "▾"}</span>
+        <span class="folder-name">${escapeHtml(folder.name)}</span>
+        <span class="folder-count">${folderSessions.length}</span>
+      `;
+
+      // Click to toggle collapse
+      headerEl.addEventListener("click", (e) => {
+        const target = e.target as HTMLElement;
+        // Don't toggle when clicking on an inline rename input
+        if (target.tagName === "INPUT") return;
+        toggleFolderCollapsed(folder.id);
+      });
+
+      // Double-click folder name to rename
+      const folderNameEl = headerEl.querySelector(".folder-name")!;
+      folderNameEl.addEventListener("dblclick", (e) => {
+        e.stopPropagation();
+        startRenamingFolder(folder.id, folderNameEl as HTMLElement);
+      });
+
+      // Right-click context menu on folder
+      headerEl.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        showFolderContextMenu(e.clientX, e.clientY, folder.id);
+      });
+
+      sessionListEl.appendChild(headerEl);
+
+      // Render sessions in this folder (if not collapsed)
+      if (!folder.collapsed) {
+        for (const session of folderSessions) {
+          sessionListEl.appendChild(createSessionItem(session, visibleIndex++));
+        }
+      }
+    }
+  } else {
+    // Flat list (searching, or non-custom sort, or no folders exist)
+    for (const session of sortedSessions) {
+      sessionListEl.appendChild(createSessionItem(session, visibleIndex++));
+    }
   }
 
   // After rebuilding the DOM, update all processing indicators
@@ -2963,6 +3071,85 @@ function renderSessionListImmediate() {
     }
   }
   perfEnd("renderSessionList");
+}
+
+function createSessionItem(session: Session, index: number): HTMLElement {
+  const item = document.createElement("div");
+  // Preserve activity state across re-renders
+  const isSessionActive = activityState.get(session.id)?.isActive || false;
+  item.className = `session-item${session.id === activeSessionId ? " active" : ""}${isSessionActive ? " session-active" : ""}`;
+  item.dataset.sessionId = session.id;
+
+  // Only show agent badge for non-Claude sessions (most are Claude, so skip to save space)
+  const isClaudeSession = session.agentType === "claude" || session.agentType === "claude-json";
+  const agentBadgeClass = session.agentType === "codex" ? "codex" :
+                         session.agentType === "aider" ? "aider" : "";
+  const agentBadgeHtml = isClaudeSession ? "" :
+    `<div class="meta"><span class="agent-badge ${agentBadgeClass}">${getAgentLabel(session.agentType)}</span></div>`;
+
+  // Show shortcut indicator for first 10 sessions (⌘1-9, ⌘0)
+  const shortcutKey = index < 9 ? String(index + 1) : index === 9 ? "0" : null;
+  const shortcutHtml = shortcutKey ? `<span class="shortcut-hint">⌘${shortcutKey}</span>` : "";
+
+  // Determine status class - for JSON sessions, show processing state with blue pulsing dot
+  const chatSession = chatSessions.get(session.id);
+  const isProcessing = chatSession?.isProcessing || false;
+  const statusClass = isProcessing ? "processing" : (session.isRunning ? "running" : "");
+
+  item.innerHTML = `
+    <div class="drag-handle" title="Drag to reorder">⋮⋮</div>
+    <div class="status ${statusClass}"></div>
+    <div class="details">
+      <div class="name">${escapeHtml(session.name)}</div>
+      ${agentBadgeHtml}
+    </div>
+    ${shortcutHtml}
+    <button class="close-btn" title="Close session">×</button>
+  `;
+
+  // Click to switch
+  item.addEventListener("click", (e) => {
+    const target = e.target as HTMLElement;
+    if (!target.classList.contains("close-btn") && !target.classList.contains("drag-handle")) {
+      switchToSession(session.id);
+    }
+  });
+
+  // Double-click to rename
+  const nameEl = item.querySelector(".name")!;
+  nameEl.addEventListener("dblclick", (e) => {
+    e.stopPropagation();
+    startRenaming(session.id, nameEl as HTMLElement);
+  });
+
+  // Right-click context menu on session
+  item.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    showSessionContextMenu(e.clientX, e.clientY, session.id);
+  });
+
+  // Close button
+  item.querySelector(".close-btn")!.addEventListener("click", (e) => {
+    e.stopPropagation();
+    closeSession(session.id);
+  });
+
+  // Mouse-based drag - start on drag handle mousedown
+  if (currentSort === "custom") {
+    const dragHandle = item.querySelector(".drag-handle") as HTMLElement;
+    if (dragHandle) {
+      dragHandle.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        isDragging = true;
+        draggedSessionId = session.id;
+        dragStartY = e.clientY;
+        item.classList.add("dragging");
+        document.body.style.cursor = "grabbing";
+      });
+    }
+  }
+
+  return item;
 }
 
 /**
@@ -3000,6 +3187,207 @@ function startRenaming(sessionId: string, nameEl: HTMLElement) {
   nameEl.appendChild(input);
   input.focus();
   input.select();
+}
+
+function startRenamingFolder(folderId: string, nameEl: HTMLElement) {
+  const folder = folders.get(folderId);
+  if (!folder) return;
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = folder.name;
+
+  const finishRename = () => {
+    const newName = input.value.trim();
+    if (newName && newName !== folder.name) {
+      folder.name = newName;
+      saveFolderToDb(folder);
+    }
+    renderSessionListImmediate();
+  };
+
+  input.addEventListener("blur", finishRename);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      finishRename();
+    }
+    if (e.key === "Escape") {
+      renderSessionListImmediate();
+    }
+  });
+  input.addEventListener("click", (e) => {
+    e.stopPropagation(); // Prevent folder toggle
+  });
+
+  nameEl.innerHTML = "";
+  nameEl.appendChild(input);
+  input.focus();
+  input.select();
+}
+
+// --- Context Menu System ---
+
+let activeContextMenu: HTMLElement | null = null;
+
+function dismissContextMenu() {
+  if (activeContextMenu) {
+    activeContextMenu.remove();
+    activeContextMenu = null;
+  }
+}
+
+function createContextMenu(x: number, y: number): HTMLElement {
+  dismissContextMenu();
+  const menu = document.createElement("div");
+  menu.className = "context-menu";
+  menu.style.left = `${x}px`;
+  menu.style.top = `${y}px`;
+  document.body.appendChild(menu);
+  activeContextMenu = menu;
+
+  // Dismiss on click outside
+  setTimeout(() => {
+    const handler = (e: MouseEvent) => {
+      if (!menu.contains(e.target as Node)) {
+        dismissContextMenu();
+        document.removeEventListener("click", handler, true);
+      }
+    };
+    document.addEventListener("click", handler, true);
+  }, 0);
+
+  // Adjust position if menu goes off-screen
+  requestAnimationFrame(() => {
+    const rect = menu.getBoundingClientRect();
+    if (rect.right > window.innerWidth) {
+      menu.style.left = `${window.innerWidth - rect.width - 8}px`;
+    }
+    if (rect.bottom > window.innerHeight) {
+      menu.style.top = `${window.innerHeight - rect.height - 8}px`;
+    }
+  });
+
+  return menu;
+}
+
+function addMenuItem(menu: HTMLElement, label: string, onClick: () => void): HTMLElement {
+  const item = document.createElement("button");
+  item.className = "context-menu-item";
+  item.textContent = label;
+  item.addEventListener("click", () => {
+    dismissContextMenu();
+    onClick();
+  });
+  menu.appendChild(item);
+  return item;
+}
+
+function addMenuDivider(menu: HTMLElement) {
+  const divider = document.createElement("div");
+  divider.className = "context-menu-divider";
+  menu.appendChild(divider);
+}
+
+function showSessionContextMenu(x: number, y: number, sessionId: string) {
+  const menu = createContextMenu(x, y);
+
+  // "Move to folder" submenu
+  if (folders.size > 0) {
+    const moveItem = document.createElement("div");
+    moveItem.className = "context-menu-item context-menu-submenu-trigger";
+    moveItem.textContent = "Move to Folder ▸";
+    menu.appendChild(moveItem);
+
+    const submenu = document.createElement("div");
+    submenu.className = "context-menu context-menu-submenu";
+    submenu.style.display = "none";
+    moveItem.appendChild(submenu);
+
+    // "No Folder" option
+    addMenuItem(submenu, "No Folder", () => moveSessionToFolder(sessionId, null));
+
+    const divider = document.createElement("div");
+    divider.className = "context-menu-divider";
+    submenu.appendChild(divider);
+
+    // Each folder
+    const sortedFolders = Array.from(folders.values()).sort((a, b) => a.sortOrder - b.sortOrder);
+    for (const folder of sortedFolders) {
+      addMenuItem(submenu, folder.name, () => moveSessionToFolder(sessionId, folder.id));
+    }
+
+    // Show/hide submenu on hover
+    moveItem.addEventListener("mouseenter", () => { submenu.style.display = "block"; });
+    moveItem.addEventListener("mouseleave", () => { submenu.style.display = "none"; });
+  }
+
+  // Rename
+  addMenuItem(menu, "Rename", () => {
+    const item = sessionListEl.querySelector(`[data-session-id="${sessionId}"]`);
+    const nameEl = item?.querySelector(".name") as HTMLElement;
+    if (nameEl) startRenaming(sessionId, nameEl);
+  });
+
+  addMenuDivider(menu);
+
+  // Close session
+  addMenuItem(menu, "Close Session", () => closeSession(sessionId));
+}
+
+function showFolderContextMenu(x: number, y: number, folderId: string) {
+  const menu = createContextMenu(x, y);
+
+  // Rename folder
+  addMenuItem(menu, "Rename Folder", () => {
+    const headerEl = sessionListEl.querySelector(`[data-folder-id="${folderId}"]`);
+    const nameEl = headerEl?.querySelector(".folder-name") as HTMLElement;
+    if (nameEl) startRenamingFolder(folderId, nameEl);
+  });
+
+  addMenuDivider(menu);
+
+  // Delete folder
+  addMenuItem(menu, "Delete Folder", async () => {
+    const folder = folders.get(folderId);
+    if (!folder) return;
+
+    // Move all sessions to unfiled
+    for (const [, session] of sessions) {
+      if (session.folderId === folderId) {
+        session.folderId = undefined;
+      }
+    }
+
+    folders.delete(folderId);
+    await deleteFolderFromDb(folderId);
+    renderSessionListImmediate();
+  });
+}
+
+// --- Create Folder ---
+
+async function createFolder(name?: string) {
+  const folderName = name || "New Folder";
+  const folderId = crypto.randomUUID();
+  const maxOrder = Math.max(0, ...Array.from(folders.values()).map(f => f.sortOrder));
+
+  const folder: Folder = {
+    id: folderId,
+    name: folderName,
+    sortOrder: maxOrder + 1,
+    collapsed: false,
+  };
+  folders.set(folderId, folder);
+  await saveFolderToDb(folder);
+  renderSessionListImmediate();
+
+  // Start inline rename on the new folder
+  requestAnimationFrame(() => {
+    const headerEl = sessionListEl.querySelector(`[data-folder-id="${folderId}"]`);
+    const nameEl = headerEl?.querySelector(".folder-name") as HTMLElement;
+    if (nameEl) startRenamingFolder(folderId, nameEl);
+  });
 }
 
 function updateView() {
@@ -6030,6 +6418,7 @@ async function resumeClaudeSession(claudeSessionId: string, project: string): Pr
     created_at: newSession.createdAt.toISOString(),
     claude_session_id: newSession.claudeSessionId || null,
     sort_order: newSession.sortOrder,
+    folder_id: newSession.folderId || null,
   };
   await invoke("save_session", { session: data });
 

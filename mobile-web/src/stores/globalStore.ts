@@ -1,10 +1,13 @@
 import { create } from 'zustand';
-import type { Session, SessionStatus } from '../types';
+import type { Session, SessionStatus, Folder } from '../types';
 
 interface GlobalState {
   // Sessions
   sessions: Map<string, Session>;
   sessionsOrder: string[];
+
+  // Folders
+  folders: Map<string, Folder>;
 
   // Per-session status (for list view indicators)
   sessionStatus: Map<string, SessionStatus>;
@@ -17,6 +20,7 @@ interface GlobalState {
 
   // Actions
   setSessions: (sessions: Session[]) => void;
+  setFolders: (folders: Folder[]) => void;
   setSession: (session: Session) => void;
   addSession: (session: Session) => void;
   updateSession: (session: Session) => void;
@@ -30,6 +34,7 @@ interface GlobalState {
 export const useGlobalStore = create<GlobalState>((set, get) => ({
   sessions: new Map(),
   sessionsOrder: [],
+  folders: new Map(),
   sessionStatus: new Map(),
   activeSessionId: null,
   isConnected: false,
@@ -55,6 +60,14 @@ export const useGlobalStore = create<GlobalState>((set, get) => ({
     }
 
     set({ sessions: sessionsMap, sessionsOrder: order, sessionStatus: statusMap });
+  },
+
+  setFolders: (folders) => {
+    const foldersMap = new Map<string, Folder>();
+    for (const folder of folders) {
+      foldersMap.set(folder.id, folder);
+    }
+    set({ folders: foldersMap });
   },
 
   setSession: (session) => {

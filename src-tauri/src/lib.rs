@@ -256,13 +256,24 @@ fn broadcast_session_list_to_mobile() {
             "created_at": s.created_at,
             "agent_type": s.agent_type,
             "working_dir": s.working_dir,
+            "folder_id": s.folder_id,
             "running": running,
+        })
+    }).collect();
+
+    let folders_data: Vec<serde_json::Value> = load_folders().unwrap_or_default().into_iter().map(|f| {
+        serde_json::json!({
+            "id": f.id,
+            "name": f.name,
+            "sort_order": f.sort_order,
+            "collapsed": f.collapsed,
         })
     }).collect();
 
     let msg = serde_json::json!({
         "type": "session_list",
-        "sessions": sessions_with_status
+        "sessions": sessions_with_status,
+        "folders": folders_data
     }).to_string();
 
     broadcast_to_mobile_clients(&msg);
@@ -386,6 +397,16 @@ struct SessionData {
     created_at: String,
     claude_session_id: Option<String>,
     sort_order: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    folder_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FolderData {
+    id: String,
+    name: String,
+    sort_order: i32,
+    collapsed: bool,
 }
 
 /// Claude JSON message content item (text, tool_use, tool_result, image)
@@ -535,6 +556,20 @@ fn init_db() -> rusqlite::Result<Connection> {
 
     // Migration: Add running_pid column to track process PIDs across restarts
     let _ = conn.execute("ALTER TABLE sessions ADD COLUMN running_pid INTEGER", []);
+
+    // Migration: Add folder_id column for folder/group support
+    let _ = conn.execute("ALTER TABLE sessions ADD COLUMN folder_id TEXT", []);
+
+    // Create folders table for session organization
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS folders (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            collapsed INTEGER NOT NULL DEFAULT 0
+        )",
+        [],
+    )?;
 
     // Create terminal_buffers table for scrollback persistence
     // Stores compressed (gzip + base64) terminal buffer content
@@ -709,7 +744,7 @@ fn is_valid_token(token: &str) -> bool {
 fn load_sessions() -> Result<Vec<SessionData>, String> {
     let conn = init_db().map_err(|e| e.to_string())?;
     let mut stmt = conn
-        .prepare("SELECT id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order FROM sessions ORDER BY sort_order ASC, created_at DESC")
+        .prepare("SELECT id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order, folder_id FROM sessions ORDER BY sort_order ASC, created_at DESC")
         .map_err(|e| e.to_string())?;
 
     let sessions = stmt
@@ -723,6 +758,7 @@ fn load_sessions() -> Result<Vec<SessionData>, String> {
                 created_at: row.get(5)?,
                 claude_session_id: row.get(6)?,
                 sort_order: row.get(7)?,
+                folder_id: row.get(8)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -744,8 +780,8 @@ fn save_session(session: SessionData) -> Result<(), String> {
     ).unwrap_or(0) == 0;
 
     conn.execute(
-        "INSERT OR REPLACE INTO sessions (id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT OR REPLACE INTO sessions (id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order, folder_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             session.id,
             session.name,
@@ -755,6 +791,7 @@ fn save_session(session: SessionData) -> Result<(), String> {
             session.created_at,
             session.claude_session_id,
             session.sort_order,
+            session.folder_id,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -795,6 +832,92 @@ fn delete_session(session_id: String) -> Result<(), String> {
     #[cfg(not(target_os = "ios"))]
     broadcast_session_deleted(&session_id);
 
+    Ok(())
+}
+
+// --- Folder commands ---
+
+#[tauri::command]
+fn load_folders() -> Result<Vec<FolderData>, String> {
+    let conn = init_db().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT id, name, sort_order, collapsed FROM folders ORDER BY sort_order ASC")
+        .map_err(|e| e.to_string())?;
+
+    let folders = stmt
+        .query_map([], |row| {
+            Ok(FolderData {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                sort_order: row.get(2)?,
+                collapsed: row.get::<_, i32>(3)? != 0,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(folders)
+}
+
+#[tauri::command]
+fn save_folder(folder: FolderData) -> Result<(), String> {
+    let conn = init_db().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT OR REPLACE INTO folders (id, name, sort_order, collapsed) VALUES (?1, ?2, ?3, ?4)",
+        params![folder.id, folder.name, folder.sort_order, folder.collapsed as i32],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_folder(folder_id: String) -> Result<(), String> {
+    let conn = init_db().map_err(|e| e.to_string())?;
+    // Move sessions in this folder to unfiled
+    conn.execute(
+        "UPDATE sessions SET folder_id = NULL WHERE folder_id = ?1",
+        params![folder_id],
+    )
+    .map_err(|e| e.to_string())?;
+    // Delete the folder
+    conn.execute("DELETE FROM folders WHERE id = ?1", params![folder_id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn update_folder_orders(folder_orders: Vec<(String, i32)>) -> Result<(), String> {
+    let conn = init_db().map_err(|e| e.to_string())?;
+    for (folder_id, sort_order) in folder_orders {
+        conn.execute(
+            "UPDATE folders SET sort_order = ?1 WHERE id = ?2",
+            params![sort_order, folder_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn update_session_folder(session_id: String, folder_id: Option<String>) -> Result<(), String> {
+    let conn = init_db().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE sessions SET folder_id = ?1 WHERE id = ?2",
+        params![folder_id, session_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn toggle_folder_collapsed(folder_id: String, collapsed: bool) -> Result<(), String> {
+    let conn = init_db().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE folders SET collapsed = ?1 WHERE id = ?2",
+        params![collapsed as i32, folder_id],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2572,6 +2695,7 @@ async fn api_list_sessions(headers: axum::http::HeaderMap) -> impl IntoResponse 
                     "created_at": s.created_at,
                     "claude_session_id": s.claude_session_id,
                     "sort_order": s.sort_order,
+                    "folder_id": s.folder_id,
                     "running": is_running
                 })
             }).collect();
@@ -2601,6 +2725,7 @@ async fn api_list_sessions(headers: axum::http::HeaderMap) -> impl IntoResponse 
                     "created_at": s.created_at,
                     "claude_session_id": s.claude_session_id,
                     "sort_order": s.sort_order,
+                    "folder_id": s.folder_id,
                     "running": false
                 })
             }).collect();
@@ -2662,6 +2787,8 @@ async fn api_create_session(
         .map(|sessions| sessions.iter().map(|s| s.sort_order).min().unwrap_or(0))
         .unwrap_or(0);
 
+    let folder_id = body.get("folder_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+
     let session = SessionData {
         id: session_id.clone(),
         name: session_name,
@@ -2671,6 +2798,7 @@ async fn api_create_session(
         created_at: chrono::Utc::now().to_rfc3339(),
         claude_session_id,
         sort_order: min_sort_order - 1,
+        folder_id,
     };
 
     // Save to database
@@ -2698,6 +2826,7 @@ async fn api_create_session(
         "agent_type": session.agent_type,
         "command": session.command,
         "working_dir": session.working_dir,
+        "folder_id": session.folder_id,
         "running": false
     })).into_response()
 }
@@ -3361,13 +3490,24 @@ async fn handle_ws_mobile(socket: WebSocket) {
                                     "created_at": s.created_at,
                                     "agent_type": s.agent_type,
                                     "working_dir": s.working_dir,
+                                    "folder_id": s.folder_id,
                                     "running": running,
+                                })
+                            }).collect();
+
+                            let folders_data: Vec<serde_json::Value> = load_folders().unwrap_or_default().into_iter().map(|f| {
+                                serde_json::json!({
+                                    "id": f.id,
+                                    "name": f.name,
+                                    "sort_order": f.sort_order,
+                                    "collapsed": f.collapsed,
                                 })
                             }).collect();
 
                             let _ = tx.send(serde_json::json!({
                                 "type": "session_list",
-                                "sessions": sessions_with_status
+                                "sessions": sessions_with_status,
+                                "folders": folders_data
                             }).to_string());
                         } else {
                             let _ = tx.send(serde_json::json!({
@@ -3879,7 +4019,13 @@ pub fn run() {
             find_latest_plan_file,
             get_web_server_port,
             get_local_ips,
-            mcp_callback
+            mcp_callback,
+            load_folders,
+            save_folder,
+            delete_folder,
+            update_folder_orders,
+            update_session_folder,
+            toggle_folder_collapsed
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -3940,7 +4086,13 @@ pub fn run() {
             read_text_file,
             find_latest_plan_file,
             get_web_server_port,
-            get_local_ips
+            get_local_ips,
+            load_folders,
+            save_folder,
+            delete_folder,
+            update_folder_orders,
+            update_session_folder,
+            toggle_folder_collapsed
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

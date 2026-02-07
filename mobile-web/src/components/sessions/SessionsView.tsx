@@ -5,7 +5,7 @@ import { api } from '../../services/api';
 import { SessionCard } from './SessionCard';
 
 export function SessionsView() {
-  const { sessions, sessionsOrder, isConnected, setActiveSession, addSession } = useGlobalStore();
+  const { sessions, sessionsOrder, folders, isConnected, setActiveSession, addSession } = useGlobalStore();
   const logout = useAuthStore((s) => s.logout);
   const [showNewSessionModal, setShowNewSessionModal] = useState(false);
   const [newSessionName, setNewSessionName] = useState('');
@@ -133,11 +133,58 @@ export function SessionsView() {
           </div>
         ) : (
           <div className="divide-y divide-[#3c3c3c]">
-            {sessionsOrder.map((id) => {
-              const session = sessions.get(id);
-              if (!session) return null;
-              return <SessionCard key={id} session={session} />;
-            })}
+            {(() => {
+              // Group sessions by folder_id for display
+              const hasFolders = sessionsOrder.some((id) => sessions.get(id)?.folder_id);
+              if (!hasFolders) {
+                // No folders — flat list
+                return sessionsOrder.map((id) => {
+                  const session = sessions.get(id);
+                  if (!session) return null;
+                  return <SessionCard key={id} session={session} />;
+                });
+              }
+
+              // Group: unfiled first, then by folder
+              const unfiled: string[] = [];
+              const folderGroups = new Map<string, { name: string; ids: string[] }>();
+
+              for (const id of sessionsOrder) {
+                const session = sessions.get(id);
+                if (!session) continue;
+                if (!session.folder_id) {
+                  unfiled.push(id);
+                } else {
+                  const folder = folders.get(session.folder_id);
+                  const folderName = folder?.name || 'Unknown Folder';
+                  const group = folderGroups.get(session.folder_id) || { name: folderName, ids: [] };
+                  group.ids.push(id);
+                  folderGroups.set(session.folder_id, group);
+                }
+              }
+
+              return (
+                <>
+                  {unfiled.map((id) => {
+                    const session = sessions.get(id);
+                    if (!session) return null;
+                    return <SessionCard key={id} session={session} />;
+                  })}
+                  {Array.from(folderGroups.entries()).map(([folderId, group]) => (
+                    <div key={folderId}>
+                      <div className="px-4 py-2 text-xs font-semibold text-gray-500 uppercase tracking-wider bg-[#222]">
+                        {group.name}
+                      </div>
+                      {group.ids.map((id) => {
+                        const session = sessions.get(id);
+                        if (!session) return null;
+                        return <SessionCard key={id} session={session} />;
+                      })}
+                    </div>
+                  ))}
+                </>
+              );
+            })()}
           </div>
         )}
       </div>

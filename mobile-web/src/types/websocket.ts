@@ -1,4 +1,4 @@
-import type { Session, SessionStatus } from './session';
+import type { Session, SessionStatus, Folder } from './session';
 import type { Message } from './message';
 
 // Client -> Server messages
@@ -13,7 +13,7 @@ export type ClientMessage =
 export type ServerMessage =
   | { type: 'auth_success' }
   | { type: 'auth_error'; message: string }
-  | { type: 'session_list'; sessions: Session[] }
+  | { type: 'session_list'; sessions: Session[]; folders?: Folder[] }
   | { type: 'session_status'; sessionId: string; status: SessionStatus }
   | { type: 'session_created'; session: Session }
   | { type: 'session_updated'; session: Session }

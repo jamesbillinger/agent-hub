@@ -102,6 +102,9 @@ class WebSocketService {
       case 'session_list':
         // Update the sessions in global store
         globalStore.setSessions(message.sessions);
+        if (message.folders) {
+          globalStore.setFolders(message.folders);
+        }
         break;
 
       case 'session_status':
