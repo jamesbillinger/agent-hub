@@ -144,7 +144,7 @@ fn broadcast_session_status(session_id: &str, running: bool) {
         "running": running
     }));
 
-    // Also broadcast to mobile clients subscribed to this session
+    // Broadcast to ALL mobile clients so the session list status updates too
     let msg = serde_json::json!({
         "type": "session_status",
         "sessionId": session_id,
@@ -152,7 +152,7 @@ fn broadcast_session_status(session_id: &str, running: bool) {
             "running": running
         }
     }).to_string();
-    broadcast_to_session_subscribers(session_id, &msg);
+    broadcast_to_mobile_clients(&msg);
 }
 
 /// Broadcast processing state change (thinking started/stopped)
@@ -163,7 +163,7 @@ fn broadcast_processing_status(session_id: &str, processing: bool) {
         "processing": processing
     }));
 
-    // Also broadcast to mobile clients subscribed to this session
+    // Broadcast to ALL mobile clients so the session list status updates too
     let msg = serde_json::json!({
         "type": "session_status",
         "sessionId": session_id,
@@ -171,7 +171,7 @@ fn broadcast_processing_status(session_id: &str, processing: bool) {
             "isProcessing": processing
         }
     }).to_string();
-    broadcast_to_session_subscribers(session_id, &msg);
+    broadcast_to_mobile_clients(&msg);
 }
 
 /// Broadcast that a session was created

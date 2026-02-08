@@ -350,6 +350,7 @@ let activeSessionId: string | null = null;
 let searchQuery = "";
 let currentSort: SortOption = "custom";
 let draggedSessionId: string | null = null;
+let draggedFolderId: string | null = null;
 let isDragging = false;
 let dragStartY = 0;
 let appSettings: AppSettings = {
@@ -1657,11 +1658,11 @@ document.addEventListener("DOMContentLoaded", async () => {
     saveAllTerminalBuffers();
   }, 30000);
 
-  // Mouse-based drag and drop for session reordering
+  // Mouse-based drag and drop for session and folder reordering
   document.addEventListener("mousemove", (e) => {
-    if (!isDragging || !draggedSessionId || currentSort !== "custom") return;
+    if (!isDragging || currentSort !== "custom") return;
+    if (!draggedSessionId && !draggedFolderId) return;
 
-    // Find the session item or folder header we're over
     const el = document.elementFromPoint(e.clientX, e.clientY);
     const target = el?.closest(".session-item") as HTMLElement;
     const folderTarget = el?.closest(".folder-header") as HTMLElement;
@@ -1671,10 +1672,24 @@ document.addEventListener("DOMContentLoaded", async () => {
       el.classList.remove("drag-over", "drag-over-bottom");
     });
     sessionListEl.querySelectorAll(".folder-header").forEach(el => {
-      el.classList.remove("drag-over");
+      el.classList.remove("drag-over", "drag-over-bottom", "folder-drag-above", "folder-drag-below");
     });
 
-    // Highlight folder header if hovering over it
+    if (draggedFolderId) {
+      // Dragging a folder - only show reorder indicators on other folder headers
+      if (folderTarget && folderTarget.dataset.folderId !== draggedFolderId) {
+        const rect = folderTarget.getBoundingClientRect();
+        const midY = rect.top + rect.height / 2;
+        if (e.clientY < midY) {
+          folderTarget.classList.add("folder-drag-above");
+        } else {
+          folderTarget.classList.add("folder-drag-below");
+        }
+      }
+      return;
+    }
+
+    // Dragging a session - highlight folder header if hovering over it
     if (folderTarget) {
       folderTarget.classList.add("drag-over");
       return;
@@ -1693,13 +1708,13 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   document.addEventListener("mouseup", async (e) => {
-    if (!isDragging || !draggedSessionId || currentSort !== "custom") {
+    if (!isDragging || currentSort !== "custom") {
       isDragging = false;
       draggedSessionId = null;
+      draggedFolderId = null;
       return;
     }
 
-    // Check if dropped on a folder header
     const el = document.elementFromPoint(e.clientX, e.clientY);
     const folderTarget = el?.closest(".folder-header") as HTMLElement;
 
@@ -1708,9 +1723,44 @@ document.addEventListener("DOMContentLoaded", async () => {
       el.classList.remove("drag-over", "drag-over-bottom", "dragging");
     });
     sessionListEl.querySelectorAll(".folder-header").forEach(el => {
-      el.classList.remove("drag-over");
+      el.classList.remove("drag-over", "drag-over-bottom", "dragging", "folder-drag-above", "folder-drag-below");
     });
     document.body.style.cursor = "";
+
+    // Handle folder drag-reorder
+    if (draggedFolderId) {
+      if (folderTarget && folderTarget.dataset.folderId && folderTarget.dataset.folderId !== draggedFolderId) {
+        const targetFolderId = folderTarget.dataset.folderId;
+        const rect = folderTarget.getBoundingClientRect();
+        const midY = rect.top + rect.height / 2;
+        const insertBefore = e.clientY < midY;
+
+        const allFolders = Array.from(folders.values()).sort((a, b) => a.sortOrder - b.sortOrder);
+        const draggedFolder = folders.get(draggedFolderId);
+        if (draggedFolder) {
+          const reordered = allFolders.filter(f => f.id !== draggedFolderId);
+          let targetIdx = reordered.findIndex(f => f.id === targetFolderId);
+          if (!insertBefore) targetIdx += 1;
+          reordered.splice(targetIdx, 0, draggedFolder);
+
+          const updates: [string, number][] = [];
+          reordered.forEach((f, i) => {
+            f.sortOrder = i;
+            updates.push([f.id, i]);
+          });
+          await updateFolderOrders(updates);
+          renderSessionListImmediate();
+        }
+      }
+      isDragging = false;
+      draggedFolderId = null;
+      return;
+    }
+
+    if (!draggedSessionId) {
+      isDragging = false;
+      return;
+    }
 
     // If dropped on a folder header, move session to that folder
     if (folderTarget && folderTarget.dataset.folderId) {
@@ -1919,6 +1969,14 @@ async function updateSessionOrders(sessionOrders: [string, number][]) {
     await invoke("update_session_orders", { sessionOrders });
   } catch (err) {
     console.error("Failed to update session orders:", err);
+  }
+}
+
+async function updateFolderOrders(folderOrders: [string, number][]) {
+  try {
+    await invoke("update_folder_orders", { folderOrders });
+  } catch (err) {
+    console.error("Failed to update folder orders:", err);
   }
 }
 
@@ -2926,6 +2984,8 @@ function cycleSessions(direction: "next" | "prev"): void {
 }
 
 // Helper function to get sessions filtered and sorted (used by renderSessionList and keyboard shortcuts)
+// Returns sessions in visual order - when folders are active, unfiled sessions come first,
+// then sessions grouped by folder in folder sort order.
 function getFilteredAndSortedSessions(): Session[] {
   let filteredSessions = Array.from(sessions.values());
 
@@ -2962,6 +3022,23 @@ function getFilteredAndSortedSessions(): Session[] {
         a.sortOrder - b.sortOrder
       );
       break;
+  }
+
+  // When folders are active, reorder to match visual layout:
+  // unfiled sessions first, then sessions grouped by folder sort order
+  // (skip collapsed folders so ctrl+tab skips hidden sessions)
+  const useFolders = !searchQuery && currentSort === "custom" && folders.size > 0;
+  if (useFolders) {
+    const unfiled = sortedSessions.filter(s => !s.folderId);
+    const sortedFolders = Array.from(folders.values()).sort((a, b) => a.sortOrder - b.sortOrder);
+    const folderOrdered: Session[] = [...unfiled];
+    for (const folder of sortedFolders) {
+      if (!folder.collapsed) {
+        const folderSessions = sortedSessions.filter(s => s.folderId === folder.id);
+        folderOrdered.push(...folderSessions);
+      }
+    }
+    return folderOrdered;
   }
 
   return sortedSessions;
@@ -3021,16 +3098,31 @@ function renderSessionListImmediate() {
       headerEl.className = "folder-header";
       headerEl.dataset.folderId = folder.id;
       headerEl.innerHTML = `
+        <div class="folder-drag-handle" title="Drag to reorder">⋮⋮</div>
         <span class="folder-toggle">${folder.collapsed ? "▸" : "▾"}</span>
         <span class="folder-name">${escapeHtml(folder.name)}</span>
         <span class="folder-count">${folderSessions.length}</span>
       `;
 
+      // Folder drag handle
+      const folderDragHandle = headerEl.querySelector(".folder-drag-handle") as HTMLElement;
+      if (folderDragHandle) {
+        folderDragHandle.addEventListener("mousedown", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          isDragging = true;
+          draggedFolderId = folder.id;
+          dragStartY = e.clientY;
+          headerEl.classList.add("dragging");
+          document.body.style.cursor = "grabbing";
+        });
+      }
+
       // Click to toggle collapse
       headerEl.addEventListener("click", (e) => {
         const target = e.target as HTMLElement;
-        // Don't toggle when clicking on an inline rename input
-        if (target.tagName === "INPUT") return;
+        // Don't toggle when clicking on an inline rename input or drag handle
+        if (target.tagName === "INPUT" || target.classList.contains("folder-drag-handle")) return;
         toggleFolderCollapsed(folder.id);
       });
 

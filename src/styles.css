@@ -2993,6 +2993,37 @@ body.resizing-sidebar {
   border-radius: 4px;
 }
 
+.folder-header.folder-drag-above {
+  border-top: 2px solid #0e639c;
+}
+
+.folder-header.folder-drag-below {
+  border-bottom: 2px solid #0e639c;
+}
+
+.folder-header.dragging {
+  opacity: 0.5;
+}
+
+.folder-drag-handle {
+  cursor: grab;
+  padding: 0 2px;
+  color: var(--text-dim);
+  font-size: 10px;
+  display: flex;
+  align-items: center;
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+
+.folder-header:hover .folder-drag-handle {
+  opacity: 1;
+}
+
+.folder-drag-handle:active {
+  cursor: grabbing;
+}
+
 .folder-toggle {
   font-size: 10px;
   width: 14px;
