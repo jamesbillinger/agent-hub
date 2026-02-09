@@ -149,9 +149,7 @@ export function SessionsView() {
                     <span className="text-gray-500 font-normal ml-auto">{runningSessions.length}</span>
                   </div>
                   {runningSessions.map((session) => (
-                    <div key={`active-${session.id}`} className="border-l-2 border-green-500">
-                      <SessionCard session={session} />
-                    </div>
+                    <SessionCard key={`active-${session.id}`} session={session} />
                   ))}
                   <div className="h-px bg-[#3c3c3c] mx-3 my-1" />
                 </div>

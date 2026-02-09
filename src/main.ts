@@ -703,6 +703,7 @@ function getPtyDimensions(terminalCols: number, terminalRows: number): { cols: n
 }
 
 // DOM Elements
+let activeSessionsEl: HTMLElement;
 let sessionListEl: HTMLElement;
 let terminalContainerEl: HTMLElement;
 let chatContainerEl: HTMLElement;
@@ -733,6 +734,7 @@ let settingsRemotePinInput: HTMLInputElement;
 // Initialize app
 document.addEventListener("DOMContentLoaded", async () => {
   // Get DOM elements
+  activeSessionsEl = document.getElementById("active-sessions")!;
   sessionListEl = document.getElementById("session-list")!;
   terminalContainerEl = document.getElementById("terminal-container")!;
   chatContainerEl = document.getElementById("chat-container")!;
@@ -1801,6 +1803,12 @@ document.addEventListener("DOMContentLoaded", async () => {
       isDragging = false;
       draggedSessionId = null;
       return;
+    }
+
+    // Move session to the target session's folder (or out of folder if target is unfiled)
+    const targetSession = sessions.get(targetSessionId);
+    if (targetSession && draggedSession.folderId !== targetSession.folderId) {
+      await moveSessionToFolder(draggedSessionId, targetSession.folderId || null);
     }
 
     // Get all sessions sorted by current order
@@ -3083,6 +3091,7 @@ function scheduleRenderSessionList() {
 function renderSessionListImmediate() {
   perfStart("renderSessionList");
   sessionListEl.innerHTML = "";
+  activeSessionsEl.innerHTML = "";
 
   const sortedSessions = getFilteredAndSortedSessions();
 
@@ -3095,7 +3104,7 @@ function renderSessionListImmediate() {
     return;
   }
 
-  // Render "Active Sessions" pinned group at the top
+  // Render "Active Sessions" docked group above the scrollable list
   if (appSettings.show_active_sessions_group) {
     const runningSessions = Array.from(sessions.values())
       .filter(s => s.isRunning)
@@ -3108,17 +3117,13 @@ function renderSessionListImmediate() {
         <span class="active-sessions-label">Active</span>
         <span class="active-sessions-count">${runningSessions.length}</span>
       `;
-      sessionListEl.appendChild(activeHeaderEl);
+      activeSessionsEl.appendChild(activeHeaderEl);
 
       for (const session of runningSessions) {
         const item = createSessionItem(session, -1);
         item.classList.add("active-sessions-item");
-        sessionListEl.appendChild(item);
+        activeSessionsEl.appendChild(item);
       }
-
-      const separator = document.createElement("div");
-      separator.className = "active-sessions-separator";
-      sessionListEl.appendChild(separator);
     }
   }
 
@@ -3191,7 +3196,9 @@ function renderSessionListImmediate() {
       // Render sessions in this folder (if not collapsed)
       if (!folder.collapsed) {
         for (const session of folderSessions) {
-          sessionListEl.appendChild(createSessionItem(session, visibleIndex++));
+          const item = createSessionItem(session, visibleIndex++);
+          item.classList.add("folder-session");
+          sessionListEl.appendChild(item);
         }
       }
     }

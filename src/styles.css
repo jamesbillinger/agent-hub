@@ -2960,8 +2960,17 @@ body.resizing-sidebar {
 }
 
 /* ============================================
-   Active Sessions Pinned Group
+   Active Sessions Pinned Group (docked above scroll)
    ============================================ */
+
+#active-sessions:empty {
+  display: none;
+}
+
+#active-sessions {
+  border-bottom: 1px solid var(--border-color);
+  padding: 4px 0;
+}
 
 .active-sessions-header {
   display: flex;
@@ -2992,17 +3001,12 @@ body.resizing-sidebar {
 }
 
 .active-sessions-item {
-  border-left: 2px solid var(--accent-green);
+  border-left-color: var(--accent-green);
 }
 
 .active-sessions-item .drag-handle {
-  display: none;
-}
-
-.active-sessions-separator {
-  height: 1px;
-  background: var(--border-primary);
-  margin: 4px 12px;
+  visibility: hidden;
+  pointer-events: none;
 }
 
 /* ============================================
@@ -3068,6 +3072,10 @@ body.resizing-sidebar {
 
 .folder-drag-handle:active {
   cursor: grabbing;
+}
+
+.folder-session {
+  padding-left: 24px;
 }
 
 .folder-toggle {
