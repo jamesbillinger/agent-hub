@@ -13,7 +13,7 @@ export type ClientMessage =
 export type ServerMessage =
   | { type: 'auth_success' }
   | { type: 'auth_error'; message: string }
-  | { type: 'session_list'; sessions: Session[]; folders?: Folder[] }
+  | { type: 'session_list'; sessions: Session[]; folders?: Folder[]; settings?: { show_active_sessions_group?: boolean } }
   | { type: 'session_status'; sessionId: string; status: SessionStatus }
   | { type: 'session_created'; session: Session }
   | { type: 'session_updated'; session: Session }

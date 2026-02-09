@@ -105,6 +105,9 @@ class WebSocketService {
         if (message.folders) {
           globalStore.setFolders(message.folders);
         }
+        if (message.settings?.show_active_sessions_group !== undefined) {
+          globalStore.setShowActiveSessionsGroup(message.settings.show_active_sessions_group);
+        }
         break;
 
       case 'session_status':

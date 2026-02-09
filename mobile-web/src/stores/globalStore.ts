@@ -18,9 +18,13 @@ interface GlobalState {
   // WebSocket connection state
   isConnected: boolean;
 
+  // Settings from desktop
+  showActiveSessionsGroup: boolean;
+
   // Actions
   setSessions: (sessions: Session[]) => void;
   setFolders: (folders: Folder[]) => void;
+  setShowActiveSessionsGroup: (value: boolean) => void;
   setSession: (session: Session) => void;
   addSession: (session: Session) => void;
   updateSession: (session: Session) => void;
@@ -38,6 +42,7 @@ export const useGlobalStore = create<GlobalState>((set, get) => ({
   sessionStatus: new Map(),
   activeSessionId: null,
   isConnected: false,
+  showActiveSessionsGroup: true,
 
   setSessions: (sessions) => {
     const sessionsMap = new Map<string, Session>();
@@ -127,6 +132,8 @@ export const useGlobalStore = create<GlobalState>((set, get) => ({
   setActiveSession: (id) => set({ activeSessionId: id }),
 
   setConnected: (connected) => set({ isConnected: connected }),
+
+  setShowActiveSessionsGroup: (value) => set({ showActiveSessionsGroup: value }),
 
   reorderSessions: (order) => set({ sessionsOrder: order }),
 }));

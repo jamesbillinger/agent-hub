@@ -270,10 +270,14 @@ fn broadcast_session_list_to_mobile() {
         })
     }).collect();
 
+    let settings = load_app_settings().unwrap_or_default();
     let msg = serde_json::json!({
         "type": "session_list",
         "sessions": sessions_with_status,
-        "folders": folders_data
+        "folders": folders_data,
+        "settings": {
+            "show_active_sessions_group": settings.show_active_sessions_group
+        }
     }).to_string();
 
     broadcast_to_mobile_clients(&msg);
@@ -359,6 +363,8 @@ struct AppSettings {
     renderer: String,
     #[serde(default)]
     remote_pin: Option<String>,
+    #[serde(default = "default_true")]
+    show_active_sessions_group: bool,
 }
 
 fn default_renderer() -> String {
@@ -383,6 +389,7 @@ impl Default for AppSettings {
             read_aloud_enabled: false,
             renderer: "webgl".to_string(),
             remote_pin: None,
+            show_active_sessions_group: true,
         }
     }
 }
@@ -3504,10 +3511,14 @@ async fn handle_ws_mobile(socket: WebSocket) {
                                 })
                             }).collect();
 
+                            let settings = load_app_settings().unwrap_or_default();
                             let _ = tx.send(serde_json::json!({
                                 "type": "session_list",
                                 "sessions": sessions_with_status,
-                                "folders": folders_data
+                                "folders": folders_data,
+                                "settings": {
+                                    "show_active_sessions_group": settings.show_active_sessions_group
+                                }
                             }).to_string());
                         } else {
                             let _ = tx.send(serde_json::json!({

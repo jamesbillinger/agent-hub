@@ -5,7 +5,7 @@ import { api } from '../../services/api';
 import { SessionCard } from './SessionCard';
 
 export function SessionsView() {
-  const { sessions, sessionsOrder, folders, isConnected, setActiveSession, addSession } = useGlobalStore();
+  const { sessions, sessionsOrder, folders, sessionStatus, isConnected, setActiveSession, addSession, showActiveSessionsGroup } = useGlobalStore();
   const logout = useAuthStore((s) => s.logout);
   const [showNewSessionModal, setShowNewSessionModal] = useState(false);
   const [newSessionName, setNewSessionName] = useState('');
@@ -133,6 +133,30 @@ export function SessionsView() {
           </div>
         ) : (
           <div className="divide-y divide-[#3c3c3c]">
+            {/* Active Sessions Group */}
+            {showActiveSessionsGroup && (() => {
+              const runningSessions = sessionsOrder
+                .map((id) => sessions.get(id))
+                .filter((s): s is NonNullable<typeof s> => !!s && (sessionStatus.get(s.id)?.running ?? false));
+
+              if (runningSessions.length === 0) return null;
+
+              return (
+                <div className="mb-1">
+                  <div className="px-4 py-2 text-xs font-semibold text-green-400 uppercase tracking-wider flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-green-500 inline-block"></span>
+                    Active
+                    <span className="text-gray-500 font-normal ml-auto">{runningSessions.length}</span>
+                  </div>
+                  {runningSessions.map((session) => (
+                    <div key={`active-${session.id}`} className="border-l-2 border-green-500">
+                      <SessionCard session={session} />
+                    </div>
+                  ))}
+                  <div className="h-px bg-[#3c3c3c] mx-3 my-1" />
+                </div>
+              );
+            })()}
             {(() => {
               // Group sessions by folder_id for display
               const hasFolders = sessionsOrder.some((id) => sessions.get(id)?.folder_id);

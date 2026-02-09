@@ -329,6 +329,7 @@ interface AppSettings {
   read_aloud_enabled: boolean;
   renderer: "webgl" | "dom";
   remote_pin?: string | null;
+  show_active_sessions_group: boolean;
 }
 
 // Recently closed session for undo functionality
@@ -364,6 +365,7 @@ let appSettings: AppSettings = {
   bounce_dock_on_bell: true,
   read_aloud_enabled: false,
   renderer: "webgl",
+  show_active_sessions_group: true,
 };
 let sidebarResizeHandle: HTMLElement;
 let sidebarEl: HTMLElement;
@@ -724,6 +726,7 @@ let settingsNotificationsCheckbox: HTMLInputElement;
 let settingsBellNotificationsCheckbox: HTMLInputElement;
 let settingsBounceDockCheckbox: HTMLInputElement;
 let settingsReadAloudCheckbox: HTMLInputElement;
+let settingsActiveSessionsGroupCheckbox: HTMLInputElement;
 let settingsRendererSelect: HTMLSelectElement;
 let settingsRemotePinInput: HTMLInputElement;
 
@@ -755,6 +758,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   settingsBellNotificationsCheckbox = document.getElementById("settings-bell-notifications") as HTMLInputElement;
   settingsBounceDockCheckbox = document.getElementById("settings-bounce-dock") as HTMLInputElement;
   settingsReadAloudCheckbox = document.getElementById("settings-read-aloud") as HTMLInputElement;
+  settingsActiveSessionsGroupCheckbox = document.getElementById("settings-active-sessions-group") as HTMLInputElement;
   settingsRendererSelect = document.getElementById("settings-renderer") as HTMLSelectElement;
   settingsRemotePinInput = document.getElementById("settings-remote-pin") as HTMLInputElement;
 
@@ -2970,7 +2974,21 @@ async function renameSession(sessionId: string, newName: string) {
 
 // Helper function to cycle through sessions
 function cycleSessions(direction: "next" | "prev"): void {
-  const sessionArray = getFilteredAndSortedSessions();
+  let sessionArray: Session[];
+
+  if (appSettings.show_active_sessions_group) {
+    // When active sessions group is enabled, cycle only through running sessions
+    sessionArray = Array.from(sessions.values())
+      .filter(s => s.isRunning)
+      .sort((a, b) => a.sortOrder - b.sortOrder);
+    // Fall back to all sessions if none are running
+    if (sessionArray.length === 0) {
+      sessionArray = getFilteredAndSortedSessions();
+    }
+  } else {
+    sessionArray = getFilteredAndSortedSessions();
+  }
+
   if (sessionArray.length > 1 && activeSessionId) {
     const currentIndex = sessionArray.findIndex(s => s.id === activeSessionId);
     let nextIndex: number;
@@ -2980,6 +2998,8 @@ function cycleSessions(direction: "next" | "prev"): void {
       nextIndex = currentIndex >= sessionArray.length - 1 ? 0 : currentIndex + 1;
     }
     switchToSession(sessionArray[nextIndex].id);
+  } else if (sessionArray.length === 1 && activeSessionId !== sessionArray[0].id) {
+    switchToSession(sessionArray[0].id);
   }
 }
 
@@ -3073,6 +3093,33 @@ function renderSessionListImmediate() {
     noResults.textContent = `No sessions match "${searchQuery}"`;
     sessionListEl.appendChild(noResults);
     return;
+  }
+
+  // Render "Active Sessions" pinned group at the top
+  if (appSettings.show_active_sessions_group) {
+    const runningSessions = Array.from(sessions.values())
+      .filter(s => s.isRunning)
+      .sort((a, b) => a.sortOrder - b.sortOrder);
+    if (runningSessions.length > 0) {
+      const activeHeaderEl = document.createElement("div");
+      activeHeaderEl.className = "active-sessions-header";
+      activeHeaderEl.innerHTML = `
+        <span class="active-sessions-icon">&#x25CF;</span>
+        <span class="active-sessions-label">Active</span>
+        <span class="active-sessions-count">${runningSessions.length}</span>
+      `;
+      sessionListEl.appendChild(activeHeaderEl);
+
+      for (const session of runningSessions) {
+        const item = createSessionItem(session, -1);
+        item.classList.add("active-sessions-item");
+        sessionListEl.appendChild(item);
+      }
+
+      const separator = document.createElement("div");
+      separator.className = "active-sessions-separator";
+      sessionListEl.appendChild(separator);
+    }
   }
 
   // Track visible index for keyboard shortcuts (⌘1-9)
@@ -3180,7 +3227,7 @@ function createSessionItem(session: Session, index: number): HTMLElement {
     `<div class="meta"><span class="agent-badge ${agentBadgeClass}">${getAgentLabel(session.agentType)}</span></div>`;
 
   // Show shortcut indicator for first 10 sessions (⌘1-9, ⌘0)
-  const shortcutKey = index < 9 ? String(index + 1) : index === 9 ? "0" : null;
+  const shortcutKey = index >= 0 && index < 9 ? String(index + 1) : index === 9 ? "0" : null;
   const shortcutHtml = shortcutKey ? `<span class="shortcut-hint">⌘${shortcutKey}</span>` : "";
 
   // Determine status class - for JSON sessions, show processing state with blue pulsing dot
@@ -6085,6 +6132,7 @@ async function showSettingsModal(): Promise<void> {
   settingsBellNotificationsCheckbox.checked = appSettings.bell_notifications_enabled ?? true;
   settingsBounceDockCheckbox.checked = appSettings.bounce_dock_on_bell ?? true;
   settingsReadAloudCheckbox.checked = appSettings.read_aloud_enabled ?? false;
+  settingsActiveSessionsGroupCheckbox.checked = appSettings.show_active_sessions_group ?? true;
   settingsRendererSelect.value = appSettings.renderer || "webgl";
   settingsRemotePinInput.value = appSettings.remote_pin || "";
 
@@ -6173,6 +6221,7 @@ async function saveSettings(): Promise<void> {
     read_aloud_enabled: settingsReadAloudCheckbox.checked,
     renderer: settingsRendererSelect.value as "webgl" | "dom",
     remote_pin: settingsRemotePinInput.value || null,
+    show_active_sessions_group: settingsActiveSessionsGroupCheckbox.checked,
   };
 
   try {
@@ -6185,6 +6234,9 @@ async function saveSettings(): Promise<void> {
   await applyTheme();
 
   hideSettingsModal();
+
+  // Re-render session list to show/hide active sessions group
+  renderSessionListImmediate();
 }
 
 // Update checking

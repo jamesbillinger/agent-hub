@@ -1,4 +1,4 @@
-import { useRef, useEffect } from 'react';
+import { useRef, useCallback } from 'react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { useSessionStore, useGlobalStore } from '../../stores';
 import { MessageBubble } from './MessageBubble';
@@ -15,37 +15,28 @@ export function MessageList({ sessionId, messages }: MessageListProps) {
   const sessionStatus = useGlobalStore((s) => s.sessionStatus.get(sessionId));
 
   const isProcessing = sessionStatus?.isProcessing ?? false;
-  const { isAtBottom } = getScrollPosition(sessionId);
+  const isAtBottomRef = useRef(getScrollPosition(sessionId).isAtBottom);
 
-  // Auto-scroll to bottom when new messages arrive (if user was at bottom)
-  useEffect(() => {
-    if (isAtBottom && virtuosoRef.current) {
-      virtuosoRef.current.scrollToIndex({
-        index: messages.length - 1,
-        behavior: 'smooth',
-      });
-    }
-  }, [messages.length, isAtBottom]);
-
-  const handleScroll = (scrolling: boolean) => {
-    if (!scrolling && virtuosoRef.current) {
-      // Check if we're at bottom after scrolling stops
-      // This is a simplified check - react-virtuoso has better ways to do this
-    }
-  };
-
-  const handleAtBottomStateChange = (atBottom: boolean) => {
+  const handleAtBottomStateChange = useCallback((atBottom: boolean) => {
+    isAtBottomRef.current = atBottom;
     setScrollPosition(sessionId, atBottom);
-  };
+  }, [sessionId, setScrollPosition]);
+
+  // Only auto-follow new output when user is at the bottom.
+  // Using a callback avoids the race condition between scroll state updates
+  // and message arrivals that caused choppy/jerky scrolling.
+  const handleFollowOutput = useCallback(() => {
+    return isAtBottomRef.current ? 'smooth' : false;
+  }, []);
 
   return (
     <div className="h-full">
       <Virtuoso
         ref={virtuosoRef}
         data={messages}
-        followOutput="smooth"
+        followOutput={handleFollowOutput}
         atBottomStateChange={handleAtBottomStateChange}
-        isScrolling={handleScroll}
+        atBottomThreshold={50}
         itemContent={(index, message) => (
           <MessageBubble key={index} message={message} />
         )}
