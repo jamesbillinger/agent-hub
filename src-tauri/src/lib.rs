@@ -96,6 +96,15 @@ static HISTORY_MENU: Lazy<Mutex<Option<Submenu<tauri::Wry>>>> = Lazy::new(|| Mut
 // Web server port - determined at runtime with failover
 static WEB_SERVER_PORT: Lazy<Mutex<Option<u16>>> = Lazy::new(|| Mutex::new(None));
 
+// Shared database connection - initialized once, used everywhere
+static DB_CONNECTION: Lazy<Mutex<Connection>> = Lazy::new(|| {
+    let conn = Connection::open(get_db_path()).expect("Failed to open database");
+    conn.busy_timeout(std::time::Duration::from_secs(5)).expect("Failed to set busy timeout");
+    // Enable WAL mode for better concurrent read/write performance
+    conn.execute_batch("PRAGMA journal_mode=WAL;").expect("Failed to enable WAL mode");
+    Mutex::new(conn)
+});
+
 // Authentication: Active pairing requests (pairing_id -> code)
 static PAIRING_REQUESTS: Lazy<Mutex<HashMap<String, PairingRequest>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -543,10 +552,10 @@ fn get_db_path() -> PathBuf {
     data_dir.join("sessions.db")
 }
 
-fn init_db() -> rusqlite::Result<Connection> {
-    let conn = Connection::open(get_db_path())?;
-    // Set busy timeout so concurrent connections wait instead of failing with "database is locked"
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+/// Run database migrations once at startup using the shared connection.
+/// Must be called before any other DB operations.
+fn run_db_migrations() {
+    let conn = DB_CONNECTION.lock();
     conn.execute(
         "CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
@@ -559,7 +568,8 @@ fn init_db() -> rusqlite::Result<Connection> {
             sort_order INTEGER NOT NULL DEFAULT 0
         )",
         [],
-    )?;
+    ).expect("Failed to create sessions table");
+
     // Migration: Add sort_order column if it doesn't exist
     let _ = conn.execute("ALTER TABLE sessions ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0", []);
 
@@ -578,7 +588,7 @@ fn init_db() -> rusqlite::Result<Connection> {
             collapsed INTEGER NOT NULL DEFAULT 0
         )",
         [],
-    )?;
+    ).expect("Failed to create folders table");
 
     // Create terminal_buffers table for scrollback persistence
     // Stores compressed (gzip + base64) terminal buffer content
@@ -590,7 +600,7 @@ fn init_db() -> rusqlite::Result<Connection> {
             FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
         )",
         [],
-    )?;
+    ).expect("Failed to create terminal_buffers table");
 
     // Create paired_devices table for remote access authentication
     conn.execute(
@@ -602,7 +612,7 @@ fn init_db() -> rusqlite::Result<Connection> {
             last_seen TEXT NOT NULL
         )",
         [],
-    )?;
+    ).expect("Failed to create paired_devices table");
 
     // Create recently_closed table for undo close functionality
     conn.execute(
@@ -616,38 +626,42 @@ fn init_db() -> rusqlite::Result<Connection> {
             closed_at TEXT NOT NULL
         )",
         [],
-    )?;
-
-    Ok(conn)
+    ).expect("Failed to create recently_closed table");
 }
 
 // Load paired devices from database into memory
 fn load_paired_devices() {
-    if let Ok(conn) = init_db() {
-        if let Ok(mut stmt) = conn.prepare("SELECT token, id, name, paired_at, last_seen FROM paired_devices") {
-            if let Ok(rows) = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    PairedDevice {
-                        id: row.get(1)?,
-                        name: row.get(2)?,
-                        paired_at: row.get(3)?,
-                        last_seen: row.get(4)?,
-                    },
-                ))
-            }) {
-                let mut devices = PAIRED_DEVICES.lock();
-                for row in rows.flatten() {
-                    devices.insert(row.0, row.1);
-                }
-            }
-        }
+    let loaded: Vec<(String, PairedDevice)> = {
+        let conn = DB_CONNECTION.lock();
+        let mut stmt = match conn.prepare("SELECT token, id, name, paired_at, last_seen FROM paired_devices") {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let result: Vec<(String, PairedDevice)> = match stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                PairedDevice {
+                    id: row.get(1)?,
+                    name: row.get(2)?,
+                    paired_at: row.get(3)?,
+                    last_seen: row.get(4)?,
+                },
+            ))
+        }) {
+            Ok(rows) => rows.flatten().collect(),
+            Err(_) => return,
+        };
+        result
+    };
+    let mut devices = PAIRED_DEVICES.lock();
+    for (token, device) in loaded {
+        devices.insert(token, device);
     }
 }
 
 // Save a paired device to database
 fn save_paired_device(token: &str, device: &PairedDevice) -> Result<(), String> {
-    let conn = init_db().map_err(|e| e.to_string())?;
+    let conn = DB_CONNECTION.lock();
     conn.execute(
         "INSERT OR REPLACE INTO paired_devices (token, id, name, paired_at, last_seen) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![token, device.id, device.name, device.paired_at, device.last_seen],
@@ -657,7 +671,7 @@ fn save_paired_device(token: &str, device: &PairedDevice) -> Result<(), String> 
 
 // Delete a paired device from database
 fn delete_paired_device_db(token: &str) -> Result<(), String> {
-    let conn = init_db().map_err(|e| e.to_string())?;
+    let conn = DB_CONNECTION.lock();
     conn.execute("DELETE FROM paired_devices WHERE token = ?1", params![token])
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -666,12 +680,11 @@ fn delete_paired_device_db(token: &str) -> Result<(), String> {
 /// Save/clear the running PID for a session
 #[cfg(not(target_os = "ios"))]
 fn save_session_pid(session_id: &str, pid: Option<u32>) {
-    if let Ok(conn) = init_db() {
-        let _ = conn.execute(
-            "UPDATE sessions SET running_pid = ?1 WHERE id = ?2",
-            params![pid.map(|p| p as i64), session_id],
-        );
-    }
+    let conn = DB_CONNECTION.lock();
+    let _ = conn.execute(
+        "UPDATE sessions SET running_pid = ?1 WHERE id = ?2",
+        params![pid.map(|p| p as i64), session_id],
+    );
 }
 
 /// Check if a process is still running
@@ -685,41 +698,37 @@ fn is_process_running(pid: u32) -> bool {
 /// we kill them and clear the PIDs so the user can restart cleanly
 #[cfg(not(target_os = "ios"))]
 fn cleanup_orphaned_processes() {
-    if let Ok(conn) = init_db() {
+    // Collect orphaned session data while holding the lock briefly
+    let orphans: Vec<(String, u32)> = {
+        let conn = DB_CONNECTION.lock();
         let mut stmt = match conn.prepare("SELECT id, running_pid FROM sessions WHERE running_pid IS NOT NULL") {
             Ok(s) => s,
             Err(_) => return,
         };
-
-        let rows = match stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        let result: Vec<(String, u32)> = match stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32))
         }) {
-            Ok(r) => r,
+            Ok(rows) => rows.flatten().collect(),
             Err(_) => return,
         };
-
-        for row in rows.flatten() {
-            let (session_id, pid) = row;
-            let pid = pid as u32;
-
-            if is_process_running(pid) {
-                // Kill the orphaned process - we can't reattach to it anyway
-                println!("Killing orphaned process for session {}: PID {}", session_id, pid);
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGTERM);
-                }
-                // Give it a moment then force kill if needed
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
-                }
-            } else {
-                println!("Clearing stale PID {} for session {}", pid, session_id);
+        result
+    };
+    // Process orphans without holding the DB lock (kill/sleep can be slow)
+    for (session_id, pid) in orphans {
+        if is_process_running(pid) {
+            println!("Killing orphaned process for session {}: PID {}", session_id, pid);
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
             }
-
-            // Clear the PID in either case
-            save_session_pid(&session_id, None);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+        } else {
+            println!("Clearing stale PID {} for session {}", pid, session_id);
         }
+        // Clear the PID - this will briefly lock DB_CONNECTION
+        save_session_pid(&session_id, None);
     }
 }
 
@@ -751,7 +760,7 @@ fn is_valid_token(token: &str) -> bool {
 
 #[tauri::command]
 fn load_sessions() -> Result<Vec<SessionData>, String> {
-    let conn = init_db().map_err(|e| e.to_string())?;
+    let conn = DB_CONNECTION.lock();
     let mut stmt = conn
         .prepare("SELECT id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order, folder_id FROM sessions ORDER BY sort_order ASC, created_at DESC")
         .map_err(|e| e.to_string())?;
@@ -779,33 +788,35 @@ fn load_sessions() -> Result<Vec<SessionData>, String> {
 
 #[tauri::command]
 fn save_session(session: SessionData) -> Result<(), String> {
-    let conn = init_db().map_err(|e| e.to_string())?;
+    let is_new: bool;
+    {
+        let conn = DB_CONNECTION.lock();
 
-    // Check if this is an update or create
-    let is_new: bool = conn.query_row(
-        "SELECT COUNT(*) FROM sessions WHERE id = ?1",
-        params![session.id],
-        |row| row.get::<_, i32>(0)
-    ).unwrap_or(0) == 0;
+        // Check if this is an update or create
+        is_new = conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+            params![session.id],
+            |row| row.get::<_, i32>(0)
+        ).unwrap_or(0) == 0;
 
-    conn.execute(
-        "INSERT OR REPLACE INTO sessions (id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order, folder_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
-            session.id,
-            session.name,
-            session.agent_type,
-            session.command,
-            session.working_dir,
-            session.created_at,
-            session.claude_session_id,
-            session.sort_order,
-            session.folder_id,
-        ],
-    )
-    .map_err(|e| e.to_string())?;
-
-    // Broadcast session change to WebSocket clients
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions (id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order, folder_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                session.id,
+                session.name,
+                session.agent_type,
+                session.command,
+                session.working_dir,
+                session.created_at,
+                session.claude_session_id,
+                session.sort_order,
+                session.folder_id,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    // Broadcast after releasing the DB lock
     #[cfg(not(target_os = "ios"))]
     {
         if is_new {
@@ -820,7 +831,7 @@ fn save_session(session: SessionData) -> Result<(), String> {
 
 #[tauri::command]
 fn update_session_orders(session_orders: Vec<(String, i32)>) -> Result<(), String> {
-    let conn = init_db().map_err(|e| e.to_string())?;
+    let conn = DB_CONNECTION.lock();
     for (session_id, sort_order) in session_orders {
         conn.execute(
             "UPDATE sessions SET sort_order = ?1 WHERE id = ?2",
@@ -833,11 +844,12 @@ fn update_session_orders(session_orders: Vec<(String, i32)>) -> Result<(), Strin
 
 #[tauri::command]
 fn delete_session(session_id: String) -> Result<(), String> {
-    let conn = init_db().map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
-        .map_err(|e| e.to_string())?;
-
-    // Broadcast session deletion to WebSocket clients
+    {
+        let conn = DB_CONNECTION.lock();
+        conn.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
+            .map_err(|e| e.to_string())?;
+    }
+    // Broadcast after releasing the DB lock
     #[cfg(not(target_os = "ios"))]
     broadcast_session_deleted(&session_id);
 
@@ -848,7 +860,7 @@ fn delete_session(session_id: String) -> Result<(), String> {
 
 #[tauri::command]
 fn load_folders() -> Result<Vec<FolderData>, String> {
-    let conn = init_db().map_err(|e| e.to_string())?;
+    let conn = DB_CONNECTION.lock();
     let mut stmt = conn
         .prepare("SELECT id, name, sort_order, collapsed FROM folders ORDER BY sort_order ASC")
         .map_err(|e| e.to_string())?;
@@ -871,7 +883,7 @@ fn load_folders() -> Result<Vec<FolderData>, String> {
 
 #[tauri::command]
 fn save_folder(folder: FolderData) -> Result<(), String> {
-    let conn = init_db().map_err(|e| e.to_string())?;
+    let conn = DB_CONNECTION.lock();
     conn.execute(
         "INSERT OR REPLACE INTO folders (id, name, sort_order, collapsed) VALUES (?1, ?2, ?3, ?4)",
         params![folder.id, folder.name, folder.sort_order, folder.collapsed as i32],
@@ -882,7 +894,7 @@ fn save_folder(folder: FolderData) -> Result<(), String> {
 
 #[tauri::command]
 fn delete_folder(folder_id: String) -> Result<(), String> {
-    let conn = init_db().map_err(|e| e.to_string())?;
+    let conn = DB_CONNECTION.lock();
     // Move sessions in this folder to unfiled
     conn.execute(
         "UPDATE sessions SET folder_id = NULL WHERE folder_id = ?1",
@@ -897,7 +909,7 @@ fn delete_folder(folder_id: String) -> Result<(), String> {
 
 #[tauri::command]
 fn update_folder_orders(folder_orders: Vec<(String, i32)>) -> Result<(), String> {
-    let conn = init_db().map_err(|e| e.to_string())?;
+    let conn = DB_CONNECTION.lock();
     for (folder_id, sort_order) in folder_orders {
         conn.execute(
             "UPDATE folders SET sort_order = ?1 WHERE id = ?2",
@@ -910,7 +922,7 @@ fn update_folder_orders(folder_orders: Vec<(String, i32)>) -> Result<(), String>
 
 #[tauri::command]
 fn update_session_folder(session_id: String, folder_id: Option<String>) -> Result<(), String> {
-    let conn = init_db().map_err(|e| e.to_string())?;
+    let conn = DB_CONNECTION.lock();
     conn.execute(
         "UPDATE sessions SET folder_id = ?1 WHERE id = ?2",
         params![folder_id, session_id],
@@ -921,7 +933,7 @@ fn update_session_folder(session_id: String, folder_id: Option<String>) -> Resul
 
 #[tauri::command]
 fn toggle_folder_collapsed(folder_id: String, collapsed: bool) -> Result<(), String> {
-    let conn = init_db().map_err(|e| e.to_string())?;
+    let conn = DB_CONNECTION.lock();
     conn.execute(
         "UPDATE folders SET collapsed = ?1 WHERE id = ?2",
         params![collapsed as i32, folder_id],
@@ -943,7 +955,7 @@ struct RecentlyClosedData {
 
 #[tauri::command]
 fn save_recently_closed(session: RecentlyClosedData) -> Result<(), String> {
-    let conn = init_db().map_err(|e| e.to_string())?;
+    let conn = DB_CONNECTION.lock();
 
     // Insert the newly closed session
     conn.execute(
@@ -973,7 +985,7 @@ fn save_recently_closed(session: RecentlyClosedData) -> Result<(), String> {
 
 #[tauri::command]
 fn get_recently_closed() -> Result<Vec<RecentlyClosedData>, String> {
-    let conn = init_db().map_err(|e| e.to_string())?;
+    let conn = DB_CONNECTION.lock();
     let mut stmt = conn
         .prepare("SELECT id, name, agent_type, command, working_dir, claude_session_id, closed_at FROM recently_closed ORDER BY closed_at DESC")
         .map_err(|e| e.to_string())?;
@@ -999,7 +1011,7 @@ fn get_recently_closed() -> Result<Vec<RecentlyClosedData>, String> {
 
 #[tauri::command]
 fn delete_recently_closed(session_id: String) -> Result<(), String> {
-    let conn = init_db().map_err(|e| e.to_string())?;
+    let conn = DB_CONNECTION.lock();
     conn.execute("DELETE FROM recently_closed WHERE id = ?1", params![session_id])
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -1052,7 +1064,7 @@ fn update_history_menu(_sessions: Vec<RecentlyClosedData>) -> Result<(), String>
 
 #[tauri::command]
 fn update_session_claude_id(session_id: String, claude_session_id: String) -> Result<(), String> {
-    let conn = init_db().map_err(|e| e.to_string())?;
+    let conn = DB_CONNECTION.lock();
     conn.execute(
         "UPDATE sessions SET claude_session_id = ?1 WHERE id = ?2",
         params![claude_session_id, session_id],
@@ -1933,7 +1945,7 @@ fn save_terminal_buffer(session_id: String, buffer_content: String) -> Result<()
     // Encode to base64 for safe text storage
     let encoded = BASE64.encode(&compressed);
 
-    let conn = init_db().map_err(|e| e.to_string())?;
+    let conn = DB_CONNECTION.lock();
     let now = chrono::Utc::now().to_rfc3339();
 
     conn.execute(
@@ -1950,7 +1962,7 @@ fn save_terminal_buffer(session_id: String, buffer_content: String) -> Result<()
 /// Returns the raw terminal content to be written to xterm.js
 #[tauri::command]
 fn load_terminal_buffer(session_id: String) -> Result<Option<String>, String> {
-    let conn = init_db().map_err(|e| e.to_string())?;
+    let conn = DB_CONNECTION.lock();
 
     let result: Result<String, _> = conn.query_row(
         "SELECT buffer_data FROM terminal_buffers WHERE session_id = ?1",
@@ -1982,7 +1994,7 @@ fn load_terminal_buffer(session_id: String) -> Result<Option<String>, String> {
 /// Delete terminal buffer when session is deleted
 #[tauri::command]
 fn delete_terminal_buffer(session_id: String) -> Result<(), String> {
-    let conn = init_db().map_err(|e| e.to_string())?;
+    let conn = DB_CONNECTION.lock();
     conn.execute(
         "DELETE FROM terminal_buffers WHERE session_id = ?1",
         params![session_id],
@@ -3934,6 +3946,9 @@ fn setup_app(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Initialize shared database connection and run migrations
+    run_db_migrations();
+
     // Store AppHandle for web server to use
     {
         let mut handle = APP_HANDLE.lock();
@@ -3968,6 +3983,9 @@ fn setup_app(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 // iOS setup without menus
 #[cfg(target_os = "ios")]
 fn setup_app(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize shared database connection and run migrations
+    run_db_migrations();
+
     // Store AppHandle for web server to use
     {
         let mut handle = APP_HANDLE.lock();
