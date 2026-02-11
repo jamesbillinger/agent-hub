@@ -545,6 +545,8 @@ fn get_db_path() -> PathBuf {
 
 fn init_db() -> rusqlite::Result<Connection> {
     let conn = Connection::open(get_db_path())?;
+    // Set busy timeout so concurrent connections wait instead of failing with "database is locked"
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
