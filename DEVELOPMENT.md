@@ -30,37 +30,26 @@ The dev server runs at:
 
 ## Building Releases
 
-### Quick Release (Recommended)
+### Release (Recommended)
 
 ```bash
 npm run release
 ```
 
 This single command:
-1. Auto-bumps the patch version (e.g., 0.1.5 → 0.1.6)
+1. Auto-bumps the patch version (e.g., 0.1.77 → 0.1.78)
 2. Updates all version files (package.json, tauri.conf.json, Cargo.toml)
-3. Builds the release
-4. Kills any running Agent Hub instance
-5. Installs to `/Applications/Agent Hub.app`
+3. Commits and pushes the version bump to main
+4. Creates and pushes a `v{version}` tag, which triggers the CI workflow
 
-The DMG is also available at `src-tauri/target/release/bundle/dmg/`
+The CI workflow then:
+1. Builds for Apple Silicon (aarch64)
+2. Signs with your Apple Developer certificate
+3. Notarizes with Apple
+4. Creates a GitHub release with DMG
+5. Generates updater artifacts (tar.gz + signature + latest.json)
 
-### GitHub Actions Release (CI)
-
-To create a release via GitHub Actions:
-
-```bash
-# Create a release branch with the version number
-git checkout -b release/0.1.29
-git push -u origin release/0.1.29
-```
-
-The workflow will:
-1. Build for Apple Silicon (aarch64)
-2. Sign with your Apple Developer certificate
-3. Notarize with Apple
-4. Create GitHub release with DMG
-5. Generate updater artifacts (tar.gz + signature + latest.json)
+The running app will pick up the update automatically on next startup, or you can check manually via Settings > About > "Check for Updates".
 
 #### Required GitHub Secrets
 

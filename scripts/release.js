@@ -42,7 +42,7 @@ fs.writeFileSync(cargoTomlPath, cargoToml);
 console.log(`✓ Updated Cargo.toml`);
 
 // Git operations
-console.log(`\n📦 Creating release branch...\n`);
+console.log(`\n📦 Creating release tag...\n`);
 
 try {
   // Commit version bump
@@ -54,13 +54,10 @@ try {
   execSync('git push origin main', { cwd: rootDir, stdio: 'inherit' });
   console.log(`✓ Pushed to main`);
 
-  // Create and push release branch
-  execSync(`git checkout -b release/${newVersion}`, { cwd: rootDir, stdio: 'inherit' });
-  execSync(`git push origin release/${newVersion}`, { cwd: rootDir, stdio: 'inherit' });
-  console.log(`✓ Pushed release/${newVersion} branch`);
-
-  // Switch back to main
-  execSync('git checkout main', { cwd: rootDir, stdio: 'inherit' });
+  // Create and push tag (triggers CI release workflow)
+  execSync(`git tag v${newVersion}`, { cwd: rootDir, stdio: 'inherit' });
+  execSync(`git push origin v${newVersion}`, { cwd: rootDir, stdio: 'inherit' });
+  console.log(`✓ Pushed tag v${newVersion}`);
 
   console.log(`\n✅ Release ${newVersion} triggered!\n`);
   console.log(`   CI will build, sign, notarize, and publish the release.`);
