@@ -1480,7 +1480,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
     // Send result back via HTTP
     try {
-      const port = 3857; // TODO: get dynamically if needed
+      const port = await invoke<number | null>("get_web_server_port") || 3857;
       await fetch(`http://localhost:${port}/api/mcp/result`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -3916,6 +3916,7 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
 • \`/exit\` - Suspend session (frees memory, resumes on next message)
 • \`/exitall\` - Suspend all other sessions
 • \`/reset\` - Reset Claude's context (keeps chat history visible)
+• \`/model [name]\` - Switch Claude model (opus, sonnet, haiku, or full ID)
 • \`/restart\` - Restart an inactive session process
 • \`/status\` - Show session status
 
@@ -4028,15 +4029,98 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
       return true;
 
     case "status":
+      const currentModelMatch = session.command.match(/--model\s+(\S+)/);
       const statusInfo = [
         `**Session:** ${session.name}`,
         `**Agent:** ${session.agentType}`,
+        currentModelMatch ? `**Model:** ${currentModelMatch[1]}` : null,
         `**Running:** ${session.isRunning ? "Yes" : "No"}`,
         `**Working Dir:** ${session.workingDir}`,
         session.claudeSessionId ? `**Claude Session:** ${session.claudeSessionId}` : null,
       ].filter(Boolean).join("\n");
       addChatMessage(sessionId, { type: "system", result: statusInfo });
       return true;
+
+    case "model": {
+      // Switch Claude model mid-session
+      if (session.agentType !== "claude-json" && session.agentType !== "claude") {
+        addChatMessage(sessionId, {
+          type: "system",
+          result: "`/model` is only available for Claude sessions.",
+        });
+        return true;
+      }
+
+      if (!args) {
+        // Show current model and usage
+        const currentModel = session.command.match(/--model\s+(\S+)/)?.[1] || "default (from CLI config)";
+        addChatMessage(sessionId, {
+          type: "system",
+          result: `**Current model:** ${currentModel}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`opus\`, \`sonnet\`, \`haiku\`, \`default\`\n**Full IDs:** \`claude-opus-4-6\`, \`claude-sonnet-4-6\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
+        });
+        return true;
+      }
+
+      // Handle "default" to strip --model flag entirely
+      const argLower = args.toLowerCase();
+      if (argLower === "default" || argLower === "reset") {
+        session.command = session.command.replace(/\s*--model\s+\S+/, "");
+
+        // Kill, save, restart
+        if (session.isRunning) {
+          try {
+            await invoke("kill_json_process", { sessionId });
+          } catch { /* might already be dead */ }
+          session.isRunning = false;
+        }
+        await saveSessionToDb(session);
+
+        addChatMessage(sessionId, {
+          type: "system",
+          result: "Switching to **default model** (from CLI config)... Session will resume with conversation history.",
+        });
+
+        await startSessionProcess(session);
+        return true;
+      }
+
+      // Map shorthand names to model IDs
+      const MODEL_ALIASES: Record<string, string> = {
+        opus: "claude-opus-4-6",
+        sonnet: "claude-sonnet-4-6",
+        haiku: "claude-haiku-4-5-20251001",
+      };
+      const modelId = MODEL_ALIASES[argLower] || args;
+
+      // Update the command: remove existing --model flag if present, add new one
+      let newCommand = session.command.replace(/\s*--model\s+\S+/, "");
+      newCommand = newCommand.replace("claude ", `claude --model ${modelId} `);
+
+      session.command = newCommand;
+
+      // Kill the current process if running
+      if (session.isRunning) {
+        try {
+          await invoke("kill_json_process", { sessionId });
+        } catch {
+          // Might already be dead
+        }
+        session.isRunning = false;
+      }
+
+      // Save updated command to database
+      await saveSessionToDb(session);
+
+      addChatMessage(sessionId, {
+        type: "system",
+        result: `Switching to **${modelId}**... Session will resume with conversation history.`,
+      });
+
+      // Restart the process (will use --resume automatically since hasBeenStarted is true)
+      await startSessionProcess(session);
+
+      return true;
+    }
 
     case "exitall":
     case "suspendall":
