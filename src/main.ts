@@ -330,6 +330,7 @@ interface AppSettings {
   renderer: "webgl" | "dom";
   remote_pin?: string | null;
   show_active_sessions_group: boolean;
+  default_model?: string | null;
 }
 
 // Recently closed session for undo functionality
@@ -391,6 +392,14 @@ const AGENT_COMMANDS: Record<string, string> = {
   shell: "$SHELL",
   custom: "",
 };
+
+// Apply default model to a claude command if configured
+function applyDefaultModel(command: string): string {
+  if (!appSettings.default_model) return command;
+  // Only apply to claude commands, and only if no --model flag already present
+  if (!command.includes("claude ") || command.includes("--model ")) return command;
+  return command.replace("claude ", `claude --model ${appSettings.default_model} `);
+}
 
 // Default working directory
 const DEFAULT_WORKING_DIR = "~/dev/pplsi";
@@ -723,6 +732,7 @@ let settingsFontFamilySelect: HTMLSelectElement;
 let settingsThemeSelect: HTMLSelectElement;
 let settingsDefaultWorkingDirInput: HTMLInputElement;
 let settingsDefaultAgentSelect: HTMLSelectElement;
+let settingsDefaultModelSelect: HTMLSelectElement;
 let settingsNotificationsCheckbox: HTMLInputElement;
 let settingsBellNotificationsCheckbox: HTMLInputElement;
 let settingsBounceDockCheckbox: HTMLInputElement;
@@ -756,6 +766,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   settingsThemeSelect = document.getElementById("settings-theme") as HTMLSelectElement;
   settingsDefaultWorkingDirInput = document.getElementById("settings-default-working-dir") as HTMLInputElement;
   settingsDefaultAgentSelect = document.getElementById("settings-default-agent") as HTMLSelectElement;
+  settingsDefaultModelSelect = document.getElementById("settings-default-model") as HTMLSelectElement;
   settingsNotificationsCheckbox = document.getElementById("settings-notifications") as HTMLInputElement;
   settingsBellNotificationsCheckbox = document.getElementById("settings-bell-notifications") as HTMLInputElement;
   settingsBounceDockCheckbox = document.getElementById("settings-bounce-dock") as HTMLInputElement;
@@ -2013,7 +2024,7 @@ async function createQuickSession() {
     id: crypto.randomUUID(),
     name: `Claude ${sessions.size + 1}`,
     agentType: "claude-json",
-    command: AGENT_COMMANDS["claude-json"],
+    command: applyDefaultModel(AGENT_COMMANDS["claude-json"]),
     workingDir: DEFAULT_WORKING_DIR,
     createdAt: new Date(),
     isRunning: false,
@@ -2042,7 +2053,7 @@ async function createQuickSessionWithAgent(agentType: Session["agentType"]) {
     id: crypto.randomUUID(),
     name: `${agentLabel} ${sessions.size + 1}`,
     agentType,
-    command: AGENT_COMMANDS[agentType],
+    command: applyDefaultModel(AGENT_COMMANDS[agentType]),
     workingDir: DEFAULT_WORKING_DIR,
     createdAt: new Date(),
     isRunning: false,
@@ -2082,7 +2093,7 @@ async function createSessionWithDirectory(agentType: Session["agentType"], name:
     id: crypto.randomUUID(),
     name,
     agentType,
-    command: AGENT_COMMANDS[agentType],
+    command: applyDefaultModel(AGENT_COMMANDS[agentType]),
     workingDir: expandedDir,
     createdAt: new Date(),
     isRunning: false,
@@ -2158,7 +2169,7 @@ async function saveSessionFromModal() {
   const dirName = workingDir.split("/").filter(Boolean).pop() || "Project";
   const name = sessionNameInput.value.trim() || dirName;
   const agentType = agentTypeSelect.value as Session["agentType"];
-  let command = AGENT_COMMANDS[agentType];
+  let command = applyDefaultModel(AGENT_COMMANDS[agentType]);
 
   if (agentType === "custom") {
     command = customCommandInput.value.trim() || "/bin/zsh";
@@ -4054,9 +4065,10 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
       if (!args) {
         // Show current model and usage
         const currentModel = session.command.match(/--model\s+(\S+)/)?.[1] || "default (from CLI config)";
+        const settingsDefault = appSettings.default_model ? `Settings default: \`${appSettings.default_model}\`` : "No settings default (using CLI config)";
         addChatMessage(sessionId, {
           type: "system",
-          result: `**Current model:** ${currentModel}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`opus\`, \`sonnet\`, \`haiku\`, \`default\`\n**Full IDs:** \`claude-opus-4-6\`, \`claude-sonnet-4-6\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
+          result: `**Current model:** ${currentModel}\n${settingsDefault}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`opus\`, \`sonnet\`, \`haiku\`, \`default\`\n**Full IDs:** \`claude-opus-4-6\`, \`claude-sonnet-4-6\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
         });
         return true;
       }
@@ -6219,6 +6231,7 @@ async function showSettingsModal(): Promise<void> {
   settingsThemeSelect.value = appSettings.theme;
   settingsDefaultWorkingDirInput.value = appSettings.default_working_dir;
   settingsDefaultAgentSelect.value = appSettings.default_agent_type;
+  settingsDefaultModelSelect.value = appSettings.default_model || "";
   settingsNotificationsCheckbox.checked = appSettings.notifications_enabled;
   settingsBellNotificationsCheckbox.checked = appSettings.bell_notifications_enabled ?? true;
   settingsBounceDockCheckbox.checked = appSettings.bounce_dock_on_bell ?? true;
@@ -6306,6 +6319,7 @@ async function saveSettings(): Promise<void> {
     theme: settingsThemeSelect.value,
     default_working_dir: settingsDefaultWorkingDirInput.value || DEFAULT_WORKING_DIR,
     default_agent_type: settingsDefaultAgentSelect.value || "claude",
+    default_model: settingsDefaultModelSelect.value || null,
     notifications_enabled: settingsNotificationsCheckbox.checked,
     bell_notifications_enabled: settingsBellNotificationsCheckbox.checked,
     bounce_dock_on_bell: settingsBounceDockCheckbox.checked,

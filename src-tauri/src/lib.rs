@@ -374,6 +374,8 @@ struct AppSettings {
     remote_pin: Option<String>,
     #[serde(default = "default_true")]
     show_active_sessions_group: bool,
+    #[serde(default)]
+    default_model: Option<String>,
 }
 
 fn default_renderer() -> String {
@@ -399,6 +401,7 @@ impl Default for AppSettings {
             renderer: "webgl".to_string(),
             remote_pin: None,
             show_active_sessions_group: true,
+            default_model: None,
         }
     }
 }
