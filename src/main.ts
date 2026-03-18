@@ -4535,10 +4535,10 @@ async function handlePlanApprove(approveBtn: HTMLButtonElement) {
   const changesInput = container.querySelector(".plan-changes-input") as HTMLElement;
   if (changesInput) changesInput.style.display = "none";
 
-  const responseText = "Plan approved. Proceed with implementation.";
+  const responseText = "Plan approved. Proceed with implementation. IMPORTANT: Plan mode has been exited by the user - do NOT call ExitPlanMode again. Begin implementing the plan immediately.";
 
   // Add user's approval to chat display
-  addChatMessage(activeSessionId, { type: "user", result: responseText });
+  addChatMessage(activeSessionId, { type: "user", result: "Plan approved. Proceed with implementation." });
 
   // Send as user message
   const jsonMessage = JSON.stringify({
@@ -4596,12 +4596,13 @@ async function handlePlanChangesSubmit(submitBtn: HTMLButtonElement) {
   // Add user's feedback to chat display
   addChatMessage(activeSessionId, { type: "user", result: feedback });
 
-  // Send as user message
+  // Send as user message with plan mode context
+  const fullFeedback = `Plan changes requested: ${feedback}\n\nIMPORTANT: Plan mode has been exited by the user - do NOT call ExitPlanMode again. Revise the plan based on the feedback above, then proceed with implementation.`;
   const jsonMessage = JSON.stringify({
     type: "user",
     message: {
       role: "user",
-      content: feedback,
+      content: fullFeedback,
     }
   }) + "\n";
 
