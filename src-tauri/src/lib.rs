@@ -129,6 +129,19 @@ type MobileSender = tokio::sync::mpsc::UnboundedSender<String>;
 static MOBILE_CLIENTS: Lazy<Mutex<HashMap<String, MobileClient>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+// Backend-side message tracking: keeps all messages per session in memory
+// so they can be persisted to DB independently of the desktop frontend.
+// This ensures messages sent from mobile are never lost even if the desktop
+// doesn't have the session tab open.
+#[cfg(not(target_os = "ios"))]
+static SESSION_MESSAGES: Lazy<Mutex<HashMap<String, Vec<serde_json::Value>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+// Track which sessions have been loaded from DB into SESSION_MESSAGES
+#[cfg(not(target_os = "ios"))]
+static SESSION_MESSAGES_LOADED: Lazy<Mutex<std::collections::HashSet<String>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
+
 #[cfg(not(target_os = "ios"))]
 struct MobileClient {
     sender: MobileSender,
@@ -292,21 +305,36 @@ fn broadcast_session_list_to_mobile() {
     broadcast_to_mobile_clients(&msg);
 }
 
-/// Get session history for mobile clients (returns JSON messages parsed from buffer)
+/// Load session messages from DB into the in-memory SESSION_MESSAGES buffer.
+/// Only loads once per session (tracked by SESSION_MESSAGES_LOADED).
 #[cfg(not(target_os = "ios"))]
-fn get_session_history(session_id: &str) -> Option<Vec<serde_json::Value>> {
-    // Load the raw buffer
-    let buffer = load_terminal_buffer(session_id.to_string()).ok()??;
+fn ensure_session_messages_loaded(session_id: &str) {
+    let mut loaded = SESSION_MESSAGES_LOADED.lock();
+    if loaded.contains(session_id) {
+        return;
+    }
+    loaded.insert(session_id.to_string());
+    drop(loaded);
 
-    // Try to parse as JSON array first (desktop format)
-    if let Ok(messages) = serde_json::from_str::<Vec<serde_json::Value>>(&buffer) {
-        if messages.is_empty() {
-            return None;
+    // Load from DB
+    if let Ok(Some(buffer)) = load_terminal_buffer(session_id.to_string()) {
+        let db_messages = parse_buffer_to_messages(&buffer);
+        if !db_messages.is_empty() {
+            let mut messages = SESSION_MESSAGES.lock();
+            messages.insert(session_id.to_string(), db_messages);
         }
-        return Some(messages);
+    }
+}
+
+/// Parse a buffer string (JSON array or NDJSON) into a Vec of messages
+#[cfg(not(target_os = "ios"))]
+fn parse_buffer_to_messages(buffer: &str) -> Vec<serde_json::Value> {
+    // Try JSON array first (desktop format)
+    if let Ok(messages) = serde_json::from_str::<Vec<serde_json::Value>>(buffer) {
+        return messages;
     }
 
-    // Fall back to NDJSON format (one JSON object per line)
+    // Fall back to NDJSON
     let mut messages = Vec::new();
     for line in buffer.lines() {
         if line.trim().is_empty() {
@@ -316,11 +344,44 @@ fn get_session_history(session_id: &str) -> Option<Vec<serde_json::Value>> {
             messages.push(json);
         }
     }
+    messages
+}
 
-    if messages.is_empty() {
-        None
-    } else {
-        Some(messages)
+/// Append a message to the in-memory SESSION_MESSAGES buffer for a session.
+/// Ensures DB history is loaded first so we have the complete picture.
+#[cfg(not(target_os = "ios"))]
+fn append_session_message(session_id: &str, message: serde_json::Value) {
+    ensure_session_messages_loaded(session_id);
+    let mut messages = SESSION_MESSAGES.lock();
+    messages.entry(session_id.to_string()).or_default().push(message);
+}
+
+/// Save the in-memory SESSION_MESSAGES buffer for a session to the database.
+/// Uses save_terminal_buffer_to_db directly to avoid re-updating SESSION_MESSAGES.
+#[cfg(not(target_os = "ios"))]
+fn save_session_messages_to_db(session_id: &str) {
+    let messages = {
+        let msgs = SESSION_MESSAGES.lock();
+        match msgs.get(session_id) {
+            Some(m) if !m.is_empty() => m.clone(),
+            _ => return,
+        }
+    };
+
+    let buffer_content = serde_json::to_string(&messages).unwrap_or_default();
+    let _ = save_terminal_buffer_to_db(session_id, &buffer_content);
+}
+
+/// Get session history for mobile clients (returns JSON messages parsed from buffer)
+/// Uses the in-memory SESSION_MESSAGES buffer if available, otherwise loads from DB.
+#[cfg(not(target_os = "ios"))]
+fn get_session_history(session_id: &str) -> Option<Vec<serde_json::Value>> {
+    ensure_session_messages_loaded(session_id);
+
+    let messages = SESSION_MESSAGES.lock();
+    match messages.get(session_id) {
+        Some(msgs) if !msgs.is_empty() => Some(msgs.clone()),
+        _ => None,
     }
 }
 
@@ -1755,6 +1816,7 @@ fn spawn_json_process(
                     // This offloads JSON parsing from the frontend
                     if let Some(parsed) = parse_claude_json(&line) {
                         // Detect processing state changes
+                        let is_result = parsed.msg_type == "result";
                         match parsed.msg_type.as_str() {
                             "assistant" => {
                                 broadcast_processing_status(&session_id_stdout, true);
@@ -1763,6 +1825,15 @@ fn spawn_json_process(
                                 broadcast_processing_status(&session_id_stdout, false);
                             }
                             _ => {}
+                        }
+
+                        // Track message in backend-side buffer
+                        if let Ok(msg_value) = serde_json::to_value(&parsed) {
+                            append_session_message(&session_id_stdout, msg_value);
+                        }
+                        // Save to DB on result messages (conversation turn complete)
+                        if is_result {
+                            save_session_messages_to_db(&session_id_stdout);
                         }
 
                         // Emit pre-parsed message to Tauri frontend
@@ -1804,6 +1875,11 @@ fn spawn_json_process(
                 while let Ok(Some(line)) = reader.next_line().await {
                     // Try to parse as JSON first (some errors come as JSON)
                     if let Some(parsed) = parse_claude_json(&line) {
+                        // Track in backend-side buffer
+                        if let Ok(msg_value) = serde_json::to_value(&parsed) {
+                            append_session_message(&session_id_stderr, msg_value);
+                        }
+
                         let _ = app_stderr.emit("json-process-message", serde_json::json!({
                             "session_id": session_id_stderr,
                             "message": parsed
@@ -1844,6 +1920,9 @@ fn spawn_json_process(
                 }
             }
 
+            // Save any remaining messages to DB before cleanup
+            save_session_messages_to_db(&session_id_clone);
+
             // Clean up
             {
                 let mut processes = JSON_PROCESSES.lock();
@@ -1852,6 +1931,15 @@ fn spawn_json_process(
             {
                 let mut broadcasters = JSON_BROADCASTERS.lock();
                 broadcasters.remove(&session_id_clone);
+            }
+            // Clear in-memory message buffer (already saved to DB)
+            {
+                let mut messages = SESSION_MESSAGES.lock();
+                messages.remove(&session_id_clone);
+            }
+            {
+                let mut loaded = SESSION_MESSAGES_LOADED.lock();
+                loaded.remove(&session_id_clone);
             }
             // Clear the PID from database
             save_session_pid(&session_id_clone, None);
@@ -1932,10 +2020,8 @@ fn kill_json_process(session_id: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Compress and save terminal buffer content to the database
-/// The buffer_content is the raw terminal content from xterm.js serialization
-#[tauri::command]
-fn save_terminal_buffer(session_id: String, buffer_content: String) -> Result<(), String> {
+/// Internal: Compress and save buffer content to the database only (no SESSION_MESSAGES update)
+fn save_terminal_buffer_to_db(session_id: &str, buffer_content: &str) -> Result<(), String> {
     // Compress the buffer content using gzip
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder
@@ -1959,6 +2045,26 @@ fn save_terminal_buffer(session_id: String, buffer_content: String) -> Result<()
     .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+/// Compress and save terminal buffer content to the database
+/// Called from the desktop frontend. Also updates in-memory SESSION_MESSAGES
+/// to stay in sync (desktop has the most complete view of messages).
+#[tauri::command]
+fn save_terminal_buffer(session_id: String, buffer_content: String) -> Result<(), String> {
+    // Update in-memory SESSION_MESSAGES when desktop saves (desktop has the most complete view)
+    #[cfg(not(target_os = "ios"))]
+    {
+        let db_messages = parse_buffer_to_messages(&buffer_content);
+        if !db_messages.is_empty() {
+            let mut messages = SESSION_MESSAGES.lock();
+            messages.insert(session_id.clone(), db_messages);
+            let mut loaded = SESSION_MESSAGES_LOADED.lock();
+            loaded.insert(session_id.clone());
+        }
+    }
+
+    save_terminal_buffer_to_db(&session_id, &buffer_content)
 }
 
 /// Load and decompress terminal buffer content from the database
@@ -3633,8 +3739,20 @@ async fn handle_ws_mobile(socket: WebSocket) {
                             other => other.to_string(),
                         };
 
-                        // Write to the session's process
-                        let _ = write_to_process(session_id.to_string(), content_str.clone());
+                        // Track user message in backend-side buffer and persist to DB
+                        // This ensures mobile messages survive even if desktop doesn't have the session open
+                        if let Ok(msg_value) = serde_json::from_str::<serde_json::Value>(&content_str) {
+                            append_session_message(session_id, msg_value);
+                            save_session_messages_to_db(session_id);
+                        }
+
+                        // Write to the session's process (ensure trailing newline)
+                        let write_str = if content_str.ends_with('\n') {
+                            content_str.clone()
+                        } else {
+                            content_str.clone() + "\n"
+                        };
+                        let _ = write_to_process(session_id.to_string(), write_str);
 
                         // Broadcast to other clients watching this session
                         if let Some(broadcaster) = {
@@ -3644,12 +3762,22 @@ async fn handle_ws_mobile(socket: WebSocket) {
                             let _ = broadcaster.send(content_str.clone());
                         }
 
-                        // Emit Tauri event so desktop sees mobile messages
+                        // Emit pre-parsed Tauri event so desktop sees mobile messages
+                        // Use json-process-message (not json-process-output) so the desktop
+                        // handles it correctly even without a trailing newline
                         if let Some(app) = APP_HANDLE.lock().as_ref() {
-                            let _ = app.emit("json-process-output", serde_json::json!({
-                                "session_id": session_id,
-                                "data": content_str,
-                            }));
+                            if let Ok(parsed) = serde_json::from_str::<ClaudeJsonMessage>(&content_str) {
+                                let _ = app.emit("json-process-message", serde_json::json!({
+                                    "session_id": session_id,
+                                    "message": parsed,
+                                }));
+                            } else {
+                                // Fallback: emit as raw output with trailing newline
+                                let _ = app.emit("json-process-output", serde_json::json!({
+                                    "session_id": session_id,
+                                    "data": content_str.clone() + "\n",
+                                }));
+                            }
                         }
                     }
 
