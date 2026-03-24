@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { marked } from 'marked';
 import type { Message, TextContent, ToolUseContent } from '../../types';
 
@@ -10,6 +10,22 @@ marked.setOptions({
 
 interface MessageBubbleProps {
   message: Message;
+}
+
+function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
+  return (
+    <div
+      className="fixed inset-0 bg-black/85 flex items-center justify-center z-[10000]"
+      onClick={onClose}
+      style={{ cursor: 'zoom-out' }}
+    >
+      <img
+        src={src}
+        alt="Zoomed"
+        className="max-w-[90vw] max-h-[90vh] object-contain rounded-lg shadow-2xl"
+      />
+    </div>
+  );
 }
 
 export function MessageBubble({ message }: MessageBubbleProps) {
@@ -24,30 +40,7 @@ export function MessageBubble({ message }: MessageBubbleProps) {
   }
 
   if (message.type === 'user') {
-    const text = extractUserText(message);
-    const images = message.images || extractUserImages(message);
-
-    if (!text && images.length === 0) return null;
-
-    return (
-      <div className="px-4 py-2 flex justify-end">
-        <div className="max-w-[85%] bg-[#0e9fd8] text-white rounded-2xl rounded-br px-4 py-2">
-          {images.length > 0 && (
-            <div className="flex flex-wrap gap-2 mb-2">
-              {images.map((img, i) => (
-                <img
-                  key={i}
-                  src={`data:${img.mediaType};base64,${img.base64Data}`}
-                  alt="Attached"
-                  className="max-w-[150px] max-h-[100px] rounded object-cover"
-                />
-              ))}
-            </div>
-          )}
-          {text && <div className="whitespace-pre-wrap break-words">{text}</div>}
-        </div>
-      </div>
-    );
+    return <UserMessageContent message={message} />;
   }
 
   if (message.type === 'assistant' && message.message?.content) {
@@ -100,6 +93,41 @@ export function MessageBubble({ message }: MessageBubbleProps) {
 
   // Skip other message types
   return null;
+}
+
+function UserMessageContent({ message }: { message: Message }) {
+  const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
+  const text = extractUserText(message);
+  const images = message.images || extractUserImages(message);
+
+  if (!text && images.length === 0) return null;
+
+  return (
+    <>
+      {lightboxSrc && <ImageLightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />}
+      <div className="px-4 py-2 flex justify-end">
+        <div className="max-w-[85%] bg-[#0e9fd8] text-white rounded-2xl rounded-br px-4 py-2">
+          {images.length > 0 && (
+            <div className="flex flex-wrap gap-2 mb-2">
+              {images.map((img, i) => {
+                const src = `data:${img.mediaType};base64,${img.base64Data}`;
+                return (
+                  <img
+                    key={i}
+                    src={src}
+                    alt="Attached"
+                    className="max-w-[150px] max-h-[100px] rounded object-cover cursor-pointer"
+                    onClick={() => setLightboxSrc(src)}
+                  />
+                );
+              })}
+            </div>
+          )}
+          {text && <div className="whitespace-pre-wrap break-words">{text}</div>}
+        </div>
+      </div>
+    </>
+  );
 }
 
 function AssistantMessageContent({ text }: { text: string }) {

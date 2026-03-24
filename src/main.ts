@@ -956,6 +956,14 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Event delegation for diff expand buttons and clickable paths (dynamically added)
   // Use chat-container since chat-messages elements are created dynamically per session
   document.getElementById("chat-container")!.addEventListener("click", (e) => {
+    // Handle image click - open in lightbox
+    const clickedImg = (e.target as HTMLElement).closest(".user-image, .chat-image img") as HTMLImageElement;
+    if (clickedImg && clickedImg.tagName === "IMG" && clickedImg.src) {
+      e.preventDefault();
+      showImageLightbox(clickedImg.src);
+      return;
+    }
+
     // Handle diff expand buttons
     const btn = (e.target as HTMLElement).closest(".diff-expand-btn") as HTMLButtonElement;
     if (btn) {
@@ -6551,6 +6559,25 @@ function showPlanModal(planHtml: string): void {
 function hidePlanModal(): void {
   const modal = document.getElementById("plan-modal")!;
   modal.classList.remove("visible");
+}
+
+// Image lightbox
+
+function showImageLightbox(src: string): void {
+  // Remove existing lightbox if any
+  document.querySelector(".image-lightbox")?.remove();
+
+  const overlay = document.createElement("div");
+  overlay.className = "image-lightbox";
+  overlay.innerHTML = `<img src="${src}" />`;
+  overlay.addEventListener("click", () => overlay.remove());
+  document.addEventListener("keydown", function onKey(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      overlay.remove();
+      document.removeEventListener("keydown", onKey);
+    }
+  });
+  document.body.appendChild(overlay);
 }
 
 // About modal functions
