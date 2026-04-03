@@ -222,7 +222,7 @@ interface PtyOutput {
 // JSON streaming message types from Claude
 interface ClaudeJsonMessage {
   type: "system" | "user" | "assistant" | "result";
-  subtype?: "init" | "success" | "error" | "resumed" | "stopped";
+  subtype?: "init" | "success" | "error" | "resumed" | "stopped" | "status" | "compact_boundary";
   session_id?: string;
   message?: {
     id: string;
@@ -260,6 +260,13 @@ interface ClaudeJsonMessage {
     cache_creation_input_tokens?: number;
     cache_read_input_tokens?: number;
   };
+  // Status/compaction fields
+  status?: string;
+  compact_metadata?: {
+    trigger?: string;
+    pre_tokens?: number;
+  };
+  isSynthetic?: boolean;
 }
 
 // Pending image attachment
@@ -307,6 +314,7 @@ interface ChatSession {
   // Context tracking
   totalInputTokens: number; // Cumulative input tokens for context %
   totalOutputTokens: number;
+  dirty: boolean; // Track if messages changed since last save
 }
 
 interface WindowState {
@@ -2380,10 +2388,9 @@ async function switchToSession(sessionId: string) {
     if (session.webglAddon) {
       session.webglAddon.clearTextureAtlas();
     }
-    // Fit BEFORE showing to get correct dimensions while still invisible
-    session.fitAddon?.fit();
-    // Show existing terminal
+    // Show existing terminal (display:none prevents fitting, so show first)
     session.terminal.element?.parentElement?.classList.remove("hidden");
+    session.fitAddon?.fit();
     session.terminal.focus();
     // Fit again after showing and refresh
     setTimeout(async () => {
@@ -3751,6 +3758,7 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
     startTime: null,
     totalInputTokens: 0,
     totalOutputTokens: 0,
+    dirty: false,
   };
 
   // File attachment button click opens file picker
@@ -5112,6 +5120,7 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
   } else {
     chatSession.messages.push(message);
   }
+  chatSession.dirty = true;
 
   const messageEl = document.createElement("div");
   messageEl.className = "chat-message";
@@ -5267,6 +5276,17 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
     // Save init message so it persists across restarts
     saveChatMessages(sessionId);
     return;
+  } else if (message.type === "system" && message.subtype === "compact_boundary") {
+    // Compaction boundary - render a visual divider
+    messageEl.classList.add("system", "compact-boundary");
+    const trigger = message.compact_metadata?.trigger || "auto";
+    const preTokens = message.compact_metadata?.pre_tokens;
+    const tokenInfo = preTokens ? ` (${Math.round(preTokens / 1000)}k tokens)` : "";
+    messageEl.innerHTML = `<div class="compact-divider"><span>Context compacted${tokenInfo} — ${trigger}</span></div>`;
+  } else if (message.type === "system" && message.subtype === "status") {
+    // Status messages (e.g., compacting) - don't render, just save
+    saveChatMessages(sessionId);
+    return;
   } else if (message.type === "system" && message.result) {
     // Plain system messages (e.g., from slash commands)
     messageEl.classList.add("system");
@@ -5329,12 +5349,9 @@ function processChatOutput(sessionId: string, data: string) {
       const message = JSON.parse(line) as ClaudeJsonMessage;
 
       // Detect compaction messages and update status
-      if (message.type === "system" && message.result) {
-        const resultLower = message.result.toLowerCase();
-        if (resultLower.includes("compact") || resultLower.includes("summariz")) {
-          chatSession.statusEl.textContent = "Compacting context...";
-          chatSession.statusEl.className = "chat-status compacting";
-        }
+      if (message.type === "system" && message.subtype === "status" && message.status === "compacting") {
+        chatSession.statusEl.textContent = "Compacting context...";
+        chatSession.statusEl.className = "chat-status compacting";
       }
 
       addChatMessage(sessionId, message);
@@ -5940,6 +5957,7 @@ async function doSaveChatMessages(sessionId: string): Promise<void> {
       sessionId,
       bufferContent,
     });
+    chatSession.dirty = false;
   } catch (err) {
     console.error("Failed to save chat messages:", err);
   } finally {
@@ -6221,9 +6239,9 @@ async function saveAllTerminalBuffers(): Promise<void> {
     }
   }
 
-  // Save chat session messages (use immediate save to bypass debounce on app close)
+  // Save chat session messages that have changed (use immediate save to bypass debounce on app close)
   for (const [sessionId, chatSession] of chatSessions.entries()) {
-    if (chatSession.messages.length > 0) {
+    if (chatSession.messages.length > 0 && chatSession.dirty) {
       savePromises.push(saveChatMessagesImmediate(sessionId));
     }
   }

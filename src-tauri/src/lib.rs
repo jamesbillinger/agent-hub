@@ -583,6 +583,13 @@ struct ClaudeJsonMessage {
     num_turns: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<ClaudeUsage>,
+    // Status/compaction fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compact_metadata: Option<serde_json::Value>,
+    #[serde(rename = "isSynthetic", skip_serializing_if = "Option::is_none")]
+    is_synthetic: Option<bool>,
 }
 
 /// Parse a raw JSON line from Claude, handling escape codes
