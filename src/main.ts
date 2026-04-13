@@ -3559,6 +3559,9 @@ function showSessionContextMenu(x: number, y: number, sessionId: string) {
     moveItem.addEventListener("mouseleave", () => { submenu.style.display = "none"; });
   }
 
+  // Edit session (opens full edit modal with env vars, agent type, etc.)
+  addMenuItem(menu, "Edit Session", () => showEditSessionModal(sessionId));
+
   // Rename
   addMenuItem(menu, "Rename", () => {
     const item = sessionListEl.querySelector(`[data-session-id="${sessionId}"]`);
