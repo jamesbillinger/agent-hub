@@ -1346,6 +1346,26 @@ document.addEventListener("DOMContentLoaded", async () => {
     const session = sessions.get(event.payload.session_id);
     if (session) {
       session.isRunning = false;
+
+      // If we tried to resume and it failed quickly (non-zero exit, no messages received),
+      // retry without --resume (session may not exist in this CLAUDE_CONFIG_DIR)
+      if (resumeAttemptedSessions.has(event.payload.session_id) && event.payload.exit_code !== 0) {
+        resumeAttemptedSessions.delete(event.payload.session_id);
+        const chatSession = chatSessions.get(event.payload.session_id);
+        if (chatSession && chatSession.messages.length <= 1) {
+          console.log(`Resume failed for ${session.name}, retrying as fresh session`);
+          // Clear the claudeSessionId so it starts fresh
+          session.claudeSessionId = undefined;
+          session.hasBeenStarted = false;
+          await saveSessionToDb(session);
+          // Retry
+          startingJsonSessions.delete(event.payload.session_id);
+          await startJsonProcess(session);
+          return;
+        }
+      }
+      resumeAttemptedSessions.delete(event.payload.session_id);
+
       const chatSession = chatSessions.get(event.payload.session_id);
       if (chatSession) {
         const wasProcessing = chatSession.isProcessing;
@@ -2816,6 +2836,8 @@ async function startSessionProcess(session: Session) {
  */
 // Track sessions currently being started to prevent race conditions
 const startingJsonSessions = new Set<string>();
+// Track sessions that attempted --resume, so we can retry without it on failure
+const resumeAttemptedSessions = new Set<string>();
 
 async function startJsonProcess(session: Session) {
   if (session.isRunning) return;
@@ -2832,6 +2854,9 @@ async function startJsonProcess(session: Session) {
 
   // For claude-json sessions, determine if we should resume
   const shouldResume = session.hasBeenStarted === true && !!session.claudeSessionId;
+  if (shouldResume) {
+    resumeAttemptedSessions.add(session.id);
+  }
 
   chatSession.statusEl.textContent = "Starting...";
   chatSession.statusEl.className = "chat-status";
