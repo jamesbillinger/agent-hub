@@ -184,6 +184,7 @@ interface Session {
   sortOrder: number;
   outputByteCount?: number; // Track bytes for periodic texture atlas clearing
   folderId?: string;
+  envVars?: string; // JSON string of env var key-value pairs
 }
 
 interface SessionData {
@@ -196,6 +197,7 @@ interface SessionData {
   claude_session_id: string | null;
   sort_order: number;
   folder_id: string | null;
+  env_vars: string | null;
 }
 
 interface Folder {
@@ -339,6 +341,7 @@ interface AppSettings {
   remote_pin?: string | null;
   show_active_sessions_group: boolean;
   default_model?: string | null;
+  claude_config_dir?: string | null;
 }
 
 // Recently closed session for undo functionality
@@ -375,6 +378,7 @@ let appSettings: AppSettings = {
   read_aloud_enabled: false,
   renderer: "webgl",
   show_active_sessions_group: true,
+  claude_config_dir: null,
 };
 let sidebarResizeHandle: HTMLElement;
 let sidebarEl: HTMLElement;
@@ -400,6 +404,31 @@ const AGENT_COMMANDS: Record<string, string> = {
   shell: "$SHELL",
   custom: "",
 };
+
+// Parse "KEY=value" lines into JSON string, or return undefined if empty
+function envVarsToJson(text: string): string | undefined {
+  const lines = text.split("\n").filter(l => l.trim() && l.includes("="));
+  if (lines.length === 0) return undefined;
+  const obj: Record<string, string> = {};
+  for (const line of lines) {
+    const idx = line.indexOf("=");
+    const key = line.slice(0, idx).trim();
+    const value = line.slice(idx + 1).trim();
+    if (key) obj[key] = value;
+  }
+  return JSON.stringify(obj);
+}
+
+// Convert JSON env vars string to "KEY=value" lines for the textarea
+function envVarsToText(json: string | undefined): string {
+  if (!json) return "";
+  try {
+    const obj = JSON.parse(json) as Record<string, string>;
+    return Object.entries(obj).map(([k, v]) => `${k}=${v}`).join("\n");
+  } catch {
+    return "";
+  }
+}
 
 // Apply default model to a claude command if configured
 function applyDefaultModel(command: string): string {
@@ -731,6 +760,7 @@ let agentTypeSelect: HTMLSelectElement;
 let customCommandInput: HTMLInputElement;
 let customCommandGroup: HTMLElement;
 let workingDirInput: HTMLInputElement;
+let envVarsInput: HTMLTextAreaElement;
 let sessionSearchInput: HTMLInputElement;
 let sortSelect: HTMLSelectElement;
 let settingsModal: HTMLElement;
@@ -763,6 +793,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   customCommandInput = document.getElementById("custom-command") as HTMLInputElement;
   customCommandGroup = document.getElementById("custom-command-group")!;
   workingDirInput = document.getElementById("working-dir") as HTMLInputElement;
+  envVarsInput = document.getElementById("env-vars") as HTMLTextAreaElement;
   sessionSearchInput = document.getElementById("session-search") as HTMLInputElement;
   sortSelect = document.getElementById("sort-select") as HTMLSelectElement;
   sidebarEl = document.getElementById("sidebar")!;
@@ -1447,6 +1478,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           claudeSessionId,
           hasBeenStarted: false,
           sortOrder: newSessionData.sort_order || minSortOrder - 1,
+          envVars: newSessionData.env_vars || undefined,
         };
         sessions.set(session.id, session);
       }
@@ -1913,6 +1945,7 @@ async function loadSavedSessions() {
         hasBeenStarted: !!data.claude_session_id,
         sortOrder: data.sort_order,
         folderId: data.folder_id || undefined,
+        envVars: data.env_vars || undefined,
       };
       sessions.set(session.id, session);
     }
@@ -1950,6 +1983,7 @@ async function saveSessionToDb(session: Session) {
       claude_session_id: session.claudeSessionId || null,
       sort_order: session.sortOrder,
       folder_id: session.folderId || null,
+      env_vars: session.envVars || null,
     };
     await invoke("save_session", { session: data });
   } catch (err) {
@@ -2137,6 +2171,7 @@ function showEditSessionModal(sessionId: string) {
   agentTypeSelect.value = session.agentType;
   workingDirInput.value = session.workingDir;
   customCommandInput.value = session.agentType === "custom" ? session.command : "";
+  envVarsInput.value = envVarsToText(session.envVars);
   customCommandGroup.style.display = session.agentType === "custom" ? "block" : "none";
 
   // Update modal title and button for editing
@@ -2156,6 +2191,7 @@ function showNewSessionModal(agentType: Session["agentType"] = "claude", options
   agentTypeSelect.value = agentType;
   customCommandInput.value = "";
   workingDirInput.value = options?.workingDir || DEFAULT_WORKING_DIR;
+  envVarsInput.value = "";
   customCommandGroup.style.display = agentType === "custom" ? "block" : "none";
 
   // Update modal title and button for new
@@ -2200,6 +2236,7 @@ async function saveSessionFromModal() {
       session.agentType = agentType;
       session.command = command;
       session.workingDir = workingDirInput.value.trim() || DEFAULT_WORKING_DIR;
+      session.envVars = envVarsToJson(envVarsInput.value);
 
       // If changing to/from Claude, handle claudeSessionId
       if (agentType === "claude" && !session.claudeSessionId) {
@@ -2235,6 +2272,7 @@ async function saveSessionFromModal() {
       claudeSessionId,
       hasBeenStarted: false,
       sortOrder: minSortOrder - 1,
+      envVars: envVarsToJson(envVarsInput.value),
     };
 
     sessions.set(session.id, session);
@@ -2763,6 +2801,7 @@ async function startSessionProcess(session: Session) {
       rows: ptyDims.rows,
       claudeSessionId: session.claudeSessionId || null,
       resumeSession: shouldResume,
+      envVars: session.envVars || null,
     });
     session.isRunning = true;
     updateStartBanner();
@@ -2828,6 +2867,7 @@ async function startJsonProcess(session: Session) {
       workingDir: session.workingDir || null,
       claudeSessionId: session.claudeSessionId || null,
       resumeSession: shouldResume,
+      envVars: session.envVars || null,
     });
     // Note: isRunning will be set by the json-process-started event
   } catch (err) {
@@ -6266,6 +6306,7 @@ async function showSettingsModal(): Promise<void> {
   settingsActiveSessionsGroupCheckbox.checked = appSettings.show_active_sessions_group ?? true;
   settingsRendererSelect.value = appSettings.renderer || "webgl";
   settingsRemotePinInput.value = appSettings.remote_pin || "";
+  (document.getElementById("settings-claude-config-dir") as HTMLInputElement).value = appSettings.claude_config_dir || "";
 
   // Show app version
   try {
@@ -6354,6 +6395,7 @@ async function saveSettings(): Promise<void> {
     renderer: settingsRendererSelect.value as "webgl" | "dom",
     remote_pin: settingsRemotePinInput.value || null,
     show_active_sessions_group: settingsActiveSessionsGroupCheckbox.checked,
+    claude_config_dir: (document.getElementById("settings-claude-config-dir") as HTMLInputElement).value || null,
   };
 
   try {
@@ -6714,6 +6756,7 @@ async function resumeClaudeSession(claudeSessionId: string, project: string): Pr
     claude_session_id: newSession.claudeSessionId || null,
     sort_order: newSession.sortOrder,
     folder_id: newSession.folderId || null,
+    env_vars: newSession.envVars || null,
   };
   await invoke("save_session", { session: data });
 

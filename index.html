@@ -129,6 +129,10 @@
           <label for="working-dir">Working Directory</label>
           <input type="text" id="working-dir" placeholder="~ (home directory)" />
         </div>
+        <div class="form-group" id="env-vars-group">
+          <label for="env-vars">Environment Variables <span class="label-hint">(one per line: KEY=value)</span></label>
+          <textarea id="env-vars" placeholder="CLAUDE_CONFIG_DIR=~/.claude-work" rows="2"></textarea>
+        </div>
         <div class="modal-actions">
           <button class="cancel-btn" id="modal-cancel">Cancel</button>
           <button class="create-btn" id="modal-create">Create</button>
@@ -206,6 +210,11 @@
               <option value="claude-haiku-4-5-20251001">Haiku</option>
             </select>
             <p class="form-hint">Override the default model for new Claude sessions. Use "CLI Default" to respect the CLI's configured model.</p>
+          </div>
+          <div class="form-group">
+            <label for="settings-claude-config-dir">Claude Config Directory</label>
+            <input type="text" id="settings-claude-config-dir" placeholder="~/.claude (default)" />
+            <p class="form-hint">Set CLAUDE_CONFIG_DIR for all sessions. Use a separate directory (e.g. ~/.claude-work) to use a different Claude account.</p>
           </div>
         </div>
 

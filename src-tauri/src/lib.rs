@@ -437,6 +437,8 @@ struct AppSettings {
     show_active_sessions_group: bool,
     #[serde(default)]
     default_model: Option<String>,
+    #[serde(default)]
+    claude_config_dir: Option<String>,
 }
 
 fn default_renderer() -> String {
@@ -463,6 +465,7 @@ impl Default for AppSettings {
             remote_pin: None,
             show_active_sessions_group: true,
             default_model: None,
+            claude_config_dir: None,
         }
     }
 }
@@ -479,6 +482,8 @@ struct SessionData {
     sort_order: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     folder_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    env_vars: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -649,6 +654,9 @@ fn run_db_migrations() {
 
     // Migration: Add folder_id column for folder/group support
     let _ = conn.execute("ALTER TABLE sessions ADD COLUMN folder_id TEXT", []);
+
+    // Migration: Add env_vars column for per-session environment variables (JSON string)
+    let _ = conn.execute("ALTER TABLE sessions ADD COLUMN env_vars TEXT", []);
 
     // Create folders table for session organization
     conn.execute(
@@ -833,7 +841,7 @@ fn is_valid_token(token: &str) -> bool {
 fn load_sessions() -> Result<Vec<SessionData>, String> {
     let conn = DB_CONNECTION.lock();
     let mut stmt = conn
-        .prepare("SELECT id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order, folder_id FROM sessions ORDER BY sort_order ASC, created_at DESC")
+        .prepare("SELECT id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order, folder_id, env_vars FROM sessions ORDER BY sort_order ASC, created_at DESC")
         .map_err(|e| e.to_string())?;
 
     let sessions = stmt
@@ -848,6 +856,7 @@ fn load_sessions() -> Result<Vec<SessionData>, String> {
                 claude_session_id: row.get(6)?,
                 sort_order: row.get(7)?,
                 folder_id: row.get(8)?,
+                env_vars: row.get(9)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -871,8 +880,8 @@ fn save_session(session: SessionData) -> Result<(), String> {
         ).unwrap_or(0) == 0;
 
         conn.execute(
-            "INSERT OR REPLACE INTO sessions (id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order, folder_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT OR REPLACE INTO sessions (id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order, folder_id, env_vars)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 session.id,
                 session.name,
@@ -883,6 +892,7 @@ fn save_session(session: SessionData) -> Result<(), String> {
                 session.claude_session_id,
                 session.sort_order,
                 session.folder_id,
+                session.env_vars,
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -1416,6 +1426,7 @@ fn spawn_pty(
     rows: u16,
     claude_session_id: Option<String>,
     resume_session: Option<bool>,
+    env_vars: Option<String>,
 ) -> Result<(), String> {
     let pty_system = native_pty_system();
 
@@ -1498,6 +1509,26 @@ fn spawn_pty(
     cmd.env("HOME", &home_dir);
     cmd.env("PATH", &enhanced_path);
     cmd.env("SHELL", &user_shell);
+
+    // Apply global CLAUDE_CONFIG_DIR from app settings (if not overridden per-session)
+    let custom_envs: std::collections::HashMap<String, String> = env_vars
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    if !custom_envs.contains_key("CLAUDE_CONFIG_DIR") {
+        if let Some(ref config_dir) = load_app_settings().unwrap_or_default().claude_config_dir {
+            if !config_dir.is_empty() {
+                let expanded = shellexpand::tilde(config_dir).to_string();
+                cmd.env("CLAUDE_CONFIG_DIR", &expanded);
+            }
+        }
+    }
+
+    // Apply custom environment variables (per-session, can override global)
+    for (key, value) in &custom_envs {
+        let expanded = shellexpand::tilde(&value).to_string();
+        cmd.env(key, &expanded);
+    }
 
     // Set working directory
     if let Some(ref dir) = work_dir {
@@ -1690,6 +1721,7 @@ fn spawn_json_process(
     working_dir: Option<String>,
     claude_session_id: Option<String>,
     resume_session: Option<bool>,
+    env_vars: Option<String>,
 ) -> Result<(), String> {
     use std::process::Stdio;
     use std::sync::mpsc;
@@ -1740,13 +1772,36 @@ fn spawn_json_process(
             // -l sources ~/.zprofile (login files)
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
 
-            let mut child = match Command::new(&shell)
-                .args(&["-i", "-l", "-c", &cmd_str])
+            // Parse custom environment variables (JSON string of key-value pairs)
+            let custom_envs: std::collections::HashMap<String, String> = env_vars
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+
+            let mut cmd = Command::new(&shell);
+            cmd.args(&["-i", "-l", "-c", &cmd_str])
                 .current_dir(&work_dir)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
+                .stderr(Stdio::piped());
+
+            // Apply global CLAUDE_CONFIG_DIR from app settings (if not overridden per-session)
+            if !custom_envs.contains_key("CLAUDE_CONFIG_DIR") {
+                if let Some(ref config_dir) = load_app_settings().unwrap_or_default().claude_config_dir {
+                    if !config_dir.is_empty() {
+                        let expanded = shellexpand::tilde(config_dir).to_string();
+                        cmd.env("CLAUDE_CONFIG_DIR", &expanded);
+                    }
+                }
+            }
+
+            // Apply custom environment variables (per-session, can override global)
+            for (key, value) in &custom_envs {
+                let expanded = shellexpand::tilde(&value).to_string();
+                cmd.env(key, &expanded);
+            }
+
+            let mut child = match cmd.spawn()
             {
                 Ok(c) => c,
                 Err(e) => {
@@ -2886,6 +2941,9 @@ async fn api_create_session(
     let agent_type = body.get("agent_type").and_then(|v| v.as_str()).unwrap_or("claude");
     let custom_command = body.get("custom_command").and_then(|v| v.as_str()).map(|s| s.to_string());
     let working_dir = body.get("working_dir").and_then(|v| v.as_str()).unwrap_or("~/dev/pplsi");
+    let env_vars = body.get("env_vars").and_then(|v| {
+        if v.is_object() { Some(v.to_string()) } else { v.as_str().map(|s| s.to_string()) }
+    });
 
     // Generate session ID
     let session_id = generate_token();
@@ -2936,6 +2994,7 @@ async fn api_create_session(
         claude_session_id,
         sort_order: min_sort_order - 1,
         folder_id,
+        env_vars,
     };
 
     // Save to database
@@ -3047,6 +3106,7 @@ async fn api_start_session(
             Some(session.working_dir),
             session.claude_session_id,
             Some(should_resume),
+            session.env_vars.clone(),
         ) {
             Ok(()) => {
                 let _ = app.emit("remote-session-started", session.id.clone());
@@ -3066,6 +3126,7 @@ async fn api_start_session(
             30,   // default rows
             session.claude_session_id,
             Some(should_resume),
+            session.env_vars,
         ) {
             Ok(()) => {
                 // Notify desktop app that session was started remotely
