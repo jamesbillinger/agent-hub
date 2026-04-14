@@ -4213,7 +4213,7 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
         const settingsDefault = appSettings.default_model ? `Settings default: \`${appSettings.default_model}\`` : "No settings default (using CLI config)";
         addChatMessage(sessionId, {
           type: "system",
-          result: `**Current model:** ${currentModel}\n${settingsDefault}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`opus\`, \`sonnet\`, \`haiku\`, \`default\`\n**Full IDs:** \`claude-opus-4-6\`, \`claude-sonnet-4-6\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
+          result: `**Current model:** ${currentModel}\n${settingsDefault}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`opus\` (1M), \`opus-200k\`, \`sonnet\`, \`haiku\`, \`default\`\n**Full IDs:** \`claude-opus-4-6[1m]\`, \`claude-opus-4-6\`, \`claude-sonnet-4-6\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
         });
         return true;
       }
@@ -4243,7 +4243,9 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
 
       // Map shorthand names to model IDs
       const MODEL_ALIASES: Record<string, string> = {
-        opus: "claude-opus-4-6",
+        opus: "claude-opus-4-6[1m]",
+        "opus-1m": "claude-opus-4-6[1m]",
+        "opus-200k": "claude-opus-4-6",
         sonnet: "claude-sonnet-4-6",
         haiku: "claude-haiku-4-5-20251001",
       };
