@@ -627,7 +627,7 @@ const errorDetectionBuffer: Map<string, string> = new Map();
  */
 function detectClaudeSessionError(sessionId: string, data: string): void {
   const session = sessions.get(sessionId);
-  if (!session || session.agentType !== "claude") return;
+  if (!session || (session.agentType !== "claude" && session.agentType !== "claude-json")) return;
 
   // Accumulate output for error detection (keep last 500 chars)
   const currentBuffer = errorDetectionBuffer.get(sessionId) || "";
@@ -638,11 +638,19 @@ function detectClaudeSessionError(sessionId: string, data: string): void {
   if (!sessionErrorsDetected.has(sessionId)) {
     if (newBuffer.includes("No conversation found with session ID:")) {
       sessionErrorsDetected.add(sessionId);
-      session.terminal?.write("\r\n\x1b[33m[Session not found - starting fresh...]\x1b[0m\r\n");
+      if (session.agentType === "claude") {
+        session.terminal?.write("\r\n\x1b[33m[Session not found - starting fresh...]\x1b[0m\r\n");
+      } else {
+        addChatMessage(sessionId, { type: "system", result: "Session not found in current config — starting fresh..." });
+      }
       autoRecoverClaudeSession(sessionId);
     } else if (newBuffer.includes("Not logged in")) {
       sessionErrorsDetected.add(sessionId);
-      session.terminal?.write("\r\n\x1b[33m[Auth error with current config - starting fresh...]\x1b[0m\r\n");
+      if (session.agentType === "claude") {
+        session.terminal?.write("\r\n\x1b[33m[Auth error with current config - starting fresh...]\x1b[0m\r\n");
+      } else {
+        addChatMessage(sessionId, { type: "system", result: "Auth error with current config — starting fresh..." });
+      }
       autoRecoverClaudeSession(sessionId);
     }
   }
@@ -653,7 +661,7 @@ function detectClaudeSessionError(sessionId: string, data: string): void {
  */
 async function autoRecoverClaudeSession(sessionId: string): Promise<void> {
   const session = sessions.get(sessionId);
-  if (!session || session.agentType !== "claude") return;
+  if (!session || (session.agentType !== "claude" && session.agentType !== "claude-json")) return;
 
   // Generate new Claude session ID
   session.claudeSessionId = crypto.randomUUID();
@@ -666,11 +674,25 @@ async function autoRecoverClaudeSession(sessionId: string): Promise<void> {
   // Save to database
   await saveSessionToDb(session);
 
+  // Kill the process if still running (for JSON sessions, stderr error may arrive before exit)
+  if (session.isRunning) {
+    try {
+      if (session.agentType === "claude-json") {
+        await invoke("kill_json_process", { sessionId });
+      } else {
+        await invoke("kill_pty", { sessionId });
+      }
+    } catch {
+      // May already be dead
+    }
+  }
+
   // Wait a moment for the failed process to exit, then restart
   setTimeout(async () => {
-    // Only restart if the session is no longer running (process exited)
     if (!session.isRunning) {
-      session.terminal?.write("\x1b[32m[Restarting with new session...]\x1b[0m\r\n\r\n");
+      if (session.agentType === "claude") {
+        session.terminal?.write("\x1b[32m[Restarting with new session...]\x1b[0m\r\n\r\n");
+      }
       await startSessionProcess(session);
     }
   }, 500);
@@ -1315,6 +1337,9 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   await listen<{ session_id: string; data: string }>("json-process-output", (event) => {
     const { session_id, data } = event.payload;
+
+    // Detect Claude session errors (auth failures, session not found) in raw output
+    detectClaudeSessionError(session_id, data);
 
     // Add to buffer
     if (!outputBuffer.has(session_id)) {
@@ -6447,6 +6472,7 @@ async function populateWebInterfaceUrl(): Promise<void> {
 }
 
 async function saveSettings(): Promise<void> {
+  const oldConfigDir = appSettings.claude_config_dir || null;
   appSettings = {
     font_size: parseInt(settingsFontSizeInput.value) || 13,
     font_family: settingsFontFamilySelect.value,
@@ -6474,6 +6500,20 @@ async function saveSettings(): Promise<void> {
   await applyTheme();
 
   hideSettingsModal();
+
+  // If CLAUDE_CONFIG_DIR changed, invalidate all existing Claude session IDs
+  // so they won't try to resume with stale references from the old config dir
+  const newConfigDir = appSettings.claude_config_dir || null;
+  if (oldConfigDir !== newConfigDir) {
+    console.log(`CLAUDE_CONFIG_DIR changed from "${oldConfigDir}" to "${newConfigDir}" — invalidating session IDs`);
+    for (const [, session] of sessions) {
+      if ((session.agentType === "claude" || session.agentType === "claude-json") && session.claudeSessionId) {
+        session.claudeSessionId = undefined;
+        session.hasBeenStarted = false;
+        saveSessionToDb(session);
+      }
+    }
+  }
 
   // Re-render session list to show/hide active sessions group
   renderSessionListImmediate();
