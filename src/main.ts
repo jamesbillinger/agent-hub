@@ -2315,10 +2315,11 @@ async function saveSessionFromModal() {
       session.envVars = envVarsToJson(envVarsInput.value);
 
       // If changing to/from Claude, handle claudeSessionId
-      if (agentType === "claude" && !session.claudeSessionId) {
+      const isClaudeType = agentType === "claude" || agentType === "claude-json";
+      if (isClaudeType && !session.claudeSessionId) {
         session.claudeSessionId = crypto.randomUUID();
         session.hasBeenStarted = false;
-      } else if (agentType !== "claude") {
+      } else if (!isClaudeType) {
         session.claudeSessionId = undefined;
       }
 
@@ -2335,7 +2336,7 @@ async function saveSessionFromModal() {
     const minSortOrder = Math.min(0, ...Array.from(sessions.values()).map(s => s.sortOrder));
 
     // Generate a Claude session ID for Claude sessions
-    const claudeSessionId = agentType === "claude" ? crypto.randomUUID() : undefined;
+    const claudeSessionId = (agentType === "claude" || agentType === "claude-json") ? crypto.randomUUID() : undefined;
 
     const session: Session = {
       id: crypto.randomUUID(),
