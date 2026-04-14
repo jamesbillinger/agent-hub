@@ -634,15 +634,17 @@ function detectClaudeSessionError(sessionId: string, data: string): void {
   const newBuffer = (currentBuffer + data).slice(-500);
   errorDetectionBuffer.set(sessionId, newBuffer);
 
-  // Check for the specific error message
-  if (newBuffer.includes("No conversation found with session ID:") && !sessionErrorsDetected.has(sessionId)) {
-    sessionErrorsDetected.add(sessionId);
-
-    // Show brief message and auto-recover
-    session.terminal?.write("\r\n\x1b[33m[Session not found - starting fresh...]\x1b[0m\r\n");
-
-    // Auto-recover: reset session ID and restart
-    autoRecoverClaudeSession(sessionId);
+  // Check for session-not-found or auth errors that indicate resume failure
+  if (!sessionErrorsDetected.has(sessionId)) {
+    if (newBuffer.includes("No conversation found with session ID:")) {
+      sessionErrorsDetected.add(sessionId);
+      session.terminal?.write("\r\n\x1b[33m[Session not found - starting fresh...]\x1b[0m\r\n");
+      autoRecoverClaudeSession(sessionId);
+    } else if (newBuffer.includes("Not logged in")) {
+      sessionErrorsDetected.add(sessionId);
+      session.terminal?.write("\r\n\x1b[33m[Auth error with current config - starting fresh...]\x1b[0m\r\n");
+      autoRecoverClaudeSession(sessionId);
+    }
   }
 }
 
@@ -1327,7 +1329,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   });
 
-  await listen<{ session_id: string }>("json-process-started", (event) => {
+  await listen<{ session_id: string }>("json-process-started", async (event) => {
     const session = sessions.get(event.payload.session_id);
     if (session) {
       session.isRunning = true;
@@ -1339,6 +1341,23 @@ document.addEventListener("DOMContentLoaded", async () => {
       }
       renderSessionList();
       updateStartBanner();
+
+      // Re-send pending message from a failed resume retry
+      const pendingMsg = pendingRetryMessages.get(event.payload.session_id);
+      if (pendingMsg && chatSession) {
+        pendingRetryMessages.delete(event.payload.session_id);
+        chatSession.statusEl.textContent = "Thinking...";
+        chatSession.statusEl.className = "chat-status";
+        const jsonMessage = JSON.stringify({
+          type: "user",
+          message: { role: "user", content: pendingMsg }
+        }) + "\n";
+        try {
+          await invoke("write_to_process", { sessionId: event.payload.session_id, data: jsonMessage });
+        } catch (err) {
+          console.error("Failed to re-send message after retry:", err);
+        }
+      }
     }
   });
 
@@ -1347,13 +1366,24 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (session) {
       session.isRunning = false;
 
-      // If we tried to resume and it failed quickly (non-zero exit, no messages received),
+      // If we tried to resume and it failed before Claude even started (no init message),
       // retry without --resume (session may not exist in this CLAUDE_CONFIG_DIR)
       if (resumeAttemptedSessions.has(event.payload.session_id) && event.payload.exit_code !== 0) {
         resumeAttemptedSessions.delete(event.payload.session_id);
-        const chatSession = chatSessions.get(event.payload.session_id);
-        if (chatSession && chatSession.messages.length <= 1) {
-          console.log(`Resume failed for ${session.name}, retrying as fresh session`);
+        const receivedInit = sessionReceivedInit.has(event.payload.session_id);
+        sessionReceivedInit.delete(event.payload.session_id);
+        if (!receivedInit) {
+          console.log(`Resume failed for ${session.name} (no init received), retrying as fresh session`);
+          // Find the last user message to re-send after retry
+          const chatSession = chatSessions.get(event.payload.session_id);
+          if (chatSession) {
+            for (let i = chatSession.messages.length - 1; i >= 0; i--) {
+              if (chatSession.messages[i].type === "user" && chatSession.messages[i].result) {
+                pendingRetryMessages.set(event.payload.session_id, chatSession.messages[i].result!);
+                break;
+              }
+            }
+          }
           // Clear the claudeSessionId so it starts fresh
           session.claudeSessionId = undefined;
           session.hasBeenStarted = false;
@@ -1365,6 +1395,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         }
       }
       resumeAttemptedSessions.delete(event.payload.session_id);
+      sessionReceivedInit.delete(event.payload.session_id);
 
       const chatSession = chatSessions.get(event.payload.session_id);
       if (chatSession) {
@@ -2838,6 +2869,11 @@ async function startSessionProcess(session: Session) {
 const startingJsonSessions = new Set<string>();
 // Track sessions that attempted --resume, so we can retry without it on failure
 const resumeAttemptedSessions = new Set<string>();
+// Track sessions that received an init message from Claude during current run
+// (if Claude never sent init, the process failed before actually starting)
+const sessionReceivedInit = new Set<string>();
+// Track pending user messages that need to be re-sent after a retry
+const pendingRetryMessages = new Map<string, string>();
 
 async function startJsonProcess(session: Session) {
   if (session.isRunning) return;
@@ -5169,6 +5205,8 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
 
   // For init messages, only save the first one - ignore subsequent ones
   if (message.type === "system" && message.subtype === "init") {
+    // Mark that Claude actually started (sent an init message) for this session
+    sessionReceivedInit.add(sessionId);
     const hasInit = chatSession.messages.some(
       m => m.type === "system" && m.subtype === "init"
     );
