@@ -1410,9 +1410,8 @@ document.addEventListener("DOMContentLoaded", async () => {
               }
             }
           }
-          // Clear the claudeSessionId so it starts fresh
+          // Clear the claudeSessionId so it starts fresh (but keep hasBeenStarted for history)
           session.claudeSessionId = undefined;
-          session.hasBeenStarted = false;
           await saveSessionToDb(session);
           // Retry
           startingJsonSessions.delete(event.payload.session_id);
@@ -6506,15 +6505,22 @@ async function saveSettings(): Promise<void> {
 
   hideSettingsModal();
 
-  // If CLAUDE_CONFIG_DIR changed, invalidate all existing Claude session IDs
-  // so they won't try to resume with stale references from the old config dir
+  // If CLAUDE_CONFIG_DIR changed, clear Claude session IDs on non-running sessions
+  // so they won't try to resume with stale references from the old config dir.
+  // Keep hasBeenStarted intact so chat history (local buffer) is still displayed.
+  // The auto-retry logic handles resume failures gracefully if a session is started.
   const newConfigDir = appSettings.claude_config_dir || null;
   if (oldConfigDir !== newConfigDir) {
-    console.log(`CLAUDE_CONFIG_DIR changed from "${oldConfigDir}" to "${newConfigDir}" — invalidating session IDs`);
-    for (const [, session] of sessions) {
-      if ((session.agentType === "claude" || session.agentType === "claude-json") && session.claudeSessionId) {
+    console.log(`CLAUDE_CONFIG_DIR changed from "${oldConfigDir}" to "${newConfigDir}" — clearing session IDs on inactive sessions`);
+    for (const [sessionId, session] of sessions) {
+      if ((session.agentType === "claude" || session.agentType === "claude-json") && session.claudeSessionId && !session.isRunning) {
+        // Save any in-memory chat messages to buffer before clearing session ID
+        const chatSession = chatSessions.get(sessionId);
+        if (chatSession && chatSession.messages.length > 0) {
+          saveChatMessagesImmediate(sessionId);
+        }
         session.claudeSessionId = undefined;
-        session.hasBeenStarted = false;
+        // Don't reset hasBeenStarted — preserve chat history display
         saveSessionToDb(session);
       }
     }
