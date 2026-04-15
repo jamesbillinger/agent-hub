@@ -1525,9 +1525,15 @@ fn spawn_pty(
     }
 
     // Apply custom environment variables (per-session, can override global)
+    // A value of "default" means "don't set this env var" (use the tool's built-in default)
     for (key, value) in &custom_envs {
-        let expanded = shellexpand::tilde(&value).to_string();
-        cmd.env(key, &expanded);
+        if value.eq_ignore_ascii_case("default") || value == "~" {
+            // Remove the env var entirely (undo any global setting above)
+            cmd.env_remove(key);
+        } else {
+            let expanded = shellexpand::tilde(&value).to_string();
+            cmd.env(key, &expanded);
+        }
     }
 
     // Set working directory
@@ -1796,9 +1802,14 @@ fn spawn_json_process(
             }
 
             // Apply custom environment variables (per-session, can override global)
+            // A value of "default" means "don't set this env var" (use the tool's built-in default)
             for (key, value) in &custom_envs {
-                let expanded = shellexpand::tilde(&value).to_string();
-                cmd.env(key, &expanded);
+                if value.eq_ignore_ascii_case("default") || value == "~" {
+                    cmd.env_remove(key);
+                } else {
+                    let expanded = shellexpand::tilde(&value).to_string();
+                    cmd.env(key, &expanded);
+                }
             }
 
             let mut child = match cmd.spawn()
