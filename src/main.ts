@@ -435,7 +435,8 @@ function applyDefaultModel(command: string): string {
   if (!appSettings.default_model) return command;
   // Only apply to claude commands, and only if no --model flag already present
   if (!command.includes("claude ") || command.includes("--model ")) return command;
-  return command.replace("claude ", `claude --model ${appSettings.default_model} `);
+  // Quote the model ID to prevent shell glob interpretation (e.g. [1m] suffix)
+  return command.replace("claude ", `claude --model '${appSettings.default_model}' `);
 }
 
 // Default working directory
@@ -4186,7 +4187,7 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
       return true;
 
     case "status":
-      const currentModelMatch = session.command.match(/--model\s+(\S+)/);
+      const currentModelMatch = session.command.match(/--model\s+'([^']*)'/) || session.command.match(/--model\s+(\S+)/);
       const statusInfo = [
         `**Session:** ${session.name}`,
         `**Agent:** ${session.agentType}`,
@@ -4210,7 +4211,7 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
 
       if (!args) {
         // Show current model and usage
-        const currentModel = session.command.match(/--model\s+(\S+)/)?.[1] || "default (from CLI config)";
+        const currentModel = session.command.match(/--model\s+'([^']*)'/)?.[1] || session.command.match(/--model\s+(\S+)/)?.[1] || "default (from CLI config)";
         const settingsDefault = appSettings.default_model ? `Settings default: \`${appSettings.default_model}\`` : "No settings default (using CLI config)";
         addChatMessage(sessionId, {
           type: "system",
@@ -4222,7 +4223,7 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
       // Handle "default" to strip --model flag entirely
       const argLower = args.toLowerCase();
       if (argLower === "default" || argLower === "reset") {
-        session.command = session.command.replace(/\s*--model\s+\S+/, "");
+        session.command = session.command.replace(/\s*--model\s+'[^']*'/, "").replace(/\s*--model\s+\S+/, "");
 
         // Kill, save, restart
         if (session.isRunning) {
@@ -4253,8 +4254,9 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
       const modelId = MODEL_ALIASES[argLower] || args;
 
       // Update the command: remove existing --model flag if present, add new one
-      let newCommand = session.command.replace(/\s*--model\s+\S+/, "");
-      newCommand = newCommand.replace("claude ", `claude --model ${modelId} `);
+      // Match both quoted and unquoted model values
+      let newCommand = session.command.replace(/\s*--model\s+'[^']*'/, "").replace(/\s*--model\s+\S+/, "");
+      newCommand = newCommand.replace("claude ", `claude --model '${modelId}' `);
 
       session.command = newCommand;
 
