@@ -2308,6 +2308,7 @@ async function saveSessionFromModal() {
     const session = sessions.get(editingSessionId);
     if (session) {
       const oldAgentType = session.agentType;
+      const oldEnvVars = session.envVars;
       session.name = name;
       session.agentType = agentType;
       session.command = command;
@@ -2330,6 +2331,22 @@ async function saveSessionFromModal() {
 
       await saveSessionToDb(session);
       renderSessionList();
+
+      // If env vars changed on a running session, restart the process
+      // so it picks up the new environment
+      if (session.isRunning && oldEnvVars !== session.envVars) {
+        console.log(`Env vars changed on running session "${session.name}" — restarting process`);
+        if (isJsonAgent(session.agentType)) {
+          await invoke("kill_json_process", { sessionId: session.id });
+          // Small delay to let the process exit cleanly
+          await new Promise(r => setTimeout(r, 500));
+          await startJsonProcess(session);
+        } else if (session.terminal) {
+          await invoke("kill_pty", { sessionId: session.id });
+          await new Promise(r => setTimeout(r, 500));
+          await startSessionProcess(session);
+        }
+      }
     }
   } else {
     // Creating new session
