@@ -43,6 +43,9 @@ use tower_http::services::ServeDir;
 #[cfg(not(target_os = "ios"))]
 mod mcp;
 
+// Full-content search index (wraps Claude's on-disk JSONL files).
+mod search;
+
 // Flag to track if MCP mode is enabled
 #[cfg(not(target_os = "ios"))]
 static MCP_MODE: Lazy<std::sync::atomic::AtomicBool> =
@@ -370,6 +373,23 @@ fn save_session_messages_to_db(session_id: &str) {
 
     let buffer_content = serde_json::to_string(&messages).unwrap_or_default();
     let _ = save_terminal_buffer_to_db(session_id, &buffer_content);
+
+    // End-of-turn: re-scan this session's JSONL file(s) and ingest any new
+    // bytes into the search index. Idempotent (resumes from last_offset).
+    // The JSONL is the canonical source — has user messages, real timestamps,
+    // attachments, parentUuid chains. Stream-json on stdout is missing all of
+    // those, which is why we don't tap it directly.
+    search::ingest_session_files(session_id);
+
+    // The CLI sometimes finishes flushing the final assistant line *after*
+    // emitting the result message that brought us here, so the immediate
+    // scan above can miss it. A brief delayed retry catches that case.
+    // ingest_session_files is cheap when nothing has changed.
+    let sid = session_id.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        search::ingest_session_files(&sid);
+    });
 }
 
 /// Get session history for mobile clients (returns JSON messages parsed from buffer)
@@ -706,6 +726,10 @@ fn run_db_migrations() {
         )",
         [],
     ).expect("Failed to create recently_closed table");
+
+    // Search: schema-versioned migrations for message_index + session_files +
+    // FTS. Drops/recreates if SCHEMA_VERSION has changed.
+    search::run_search_migrations(&conn);
 }
 
 // Load paired devices from database into memory
@@ -927,6 +951,7 @@ fn update_session_orders(session_orders: Vec<(String, i32)>) -> Result<(), Strin
 fn delete_session(session_id: String) -> Result<(), String> {
     {
         let conn = DB_CONNECTION.lock();
+        search::delete_search_data_for_session(&conn, &session_id);
         conn.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
             .map_err(|e| e.to_string())?;
     }
@@ -935,6 +960,41 @@ fn delete_session(session_id: String) -> Result<(), String> {
     broadcast_session_deleted(&session_id);
 
     Ok(())
+}
+
+// --- Search commands ---
+
+#[tauri::command]
+fn rebuild_search_index() -> Result<search::BackfillStats, String> {
+    Ok(search::rebuild_index())
+}
+
+#[tauri::command]
+fn get_search_index_stats() -> Result<search::SearchStats, String> {
+    Ok(search::get_stats())
+}
+
+#[tauri::command]
+fn search_messages(
+    query: String,
+    session_id: Option<String>,
+    role: Option<String>,
+    from_ts: Option<i64>,
+    to_ts: Option<i64>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Vec<search::SearchHit>, String> {
+    search::search_messages(
+        &query,
+        search::SearchFilters {
+            session_id,
+            role,
+            from_ts,
+            to_ts,
+            limit,
+            offset,
+        },
+    )
 }
 
 // --- Folder commands ---
@@ -4174,6 +4234,15 @@ fn setup_app(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         cleanup_orphaned_processes();
     });
 
+    // Search index: one-time backfill of ~/.claude/projects/**/*.jsonl on
+    // first install, then a cheap incremental rescan every startup to catch
+    // up files modified while the app was closed (e.g. claude CLI run
+    // directly between sessions, or app crashed mid-turn).
+    std::thread::spawn(|| {
+        search::backfill_if_needed();
+        search::incremental_rescan();
+    });
+
     // Start MCP server if --mcp flag was passed
     if MCP_MODE.load(std::sync::atomic::Ordering::Relaxed) {
         let app_handle = app.handle().clone();
@@ -4266,7 +4335,10 @@ pub fn run() {
             delete_folder,
             update_folder_orders,
             update_session_folder,
-            toggle_folder_collapsed
+            toggle_folder_collapsed,
+            rebuild_search_index,
+            get_search_index_stats,
+            search_messages
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -4333,7 +4405,10 @@ pub fn run() {
             delete_folder,
             update_folder_orders,
             update_session_folder,
-            toggle_folder_collapsed
+            toggle_folder_collapsed,
+            rebuild_search_index,
+            get_search_index_stats,
+            search_messages
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
