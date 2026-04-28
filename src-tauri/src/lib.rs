@@ -576,6 +576,12 @@ struct ClaudeJsonMessage {
     subtype: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<String>,
+    // JSONL line uuid — preserved on round-trip so the frontend can
+    // attach it as data-uuid and scroll-to-message from a search hit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "parentUuid")]
+    parent_uuid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<ClaudeMessageInner>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1330,8 +1336,12 @@ fn load_claude_session_history(session_id: String, project: String) -> Result<Ve
     let home = dirs::home_dir().ok_or_else(|| "Could not find home directory".to_string())?;
     let claude_projects = home.join(".claude").join("projects");
 
+    // Expand tilde so sessions stored with `~/...` match the path the CLI
+    // wrote (which uses the absolute path).
+    let expanded = shellexpand::tilde(&project).to_string();
+
     // Build project folder name the same way Claude does
-    let project_folder_name = project
+    let project_folder_name = expanded
         .replace('/', "-")
         .trim_start_matches('-')
         .to_string();

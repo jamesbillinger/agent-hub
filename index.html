@@ -64,7 +64,7 @@
           </div>
         </div>
         <div id="sidebar-controls">
-          <input type="text" id="session-search" placeholder="Search sessions..." />
+          <input type="text" id="session-search" placeholder="Search sessions and content..." />
           <div id="sort-controls">
             <select id="sort-select">
               <option value="custom">Custom Order</option>
@@ -76,6 +76,13 @@
         </div>
         <div id="active-sessions"></div>
         <div id="session-list"></div>
+        <div id="content-matches" class="content-matches" hidden>
+          <div class="content-matches-header">
+            <span class="content-matches-label">Content matches</span>
+            <span class="content-matches-count"></span>
+          </div>
+          <div class="content-matches-list"></div>
+        </div>
       </div>
 
       <!-- Sidebar Resize Handle -->

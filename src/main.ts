@@ -226,6 +226,9 @@ interface ClaudeJsonMessage {
   type: "system" | "user" | "assistant" | "result";
   subtype?: "init" | "success" | "error" | "resumed" | "stopped" | "status" | "compact_boundary";
   session_id?: string;
+  // JSONL line uuid (present when messages come from on-disk history;
+  // may be absent on fresh stream-json envelopes from the CLI).
+  uuid?: string;
   message?: {
     id: string;
     type: string;
@@ -905,6 +908,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   sessionSearchInput.addEventListener("input", () => {
     searchQuery = sessionSearchInput.value.toLowerCase();
     renderSessionList();
+    scheduleContentSearch(sessionSearchInput.value);
   });
 
   sortSelect.addEventListener("change", () => {
@@ -3242,6 +3246,172 @@ function getFilteredAndSortedSessions(): Session[] {
   return sortedSessions;
 }
 
+// ----------------------------------------------------------------------
+//  Content search (FTS hits across all sessions, rendered under the
+//  session list). The fast title filter remains in renderSessionList.
+// ----------------------------------------------------------------------
+
+interface SearchHit {
+  message_id: number;
+  session_id: string;
+  session_name: string | null;
+  claude_session_id: string;
+  uuid: string;
+  file_path: string;
+  file_offset: number;
+  role: string;
+  ts: number;
+  snippet: string;
+  rank: number;
+}
+
+let contentSearchTimer: number | null = null;
+let contentSearchSeq = 0;
+let pendingScrollTargetUuid: string | null = null;
+
+function scheduleContentSearch(rawQuery: string) {
+  if (contentSearchTimer !== null) {
+    window.clearTimeout(contentSearchTimer);
+    contentSearchTimer = null;
+  }
+  const query = rawQuery.trim();
+  // Hide the section for empty / very short queries; keeps title filter
+  // feeling instant and avoids hitting the index for noise.
+  if (query.length < 3) {
+    renderContentMatches(null, "");
+    return;
+  }
+  const seq = ++contentSearchSeq;
+  contentSearchTimer = window.setTimeout(async () => {
+    contentSearchTimer = null;
+    try {
+      const hits = await invoke<SearchHit[]>("search_messages", { query, limit: 50 });
+      // Drop late responses that lost the race to a newer query.
+      if (seq !== contentSearchSeq) return;
+      renderContentMatches(hits, query);
+    } catch (err) {
+      console.error("search_messages failed:", err);
+      if (seq === contentSearchSeq) renderContentMatches([], query);
+    }
+  }, 220);
+}
+
+function renderContentMatches(hits: SearchHit[] | null, query: string) {
+  const container = document.getElementById("content-matches");
+  if (!container) return;
+  const list = container.querySelector(".content-matches-list") as HTMLElement;
+  const count = container.querySelector(".content-matches-count") as HTMLElement;
+  if (!list || !count) return;
+
+  if (!hits) {
+    container.hidden = true;
+    list.innerHTML = "";
+    count.textContent = "";
+    return;
+  }
+
+  if (hits.length === 0) {
+    container.hidden = false;
+    count.textContent = "0";
+    list.innerHTML = `<div class="content-match" style="cursor:default;color:var(--text-dim);font-style:italic">No matches for "${escapeHtml(query)}"</div>`;
+    return;
+  }
+
+  container.hidden = false;
+  count.textContent = String(hits.length);
+
+  const frag = document.createDocumentFragment();
+  for (const hit of hits) {
+    const row = document.createElement("div");
+    row.className = "content-match";
+    row.dataset.sessionId = hit.session_id;
+    row.dataset.uuid = hit.uuid;
+
+    const meta = document.createElement("div");
+    meta.className = "content-match-meta";
+
+    const sessName = document.createElement("span");
+    sessName.className = "content-match-session";
+    sessName.textContent = hit.session_name || "(unnamed)";
+    meta.appendChild(sessName);
+
+    const role = document.createElement("span");
+    role.className = `content-match-role ${hit.role}`;
+    role.textContent = hit.role;
+    meta.appendChild(role);
+
+    if (hit.ts > 0) {
+      const ago = document.createElement("span");
+      ago.className = "content-match-ago";
+      ago.textContent = formatRelativeTime(hit.ts);
+      meta.appendChild(ago);
+    }
+
+    row.appendChild(meta);
+
+    const snip = document.createElement("div");
+    snip.className = "content-match-snippet";
+    // The server already wraps matches in <mark>...</mark>; everything else
+    // is escaped on the server side from a plain-text column.
+    snip.innerHTML = hit.snippet;
+    row.appendChild(snip);
+
+    row.addEventListener("click", () => {
+      jumpToSearchHit(hit);
+    });
+
+    frag.appendChild(row);
+  }
+  list.innerHTML = "";
+  list.appendChild(frag);
+}
+
+function formatRelativeTime(ms: number): string {
+  const diff = Date.now() - ms;
+  if (diff < 60_000) return "just now";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h`;
+  if (diff < 30 * 86_400_000) return `${Math.floor(diff / 86_400_000)}d`;
+  const d = new Date(ms);
+  return `${d.getMonth() + 1}/${d.getDate()}/${String(d.getFullYear()).slice(2)}`;
+}
+
+async function jumpToSearchHit(hit: SearchHit) {
+  pendingScrollTargetUuid = hit.uuid;
+  if (activeSessionId !== hit.session_id) {
+    await switchToSession(hit.session_id);
+  }
+  // The session may need a moment to render its history; retry briefly.
+  scrollToPendingTarget();
+}
+
+function scrollToPendingTarget() {
+  if (!pendingScrollTargetUuid) return;
+  const uuid = pendingScrollTargetUuid;
+  const tryFind = (attemptsLeft: number) => {
+    // Scope to .chat-message — sidebar .content-match rows also carry
+    // data-uuid (so we know what to jump to) and would otherwise match.
+    const el = document.querySelector(
+      `.chat-message[data-uuid="${CSS.escape(uuid)}"]`
+    ) as HTMLElement | null;
+    if (el) {
+      pendingScrollTargetUuid = null;
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      el.classList.remove("scroll-target-flash");
+      // Force reflow so the animation re-fires when re-targeting same uuid
+      void el.offsetWidth;
+      el.classList.add("scroll-target-flash");
+      return;
+    }
+    if (attemptsLeft > 0) {
+      window.setTimeout(() => tryFind(attemptsLeft - 1), 120);
+    } else {
+      pendingScrollTargetUuid = null;
+    }
+  };
+  tryFind(15); // ~1.8s window for slow renders
+}
+
 /**
  * Schedule a session list render on the next animation frame.
  * Multiple calls coalesce into a single render, reducing redundant DOM work.
@@ -5278,6 +5448,11 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
 
   const messageEl = document.createElement("div");
   messageEl.className = "chat-message";
+  // Search hits jump to a specific message via data-uuid; the JSONL
+  // record's uuid is stable across reloads.
+  if (message.uuid) {
+    messageEl.dataset.uuid = message.uuid;
+  }
 
   if (message.type === "user") {
     // Extract user content from either desktop format (result) or mobile format (message.content)
@@ -6150,6 +6325,29 @@ async function saveChatMessagesImmediate(sessionId: string): Promise<void> {
  */
 async function loadChatMessages(sessionId: string, chatSession: ChatSession): Promise<void> {
   try {
+    // Prefer the on-disk JSONL when we have one — it carries `uuid` on each
+    // line, which is what enables search-hit jump-to-message. The legacy
+    // `terminal_buffer` blob was serialized through a Rust struct that
+    // dropped uuid, so messages restored from it can't be jumped to.
+    const sess = sessions.get(sessionId);
+    if (sess?.claudeSessionId && sess.workingDir) {
+      try {
+        const history = await invoke<ClaudeJsonMessage[]>(
+          "load_claude_session_history",
+          { sessionId: sess.claudeSessionId, project: sess.workingDir }
+        );
+        if (history && history.length > 0) {
+          for (const msg of history) {
+            chatSession.messages.push(msg);
+            renderChatMessage(chatSession, msg);
+          }
+          return;
+        }
+      } catch {
+        // JSONL not present (e.g. session never wrote one yet) — fall through.
+      }
+    }
+
     const bufferContent = await invoke<string | null>("load_terminal_buffer", { sessionId });
     if (bufferContent) {
       let messages: ClaudeJsonMessage[];
@@ -6235,6 +6433,11 @@ async function loadChatMessages(sessionId: string, chatSession: ChatSession): Pr
 function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage): void {
   const messageEl = document.createElement("div");
   messageEl.className = "chat-message";
+  // Search hits jump to a specific message via data-uuid; the JSONL
+  // record's uuid is stable across reloads.
+  if (message.uuid) {
+    messageEl.dataset.uuid = message.uuid;
+  }
 
   if (message.type === "user") {
     // Skip user messages with empty content (e.g., tool_result messages)
