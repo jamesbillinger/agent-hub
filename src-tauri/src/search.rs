@@ -131,6 +131,9 @@ pub fn run_search_migrations(conn: &Connection) {
     )
     .expect("Failed to create search schema");
 
+    // Forward-compatible column adds — silently no-ops once the column exists.
+    let _ = conn.execute("ALTER TABLE session_files ADD COLUMN claude_home TEXT", []);
+
     conn.execute(
         "INSERT OR REPLACE INTO search_meta (key, value) VALUES ('schema_version', ?1)",
         [SCHEMA_VERSION],
@@ -286,30 +289,66 @@ pub struct BackfillStats {
     pub errors: u32,
 }
 
-fn claude_projects_dir() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".claude").join("projects"))
+/// Resolve a single user-supplied Claude home (e.g. "~/.claude-work") to
+/// its `<home>/projects` dir, with tilde expansion.
+fn projects_dir_from_home(home: &str) -> Option<PathBuf> {
+    let expanded = shellexpand::tilde(home).to_string();
+    let p = PathBuf::from(expanded).join("projects");
+    if p.is_dir() {
+        Some(p)
+    } else {
+        None
+    }
 }
 
-fn scan_all_jsonl_files() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let Some(root) = claude_projects_dir() else {
-        return out;
-    };
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if !p.is_dir() {
+/// Each entry pairs a Claude home (the user-supplied value, e.g. "~/.claude")
+/// with its resolved projects directory. We pass both around so the
+/// `claude_home` column on session_files records provenance.
+fn search_homes_from_settings() -> Vec<(String, PathBuf)> {
+    let settings = crate::load_app_settings().unwrap_or_default();
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for home in &settings.claude_search_dirs {
+        let trimmed = home.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        let Ok(sub) = std::fs::read_dir(&p) else {
+        if let Some(projects) = projects_dir_from_home(trimmed) {
+            if seen.insert(projects.clone()) {
+                out.push((trimmed.to_string(), projects));
+            }
+        }
+    }
+    if out.is_empty() {
+        // Fallback if user blanked the list — always at least scan the default.
+        if let Some(p) = dirs::home_dir().map(|h| h.join(".claude").join("projects")) {
+            if p.is_dir() {
+                out.push(("~/.claude".to_string(), p));
+            }
+        }
+    }
+    out
+}
+
+fn scan_all_jsonl_files() -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    for (home, projects_root) in search_homes_from_settings() {
+        let Ok(entries) = std::fs::read_dir(&projects_root) else {
             continue;
         };
-        for f in sub.flatten() {
-            let fp = f.path();
-            if fp.extension().map_or(false, |e| e == "jsonl") {
-                out.push(fp);
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let Ok(sub) = std::fs::read_dir(&p) else {
+                continue;
+            };
+            for f in sub.flatten() {
+                let fp = f.path();
+                if fp.extension().map_or(false, |e| e == "jsonl") {
+                    out.push((home.clone(), fp));
+                }
             }
         }
     }
@@ -405,8 +444,8 @@ fn run_backfill() -> BackfillStats {
         "total": total,
     }));
 
-    let mut unlinked: Vec<PathBuf> = Vec::new();
-    for (i, path) in all_files.into_iter().enumerate() {
+    let mut unlinked: Vec<(String, PathBuf)> = Vec::new();
+    for (i, (home, path)) in all_files.into_iter().enumerate() {
         let claude_session_id = match path.file_stem().and_then(|s| s.to_str()) {
             Some(s) => s.to_string(),
             None => continue,
@@ -416,8 +455,8 @@ fn run_backfill() -> BackfillStats {
             lookup_session_by_claude_id(&conn, &claude_session_id)
         };
         match session_id {
-            Some(sid) => ingest_one(&path, &sid, &claude_session_id, &mut stats),
-            None => unlinked.push(path),
+            Some(sid) => ingest_one(&path, &sid, &claude_session_id, &home, &mut stats),
+            None => unlinked.push((home, path)),
         }
         // Throttle: emit on every 5th file or whenever it's the first/last,
         // so a 1000-file rebuild doesn't fire 1000 events.
@@ -439,7 +478,7 @@ fn run_backfill() -> BackfillStats {
         }
         let pending = std::mem::take(&mut unlinked);
         let mut made_progress = false;
-        for path in pending {
+        for (home, path) in pending {
             let claude_session_id = match path.file_stem().and_then(|s| s.to_str()) {
                 Some(s) => s.to_string(),
                 None => continue,
@@ -451,10 +490,10 @@ fn run_backfill() -> BackfillStats {
             };
             match session_id {
                 Some(sid) => {
-                    ingest_one(&path, &sid, &claude_session_id, &mut stats);
+                    ingest_one(&path, &sid, &claude_session_id, &home, &mut stats);
                     made_progress = true;
                 }
-                None => unlinked.push(path),
+                None => unlinked.push((home, path)),
             }
         }
         if !made_progress {
@@ -487,10 +526,10 @@ fn run_backfill() -> BackfillStats {
 /// Re-stat every JSONL we've previously seen and re-ingest those whose
 /// mtime/size has changed. Cheap when nothing has changed.
 pub fn incremental_rescan() -> BackfillStats {
-    let known: Vec<(String, String, String, i64, i64)> = {
+    let known: Vec<(String, String, String, i64, i64, Option<String>)> = {
         let conn = crate::DB_CONNECTION.lock();
         let mut stmt = match conn.prepare(
-            "SELECT claude_session_id, session_id, file_path, last_mtime, last_size FROM session_files",
+            "SELECT claude_session_id, session_id, file_path, last_mtime, last_size, claude_home FROM session_files",
         ) {
             Ok(s) => s,
             Err(_) => return BackfillStats::default(),
@@ -502,6 +541,7 @@ pub fn incremental_rescan() -> BackfillStats {
                 r.get::<_, String>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, i64>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -509,7 +549,7 @@ pub fn incremental_rescan() -> BackfillStats {
     };
 
     let mut stats = BackfillStats::default();
-    for (claude_session_id, session_id, file_path, last_mtime, last_size) in known {
+    for (claude_session_id, session_id, file_path, last_mtime, last_size, claude_home) in known {
         let path = PathBuf::from(&file_path);
         let Ok(meta) = std::fs::metadata(&path) else {
             continue; // file vanished — leave bookkeeping alone
@@ -524,7 +564,8 @@ pub fn incremental_rescan() -> BackfillStats {
         if size == last_size && mtime == last_mtime {
             continue;
         }
-        ingest_one(&path, &session_id, &claude_session_id, &mut stats);
+        let home = claude_home.unwrap_or_else(|| "~/.claude".to_string());
+        ingest_one(&path, &session_id, &claude_session_id, &home, &mut stats);
     }
     if stats.files_ingested > 0 || stats.rows_inserted > 0 {
         eprintln!(
@@ -538,57 +579,90 @@ pub fn incremental_rescan() -> BackfillStats {
 /// End-of-turn hook: re-scan all JSONL files associated with `session_id`
 /// and ingest any new bytes. Idempotent. Called from save_session_messages_to_db.
 pub fn ingest_session_files(session_id: &str) {
-    let files: Vec<(String, String)> = {
+    let files: Vec<(String, String, Option<String>)> = {
         let conn = crate::DB_CONNECTION.lock();
         let mut stmt = match conn.prepare(
-            "SELECT claude_session_id, file_path FROM session_files WHERE session_id = ?1",
+            "SELECT claude_session_id, file_path, claude_home FROM session_files WHERE session_id = ?1",
         ) {
             Ok(s) => s,
             Err(_) => return,
         };
         stmt.query_map([session_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
     };
 
-    // Also find any JSONLs the CLI may have created recently for this session
-    // but that we haven't recorded yet (e.g. fresh start, --resume new file).
-    // We do that by looking at sessions.claude_session_id and seeing if it has
-    // a matching JSONL not yet in session_files.
-    if let Some((cwd, latest_claude_id)) = lookup_session_cwd_and_claude_id(session_id) {
-        if let Some(p) = jsonl_path_for(&cwd, &latest_claude_id) {
-            if p.exists() && !files.iter().any(|(cid, _)| cid == &latest_claude_id) {
-                let mut stats = BackfillStats::default();
-                ingest_one(&p, session_id, &latest_claude_id, &mut stats);
+    // Find any JSONL the CLI created since last visit (e.g. --resume creates
+    // a new file). For that we need to know which Claude home the session
+    // writes into — derived from session.env_vars.CLAUDE_CONFIG_DIR or the
+    // global app setting.
+    if let Some((cwd, latest_claude_id, env_home)) = lookup_session_meta(session_id) {
+        for home in candidate_homes_for_session(env_home.as_deref()) {
+            if let Some(p) = jsonl_path_for(&home, &cwd, &latest_claude_id) {
+                if p.exists() && !files.iter().any(|(cid, _, _)| cid == &latest_claude_id) {
+                    let mut stats = BackfillStats::default();
+                    ingest_one(&p, session_id, &latest_claude_id, &home, &mut stats);
+                    break;
+                }
             }
         }
     }
 
     let mut stats = BackfillStats::default();
-    for (claude_session_id, file_path) in files {
-        ingest_one(&PathBuf::from(file_path), session_id, &claude_session_id, &mut stats);
+    for (claude_session_id, file_path, claude_home) in files {
+        let home = claude_home.unwrap_or_else(|| "~/.claude".to_string());
+        ingest_one(&PathBuf::from(file_path), session_id, &claude_session_id, &home, &mut stats);
     }
 }
 
-fn lookup_session_cwd_and_claude_id(session_id: &str) -> Option<(String, String)> {
+/// Return cwd, claude_session_id, and CLAUDE_CONFIG_DIR override (parsed
+/// from sessions.env_vars JSON, if present and not the "default" sentinel).
+fn lookup_session_meta(session_id: &str) -> Option<(String, String, Option<String>)> {
     let conn = crate::DB_CONNECTION.lock();
     conn.query_row(
-        "SELECT working_dir, claude_session_id FROM sessions WHERE id = ?1",
+        "SELECT working_dir, claude_session_id, env_vars FROM sessions WHERE id = ?1",
         [session_id],
         |r| {
             let wd: String = r.get(0)?;
             let csid: Option<String> = r.get(1)?;
-            Ok((wd, csid))
+            let env_json: Option<String> = r.get(2)?;
+            Ok((wd, csid, env_json))
         },
     )
     .ok()
-    .and_then(|(wd, csid)| csid.map(|c| (wd, c)))
+    .and_then(|(wd, csid, env_json)| {
+        let env_home = env_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+            .and_then(|v| {
+                v.get("CLAUDE_CONFIG_DIR")
+                    .and_then(|x| x.as_str())
+                    .map(String::from)
+            })
+            .filter(|s| !s.is_empty() && s != "default");
+        csid.map(|c| (wd, c, env_home))
+    })
 }
 
-fn jsonl_path_for(working_dir: &str, claude_session_id: &str) -> Option<PathBuf> {
-    let projects = claude_projects_dir()?;
+/// If the session has a CLAUDE_CONFIG_DIR override, try that home first
+/// (most likely correct). Otherwise iterate the configured search dirs.
+fn candidate_homes_for_session(env_home: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(h) = env_home {
+        out.push(h.to_string());
+    }
+    for (h, _) in search_homes_from_settings() {
+        if !out.iter().any(|x| x == &h) {
+            out.push(h);
+        }
+    }
+    out
+}
+
+fn jsonl_path_for(home: &str, working_dir: &str, claude_session_id: &str) -> Option<PathBuf> {
+    let projects = projects_dir_from_home(home)?;
     let folder = working_dir
         .replace('/', "-")
         .trim_start_matches('-')
@@ -604,9 +678,10 @@ fn ingest_one(
     path: &Path,
     session_id: &str,
     claude_session_id: &str,
+    claude_home: &str,
     stats: &mut BackfillStats,
 ) {
-    match ingest_file(path, session_id, claude_session_id) {
+    match ingest_file(path, session_id, claude_session_id, claude_home) {
         Ok(IngestOutcome::UpToDate) => stats.files_skipped_uptodate += 1,
         Ok(IngestOutcome::Ingested(n)) => {
             stats.files_ingested += 1;
@@ -628,6 +703,7 @@ fn ingest_file(
     path: &Path,
     session_id: &str,
     claude_session_id: &str,
+    claude_home: &str,
 ) -> std::io::Result<IngestOutcome> {
     let meta = std::fs::metadata(path)?;
     let size = meta.len() as i64;
@@ -696,6 +772,7 @@ fn ingest_file(
                 &path_str,
                 claude_session_id,
                 session_id,
+                claude_home,
                 offset,
                 &last_uuid,
                 mtime,
@@ -712,6 +789,7 @@ fn ingest_file(
         &path_str,
         claude_session_id,
         session_id,
+        claude_home,
         offset,
         &last_uuid,
         mtime,
@@ -728,6 +806,7 @@ fn flush_batch(
     path: &str,
     claude_session_id: &str,
     session_id: &str,
+    claude_home: &str,
     offset: i64,
     last_uuid: &Option<String>,
     mtime: i64,
@@ -775,8 +854,8 @@ fn flush_batch(
     {
         let mut upsert = match tx.prepare_cached(
             "INSERT INTO session_files
-             (claude_session_id, session_id, file_path, last_offset, last_mtime, last_size, last_uuid, first_seen_at, completed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             (claude_session_id, session_id, file_path, last_offset, last_mtime, last_size, last_uuid, first_seen_at, completed_at, claude_home)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(claude_session_id) DO UPDATE SET
                 session_id    = excluded.session_id,
                 file_path     = excluded.file_path,
@@ -784,7 +863,8 @@ fn flush_batch(
                 last_mtime    = excluded.last_mtime,
                 last_size     = excluded.last_size,
                 last_uuid     = excluded.last_uuid,
-                completed_at  = excluded.completed_at",
+                completed_at  = excluded.completed_at,
+                claude_home   = excluded.claude_home",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -802,6 +882,7 @@ fn flush_batch(
             last_uuid,
             first_seen_at,
             completed_at,
+            claude_home,
         ]);
     }
     if let Err(e) = tx.commit() {
@@ -818,6 +899,7 @@ fn flush_batch(
 pub struct OrphanJsonl {
     pub file_path: String,
     pub claude_session_id: String,
+    pub claude_home: String,
     pub cwd: Option<String>,
     pub first_message_preview: Option<String>,
     pub message_count: u32,
@@ -848,12 +930,12 @@ pub fn list_orphan_jsonls() -> Vec<OrphanJsonl> {
     };
 
     let mut out = Vec::new();
-    for path in scan_all_jsonl_files() {
+    for (home, path) in scan_all_jsonl_files() {
         let path_str = path.to_string_lossy().to_string();
         if known.contains(&path_str) {
             continue;
         }
-        if let Some(info) = inspect_jsonl_for_orphan(&path) {
+        if let Some(info) = inspect_jsonl_for_orphan(&path, &home) {
             out.push(info);
         }
     }
@@ -862,7 +944,7 @@ pub fn list_orphan_jsonls() -> Vec<OrphanJsonl> {
     out
 }
 
-fn inspect_jsonl_for_orphan(path: &Path) -> Option<OrphanJsonl> {
+fn inspect_jsonl_for_orphan(path: &Path, home: &str) -> Option<OrphanJsonl> {
     let claude_session_id = path.file_stem()?.to_str()?.to_string();
     let file_path = path.to_string_lossy().to_string();
     let f = File::open(path).ok()?;
@@ -907,6 +989,7 @@ fn inspect_jsonl_for_orphan(path: &Path) -> Option<OrphanJsonl> {
     Some(OrphanJsonl {
         file_path,
         claude_session_id,
+        claude_home: home.to_string(),
         cwd,
         first_message_preview: first_user_text,
         message_count: count,
@@ -1000,11 +1083,21 @@ pub fn import_orphans() -> ImportStats {
                 .map(|dt| dt.to_rfc3339())
                 .unwrap_or_else(|| now_iso.clone());
 
+            // Imported sessions from a non-default Claude home need
+            // CLAUDE_CONFIG_DIR set so resume goes to the right place.
+            let env_vars: Option<String> = if orphan.claude_home != "~/.claude" {
+                Some(format!(
+                    r#"{{"CLAUDE_CONFIG_DIR":"{}"}}"#,
+                    orphan.claude_home.replace('"', "\\\"")
+                ))
+            } else {
+                None
+            };
             let res = conn.execute(
                 "INSERT INTO sessions
                   (id, name, agent_type, command, working_dir, created_at,
-                   claude_session_id, sort_order, folder_id)
-                 VALUES (?1, ?2, 'claude-json', ?3, ?4, ?5, ?6, 99999, ?7)",
+                   claude_session_id, sort_order, folder_id, env_vars)
+                 VALUES (?1, ?2, 'claude-json', ?3, ?4, ?5, ?6, 99999, ?7, ?8)",
                 params![
                     session_id,
                     name,
@@ -1012,7 +1105,8 @@ pub fn import_orphans() -> ImportStats {
                     working_dir,
                     created_at,
                     orphan.claude_session_id,
-                    folder_id
+                    folder_id,
+                    env_vars
                 ],
             );
             if res.is_ok() {

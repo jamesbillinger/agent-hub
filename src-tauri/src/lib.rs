@@ -478,6 +478,16 @@ struct AppSettings {
     default_model: Option<String>,
     #[serde(default)]
     claude_config_dir: Option<String>,
+    /// Claude home directories to scan for JSONL search indexing. The
+    /// CLI writes per-account history under <home>/projects/. Defaults
+    /// to just ["~/.claude"]. Add e.g. "~/.claude-work" for additional
+    /// accounts.
+    #[serde(default = "default_claude_search_dirs")]
+    claude_search_dirs: Vec<String>,
+}
+
+fn default_claude_search_dirs() -> Vec<String> {
+    vec!["~/.claude".to_string()]
 }
 
 fn default_renderer() -> String {
@@ -505,6 +515,7 @@ impl Default for AppSettings {
             show_active_sessions_group: true,
             default_model: None,
             claude_config_dir: None,
+            claude_search_dirs: default_claude_search_dirs(),
         }
     }
 }
@@ -1362,26 +1373,41 @@ fn list_claude_sessions(_working_dir: Option<String>) -> Result<Vec<ClaudeSessio
 fn load_claude_session_history(session_id: String, project: String) -> Result<Vec<serde_json::Value>, String> {
     use std::io::{BufRead, BufReader};
 
-    let home = dirs::home_dir().ok_or_else(|| "Could not find home directory".to_string())?;
-    let claude_projects = home.join(".claude").join("projects");
-
     // Expand tilde so sessions stored with `~/...` match the path the CLI
     // wrote (which uses the absolute path).
     let expanded = shellexpand::tilde(&project).to_string();
-
-    // Build project folder name the same way Claude does
     let project_folder_name = expanded
         .replace('/', "-")
         .trim_start_matches('-')
         .to_string();
 
-    let session_file = claude_projects
-        .join(format!("-{}", project_folder_name))
-        .join(format!("{}.jsonl", session_id));
-
-    if !session_file.exists() {
-        return Err(format!("Session file not found: {:?}", session_file));
+    // Iterate every configured Claude home (settings.claude_search_dirs) and
+    // pick the first one that has the file. Falls back to ~/.claude.
+    let settings = load_app_settings().unwrap_or_default();
+    let mut search_homes: Vec<String> = settings.claude_search_dirs.clone();
+    if !search_homes.iter().any(|h| h == "~/.claude") {
+        search_homes.push("~/.claude".to_string());
     }
+
+    let mut session_file: Option<std::path::PathBuf> = None;
+    for home in &search_homes {
+        let home_expanded = shellexpand::tilde(home).to_string();
+        let candidate = std::path::PathBuf::from(home_expanded)
+            .join("projects")
+            .join(format!("-{}", project_folder_name))
+            .join(format!("{}.jsonl", session_id));
+        if candidate.exists() {
+            session_file = Some(candidate);
+            break;
+        }
+    }
+    let session_file = match session_file {
+        Some(p) => p,
+        None => return Err(format!(
+            "Session file not found in any configured Claude home: {} under -{}",
+            session_id, project_folder_name
+        )),
+    };
 
     let file = std::fs::File::open(&session_file)
         .map_err(|e| format!("Could not open session file: {}", e))?;

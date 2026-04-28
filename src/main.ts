@@ -345,6 +345,7 @@ interface AppSettings {
   show_active_sessions_group: boolean;
   default_model?: string | null;
   claude_config_dir?: string | null;
+  claude_search_dirs?: string[];
 }
 
 // Recently closed session for undo functionality
@@ -382,6 +383,7 @@ let appSettings: AppSettings = {
   renderer: "webgl",
   show_active_sessions_group: true,
   claude_config_dir: null,
+  claude_search_dirs: ["~/.claude"],
 };
 let sidebarResizeHandle: HTMLElement;
 let sidebarEl: HTMLElement;
@@ -6633,6 +6635,8 @@ async function showSettingsModal(): Promise<void> {
   settingsRendererSelect.value = appSettings.renderer || "webgl";
   settingsRemotePinInput.value = appSettings.remote_pin || "";
   (document.getElementById("settings-claude-config-dir") as HTMLInputElement).value = appSettings.claude_config_dir || "";
+  (document.getElementById("settings-claude-search-dirs") as HTMLTextAreaElement).value =
+    (appSettings.claude_search_dirs || ["~/.claude"]).join("\n");
 
   // Show app version
   try {
@@ -6766,6 +6770,11 @@ async function saveSettings(): Promise<void> {
     remote_pin: settingsRemotePinInput.value || null,
     show_active_sessions_group: settingsActiveSessionsGroupCheckbox.checked,
     claude_config_dir: (document.getElementById("settings-claude-config-dir") as HTMLInputElement).value || null,
+    claude_search_dirs: (() => {
+      const raw = (document.getElementById("settings-claude-search-dirs") as HTMLTextAreaElement).value;
+      const lines = raw.split("\n").map((s) => s.trim()).filter((s) => s.length > 0);
+      return lines.length > 0 ? lines : ["~/.claude"];
+    })(),
   };
 
   try {
