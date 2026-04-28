@@ -17,6 +17,16 @@ use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use tauri::Emitter;
+
+/// Emit a Tauri event to any listeners (desktop UI). Mobile WS clients
+/// don't get these events directly — the mobile Settings page is rare
+/// enough that the simple "click Rebuild → wait" UX is acceptable for it.
+fn emit_progress(payload: serde_json::Value) {
+    if let Some(app) = crate::APP_HANDLE.lock().as_ref() {
+        let _ = app.emit("search-progress", payload);
+    }
+}
 
 const SCHEMA_VERSION: &str = "1";
 const BATCH_SIZE: usize = 500;
@@ -388,9 +398,15 @@ fn run_backfill() -> BackfillStats {
     let mut stats = BackfillStats::default();
     let all_files = scan_all_jsonl_files();
     stats.files_scanned = all_files.len() as u32;
+    let total = all_files.len();
+
+    emit_progress(serde_json::json!({
+        "phase": "start",
+        "total": total,
+    }));
 
     let mut unlinked: Vec<PathBuf> = Vec::new();
-    for path in all_files {
+    for (i, path) in all_files.into_iter().enumerate() {
         let claude_session_id = match path.file_stem().and_then(|s| s.to_str()) {
             Some(s) => s.to_string(),
             None => continue,
@@ -402,6 +418,17 @@ fn run_backfill() -> BackfillStats {
         match session_id {
             Some(sid) => ingest_one(&path, &sid, &claude_session_id, &mut stats),
             None => unlinked.push(path),
+        }
+        // Throttle: emit on every 5th file or whenever it's the first/last,
+        // so a 1000-file rebuild doesn't fire 1000 events.
+        if i == 0 || i == total - 1 || (i + 1) % 5 == 0 {
+            emit_progress(serde_json::json!({
+                "phase": "scanning",
+                "scanned": i + 1,
+                "total": total,
+                "ingested": stats.files_ingested,
+                "rows": stats.rows_inserted,
+            }));
         }
     }
 
@@ -446,6 +473,14 @@ fn run_backfill() -> BackfillStats {
         stats.files_skipped_uptodate,
         stats.errors,
     );
+    emit_progress(serde_json::json!({
+        "phase": "done",
+        "scanned": stats.files_scanned,
+        "ingested": stats.files_ingested,
+        "rows": stats.rows_inserted,
+        "unlinked": stats.files_skipped_unlinked,
+        "elapsed_ms": start.elapsed().as_millis() as u64,
+    }));
     stats
 }
 

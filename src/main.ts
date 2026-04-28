@@ -999,6 +999,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   document.getElementById("settings-check-update")!.addEventListener("click", checkForUpdates);
   document.getElementById("settings-rebuild-index")!.addEventListener("click", rebuildSearchIndex);
   document.getElementById("settings-import-orphans")!.addEventListener("click", importOrphanJsonls);
+  void subscribeToSearchProgress();
   settingsModal.addEventListener("click", (e) => {
     if (e.target === settingsModal) hideSettingsModal();
   });
@@ -6810,6 +6811,9 @@ async function rebuildSearchIndex(): Promise<void> {
   if (!status || !btn) return;
   btn.disabled = true;
   status.textContent = "Rebuilding index…";
+  // Live progress is delivered via the "search-progress" Tauri event,
+  // subscribed once at app startup. It updates this same status element
+  // while the rebuild_search_index call is in flight.
   try {
     const res = await invoke<{ files_ingested: number; rows_inserted: number; files_skipped_unlinked: number }>(
       "rebuild_search_index"
@@ -6821,6 +6825,23 @@ async function rebuildSearchIndex(): Promise<void> {
   } finally {
     btn.disabled = false;
   }
+}
+
+// Subscribe to backfill progress events from the search module.
+async function subscribeToSearchProgress() {
+  await listen<{ phase: string; scanned?: number; total?: number; rows?: number; ingested?: number; unlinked?: number }>(
+    "search-progress",
+    (event) => {
+      const status = document.getElementById("search-index-status");
+      if (!status) return;
+      const p = event.payload;
+      if (p.phase === "scanning" && p.total) {
+        status.textContent = `Indexing ${p.scanned}/${p.total} (${p.rows ?? 0} messages)…`;
+      } else if (p.phase === "done") {
+        status.textContent = `Indexed ${p.rows ?? 0} messages from ${p.ingested ?? 0} files (${p.unlinked ?? 0} unlinked).`;
+      }
+    }
+  );
 }
 
 async function importOrphanJsonls(): Promise<void> {
