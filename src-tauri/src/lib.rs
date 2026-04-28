@@ -981,6 +981,16 @@ fn get_search_index_stats() -> Result<search::SearchStats, String> {
 }
 
 #[tauri::command]
+fn list_orphan_jsonls() -> Result<Vec<search::OrphanJsonl>, String> {
+    Ok(search::list_orphan_jsonls())
+}
+
+#[tauri::command]
+fn import_orphan_jsonls() -> Result<search::ImportStats, String> {
+    Ok(search::import_orphans())
+}
+
+#[tauri::command]
 fn search_messages(
     query: String,
     session_id: Option<String>,
@@ -4402,7 +4412,9 @@ pub fn run() {
             toggle_folder_collapsed,
             rebuild_search_index,
             get_search_index_stats,
-            search_messages
+            search_messages,
+            list_orphan_jsonls,
+            import_orphan_jsonls
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -4472,7 +4484,9 @@ pub fn run() {
             toggle_folder_collapsed,
             rebuild_search_index,
             get_search_index_stats,
-            search_messages
+            search_messages,
+            list_orphan_jsonls,
+            import_orphan_jsonls
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

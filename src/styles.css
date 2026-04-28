@@ -3579,6 +3579,14 @@ body.resizing-sidebar {
   padding: 0 2px;
   border-radius: 2px;
 }
+.search-index-stats {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-primary);
+}
+.search-index-stats strong { color: var(--text-primary); }
+.search-index-stats .form-hint { margin-top: 2px; }
+
 .chat-message.scroll-target-flash {
   animation: scroll-target-flash 1.4s ease-out;
 }

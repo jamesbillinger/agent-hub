@@ -776,6 +776,242 @@ fn flush_batch(
 }
 
 // =====================================================================
+//  Orphan import
+// =====================================================================
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OrphanJsonl {
+    pub file_path: String,
+    pub claude_session_id: String,
+    pub cwd: Option<String>,
+    pub first_message_preview: Option<String>,
+    pub message_count: u32,
+    pub first_ts: Option<i64>,
+    pub last_ts: Option<i64>,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct ImportStats {
+    pub considered: u32,
+    pub imported: u32,
+    pub skipped: u32,
+    pub folder_id: Option<String>,
+    pub backfill: BackfillStats,
+}
+
+/// JSONL files we know about that aren't linked to a session yet.
+pub fn list_orphan_jsonls() -> Vec<OrphanJsonl> {
+    let known: std::collections::HashSet<String> = {
+        let conn = crate::DB_CONNECTION.lock();
+        let mut stmt = match conn.prepare("SELECT file_path FROM session_files") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    };
+
+    let mut out = Vec::new();
+    for path in scan_all_jsonl_files() {
+        let path_str = path.to_string_lossy().to_string();
+        if known.contains(&path_str) {
+            continue;
+        }
+        if let Some(info) = inspect_jsonl_for_orphan(&path) {
+            out.push(info);
+        }
+    }
+    // Most-recent-first for the UI.
+    out.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
+    out
+}
+
+fn inspect_jsonl_for_orphan(path: &Path) -> Option<OrphanJsonl> {
+    let claude_session_id = path.file_stem()?.to_str()?.to_string();
+    let file_path = path.to_string_lossy().to_string();
+    let f = File::open(path).ok()?;
+    let reader = BufReader::new(f);
+
+    let mut cwd: Option<String> = None;
+    let mut first_user_text: Option<String> = None;
+    let mut count: u32 = 0;
+    let mut first_ts: Option<i64> = None;
+    let mut last_ts: Option<i64> = None;
+
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+
+        if cwd.is_none() {
+            cwd = v.get("cwd").and_then(|x| x.as_str()).map(String::from);
+        }
+        if let Some(ts) = v
+            .get("timestamp")
+            .and_then(|x| x.as_str())
+            .and_then(parse_iso_to_millis)
+        {
+            if first_ts.is_none() {
+                first_ts = Some(ts);
+            }
+            last_ts = Some(ts);
+        }
+
+        if v.get("type").and_then(|t| t.as_str()) == Some("user")
+            && v.get("uuid").is_some()
+        {
+            count += 1;
+            if first_user_text.is_none() {
+                first_user_text = extract_first_user_text(&v);
+            }
+        }
+    }
+
+    Some(OrphanJsonl {
+        file_path,
+        claude_session_id,
+        cwd,
+        first_message_preview: first_user_text,
+        message_count: count,
+        first_ts,
+        last_ts,
+    })
+}
+
+/// Pull the first paragraph of a user message — used as the imported
+/// session's name. Trimmed to ~60 chars.
+fn extract_first_user_text(v: &Value) -> Option<String> {
+    let text = match v.pointer("/message/content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .find_map(|b| {
+                if b.get("type").and_then(|t| t.as_str())? == "text" {
+                    b.get("text").and_then(|t| t.as_str()).map(String::from)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default(),
+        _ => return None,
+    };
+    let first_line = text.lines().next().unwrap_or(&text).trim().to_string();
+    if first_line.is_empty() {
+        return None;
+    }
+    let truncated: String = first_line.chars().take(60).collect();
+    Some(if truncated.len() < first_line.len() {
+        format!("{}…", truncated)
+    } else {
+        truncated
+    })
+}
+
+/// Import every orphan JSONL as a new claude-json session in a folder
+/// named "IMPORTED" (created if missing, collapsed by default), then
+/// re-run backfill so the newly-linked files get indexed.
+pub fn import_orphans() -> ImportStats {
+    let mut stats = ImportStats::default();
+    let orphans = list_orphan_jsonls();
+    stats.considered = orphans.len() as u32;
+    if orphans.is_empty() {
+        return stats;
+    }
+
+    let folder_id = ensure_imported_folder();
+    stats.folder_id = Some(folder_id.clone());
+    let now_iso = chrono::Utc::now().to_rfc3339();
+    let cmd = "claude --print --verbose --input-format stream-json --output-format stream-json --dangerously-skip-permissions";
+
+    {
+        let conn = crate::DB_CONNECTION.lock();
+        for orphan in &orphans {
+            // Don't re-import if a session already exists with this claude_id.
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM sessions WHERE claude_session_id = ?1 LIMIT 1",
+                    [&orphan.claude_session_id],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if exists {
+                stats.skipped += 1;
+                continue;
+            }
+
+            let session_id = uuid::Uuid::new_v4().to_string();
+            let name = orphan
+                .first_message_preview
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| match orphan.first_ts {
+                    Some(ts) => format!(
+                        "Imported {}",
+                        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ts)
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_else(|| "session".into())
+                    ),
+                    None => "Imported session".into(),
+                });
+            let working_dir = orphan
+                .cwd
+                .clone()
+                .unwrap_or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "/".into()));
+            let created_at = orphan
+                .first_ts
+                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_else(|| now_iso.clone());
+
+            let res = conn.execute(
+                "INSERT INTO sessions
+                  (id, name, agent_type, command, working_dir, created_at,
+                   claude_session_id, sort_order, folder_id)
+                 VALUES (?1, ?2, 'claude-json', ?3, ?4, ?5, ?6, 99999, ?7)",
+                params![
+                    session_id,
+                    name,
+                    cmd,
+                    working_dir,
+                    created_at,
+                    orphan.claude_session_id,
+                    folder_id
+                ],
+            );
+            if res.is_ok() {
+                stats.imported += 1;
+            } else {
+                stats.skipped += 1;
+            }
+        }
+    }
+
+    // Now that sessions exist, re-run backfill — direct claude_session_id
+    // match in pass 1 will link every file we just inserted.
+    stats.backfill = run_backfill();
+    stats
+}
+
+fn ensure_imported_folder() -> String {
+    let conn = crate::DB_CONNECTION.lock();
+    if let Ok(id) = conn.query_row(
+        "SELECT id FROM folders WHERE name = 'IMPORTED' LIMIT 1",
+        [],
+        |r| r.get::<_, String>(0),
+    ) {
+        return id;
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let _ = conn.execute(
+        "INSERT INTO folders (id, name, sort_order, collapsed) VALUES (?1, 'IMPORTED', 99999, 1)",
+        params![id],
+    );
+    id
+}
+
+// =====================================================================
 //  Cleanup + stats
 // =====================================================================
 
@@ -801,29 +1037,38 @@ pub struct SearchStats {
     pub indexed_files: i64,
     pub indexed_messages: i64,
     pub last_completed_ms: Option<i64>,
+    /// JSONL files on disk that aren't linked to any session yet.
+    /// Surfaced so the UI can offer an "Import" action.
+    pub unlinked_files: i64,
 }
 
 pub fn get_stats() -> SearchStats {
-    let conn = crate::DB_CONNECTION.lock();
-    let indexed_files: i64 = conn
-        .query_row("SELECT COUNT(*) FROM session_files", [], |r| r.get(0))
-        .unwrap_or(0);
-    let indexed_messages: i64 = conn
-        .query_row("SELECT COUNT(*) FROM message_index", [], |r| r.get(0))
-        .unwrap_or(0);
-    let last_completed_ms: Option<i64> = conn
-        .query_row(
-            "SELECT MAX(completed_at) FROM session_files WHERE completed_at IS NOT NULL",
-            [],
-            |r| r.get(0),
-        )
-        .ok()
-        .flatten();
+    let (indexed_files, indexed_messages, last_completed_ms) = {
+        let conn = crate::DB_CONNECTION.lock();
+        let f: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_files", [], |r| r.get(0))
+            .unwrap_or(0);
+        let m: i64 = conn
+            .query_row("SELECT COUNT(*) FROM message_index", [], |r| r.get(0))
+            .unwrap_or(0);
+        let l: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(completed_at) FROM session_files WHERE completed_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        (f, m, l)
+    };
+    // Counting orphans does no DB work — just a directory scan + set diff.
+    let unlinked_files = list_orphan_jsonls().len() as i64;
     SearchStats {
         schema_version: SCHEMA_VERSION.to_string(),
         indexed_files,
         indexed_messages,
         last_completed_ms,
+        unlinked_files,
     }
 }
 

@@ -997,6 +997,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   document.getElementById("settings-cancel")!.addEventListener("click", hideSettingsModal);
   document.getElementById("settings-save")!.addEventListener("click", saveSettings);
   document.getElementById("settings-check-update")!.addEventListener("click", checkForUpdates);
+  document.getElementById("settings-rebuild-index")!.addEventListener("click", rebuildSearchIndex);
+  document.getElementById("settings-import-orphans")!.addEventListener("click", importOrphanJsonls);
   settingsModal.addEventListener("click", (e) => {
     if (e.target === settingsModal) hideSettingsModal();
   });
@@ -6645,7 +6647,50 @@ async function showSettingsModal(): Promise<void> {
   // Populate web interface URL
   await populateWebInterfaceUrl();
 
+  // Populate search index stats
+  await populateSearchIndexStats();
+
   settingsModal.classList.add("visible");
+}
+
+interface SearchIndexStats {
+  schema_version: string;
+  indexed_files: number;
+  indexed_messages: number;
+  unlinked_files: number;
+  last_completed_ms: number | null;
+}
+interface ImportStats {
+  considered: number;
+  imported: number;
+  skipped: number;
+  folder_id: string | null;
+}
+
+async function populateSearchIndexStats(): Promise<void> {
+  const statsEl = document.getElementById("search-index-stats");
+  const importBtn = document.getElementById("settings-import-orphans") as HTMLButtonElement | null;
+  if (!statsEl || !importBtn) return;
+  try {
+    const stats = await invoke<SearchIndexStats>("get_search_index_stats");
+    const lastIngest = stats.last_completed_ms
+      ? new Date(stats.last_completed_ms).toLocaleString()
+      : "never";
+    statsEl.innerHTML = `
+      <div>Indexed: <strong>${stats.indexed_messages.toLocaleString()}</strong> messages across <strong>${stats.indexed_files.toLocaleString()}</strong> files</div>
+      <div>Unlinked JSONLs: <strong>${stats.unlinked_files.toLocaleString()}</strong></div>
+      <div class="form-hint">Last ingest: ${lastIngest} · Schema v${stats.schema_version}</div>
+    `;
+    if (stats.unlinked_files > 0) {
+      importBtn.hidden = false;
+      importBtn.textContent = `Import ${stats.unlinked_files} unlinked JSONL${stats.unlinked_files === 1 ? "" : "s"}`;
+      importBtn.disabled = false;
+    } else {
+      importBtn.hidden = true;
+    }
+  } catch (err) {
+    statsEl.textContent = `Error: ${err}`;
+  }
 }
 
 function hideSettingsModal(): void {
@@ -6759,6 +6804,46 @@ async function saveSettings(): Promise<void> {
 }
 
 // Update checking
+async function rebuildSearchIndex(): Promise<void> {
+  const status = document.getElementById("search-index-status");
+  const btn = document.getElementById("settings-rebuild-index") as HTMLButtonElement;
+  if (!status || !btn) return;
+  btn.disabled = true;
+  status.textContent = "Rebuilding index…";
+  try {
+    const res = await invoke<{ files_ingested: number; rows_inserted: number; files_skipped_unlinked: number }>(
+      "rebuild_search_index"
+    );
+    status.textContent = `Rebuild complete: ${res.rows_inserted} messages from ${res.files_ingested} files (${res.files_skipped_unlinked} unlinked).`;
+    await populateSearchIndexStats();
+  } catch (err) {
+    status.textContent = `Rebuild failed: ${err}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function importOrphanJsonls(): Promise<void> {
+  const status = document.getElementById("search-index-status");
+  const btn = document.getElementById("settings-import-orphans") as HTMLButtonElement;
+  if (!status || !btn) return;
+  btn.disabled = true;
+  status.textContent = "Importing unlinked JSONLs…";
+  try {
+    const res = await invoke<ImportStats>("import_orphan_jsonls");
+    status.textContent = `Imported ${res.imported} session${res.imported === 1 ? "" : "s"} into IMPORTED folder${res.skipped ? ` (${res.skipped} skipped)` : ""}.`;
+    // Refresh the sidebar so the new sessions + folder appear.
+    await loadSavedSessions();
+    await loadFolders();
+    renderSessionListImmediate();
+    await populateSearchIndexStats();
+  } catch (err) {
+    status.textContent = `Import failed: ${err}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function checkForUpdates(): Promise<void> {
   const statusEl = document.getElementById("settings-update-status")!;
   const button = document.getElementById("settings-check-update") as HTMLButtonElement;
