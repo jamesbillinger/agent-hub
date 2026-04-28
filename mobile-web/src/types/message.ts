@@ -32,6 +32,8 @@ export interface Message {
   type: 'system' | 'user' | 'assistant' | 'result';
   subtype?: 'init' | 'success' | 'error';
   session_id?: string;
+  uuid?: string;
+  parentUuid?: string;
   message?: {
     id?: string;
     role?: string;

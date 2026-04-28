@@ -3,11 +3,13 @@ import { useGlobalStore, useAuthStore } from '../../stores';
 import { websocketService } from '../../services/websocket';
 import { api } from '../../services/api';
 import { SessionCard } from './SessionCard';
+import { SearchPanel } from './SearchPanel';
 
 export function SessionsView() {
   const { sessions, sessionsOrder, folders, sessionStatus, isConnected, setActiveSession, addSession, showActiveSessionsGroup } = useGlobalStore();
   const logout = useAuthStore((s) => s.logout);
   const [showNewSessionModal, setShowNewSessionModal] = useState(false);
+  const [showSearch, setShowSearch] = useState(false);
   const [newSessionName, setNewSessionName] = useState('');
   const [newSessionDir, setNewSessionDir] = useState('~/dev/');
   const [isCreating, setIsCreating] = useState(false);
@@ -46,6 +48,7 @@ export function SessionsView() {
 
   return (
     <div className="h-full flex flex-col bg-[#1a1a1a]">
+      {showSearch && <SearchPanel onClose={() => setShowSearch(false)} />}
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-[#3c3c3c] pt-[env(safe-area-inset-top)]">
         <div className="flex items-center gap-2">
@@ -55,6 +58,14 @@ export function SessionsView() {
           )}
         </div>
         <div className="flex gap-2">
+          <button
+            onClick={() => setShowSearch(true)}
+            className="p-2 text-gray-400 hover:text-white"
+            title="Search"
+            aria-label="Search"
+          >
+            ⌕
+          </button>
           <button
             onClick={() => setShowNewSessionModal(true)}
             className="p-2 text-[#0e9fd8] hover:text-white font-bold text-lg"

@@ -119,3 +119,18 @@ body {
   padding-left: 1em;
   color: #a0a0a0;
 }
+
+/* Flash animation when a search hit is jumped to. */
+.ah-search-flash {
+  animation: ah-search-flash 1.4s ease-out;
+}
+@keyframes ah-search-flash {
+  0%   { background: rgba(74, 158, 255, 0.20); }
+  100% { background: transparent; }
+}
+.ah-search-flash mark {
+  background: rgba(255, 215, 0, 0.30);
+  color: inherit;
+  padding: 0 2px;
+  border-radius: 2px;
+}

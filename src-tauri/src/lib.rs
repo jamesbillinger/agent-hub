@@ -393,11 +393,30 @@ fn save_session_messages_to_db(session_id: &str) {
 }
 
 /// Get session history for mobile clients (returns JSON messages parsed from buffer)
-/// Uses the in-memory SESSION_MESSAGES buffer if available, otherwise loads from DB.
+/// Prefers the on-disk JSONL when we have a claude_session_id (each line
+/// carries `uuid` so search-hit jump-to-message works on mobile too); falls
+/// back to the in-memory SESSION_MESSAGES buffer for sessions without a
+/// JSONL on disk.
 #[cfg(not(target_os = "ios"))]
 fn get_session_history(session_id: &str) -> Option<Vec<serde_json::Value>> {
-    ensure_session_messages_loaded(session_id);
+    let session_meta: Option<(Option<String>, String)> = {
+        let conn = DB_CONNECTION.lock();
+        conn.query_row(
+            "SELECT claude_session_id, working_dir FROM sessions WHERE id = ?1",
+            [session_id],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
+        )
+        .ok()
+    };
+    if let Some((Some(claude_id), working_dir)) = session_meta {
+        if let Ok(history) = load_claude_session_history(claude_id, working_dir) {
+            if !history.is_empty() {
+                return Some(history);
+            }
+        }
+    }
 
+    ensure_session_messages_loaded(session_id);
     let messages = SESSION_MESSAGES.lock();
     match messages.get(session_id) {
         Some(msgs) if !msgs.is_empty() => Some(msgs.clone()),
@@ -1372,9 +1391,12 @@ fn load_claude_session_history(session_id: String, project: String) -> Result<Ve
     for line in reader.lines() {
         if let Ok(line) = line {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
-                // Only include user and assistant messages
+                // Include the message types the mobile + desktop renderers
+                // know how to handle. Skip attachments (huge skill_listing
+                // bodies) and bookkeeping records (queue-operation,
+                // last-prompt, permission-mode, file-history-snapshot).
                 if let Some(msg_type) = json.get("type").and_then(|t| t.as_str()) {
-                    if msg_type == "user" || msg_type == "assistant" {
+                    if matches!(msg_type, "user" | "assistant" | "system" | "result") {
                         messages.push(json);
                     }
                 }

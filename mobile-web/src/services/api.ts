@@ -95,6 +95,39 @@ class ApiService {
   async getSessionBuffer(sessionId: string): Promise<{ buffer: string | null }> {
     return this.request(`/api/sessions/${sessionId}/buffer`);
   }
+
+  // Search
+  async searchMessages(params: {
+    q: string;
+    session_id?: string;
+    role?: string;
+    from_ts?: number;
+    to_ts?: number;
+    limit?: number;
+    offset?: number;
+  }): Promise<{ hits: SearchHit[]; count: number }> {
+    const qs = new URLSearchParams();
+    qs.set('q', params.q);
+    for (const [k, v] of Object.entries(params)) {
+      if (k === 'q' || v === undefined || v === null || v === '') continue;
+      qs.set(k, String(v));
+    }
+    return this.request(`/api/search/messages?${qs.toString()}`);
+  }
+}
+
+export interface SearchHit {
+  message_id: number;
+  session_id: string;
+  session_name: string | null;
+  claude_session_id: string;
+  uuid: string;
+  file_path: string;
+  file_offset: number;
+  role: string;
+  ts: number;
+  snippet: string;
+  rank: number;
 }
 
 export const api = new ApiService();

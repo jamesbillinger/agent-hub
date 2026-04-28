@@ -21,6 +21,11 @@ interface GlobalState {
   // Settings from desktop
   showActiveSessionsGroup: boolean;
 
+  // Pending scroll-to-message target (uuid). Set when a search hit is
+  // tapped; consumed by MessageList once the messages render.
+  pendingScrollTargetUuid: string | null;
+  setPendingScrollTarget: (uuid: string | null) => void;
+
   // Actions
   setSessions: (sessions: Session[]) => void;
   setFolders: (folders: Folder[]) => void;
@@ -43,6 +48,8 @@ export const useGlobalStore = create<GlobalState>((set, get) => ({
   activeSessionId: null,
   isConnected: false,
   showActiveSessionsGroup: true,
+  pendingScrollTargetUuid: null,
+  setPendingScrollTarget: (uuid) => set({ pendingScrollTargetUuid: uuid }),
 
   setSessions: (sessions) => {
     const sessionsMap = new Map<string, Session>();
