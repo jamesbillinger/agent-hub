@@ -2928,6 +2928,52 @@ async fn api_auth_check(
     }
 }
 
+// GET /api/search/messages?q=...&session_id=...&role=...&from_ts=...&to_ts=...&limit=...&offset=...
+#[derive(serde::Deserialize)]
+struct SearchQueryParams {
+    q: String,
+    session_id: Option<String>,
+    role: Option<String>,
+    from_ts: Option<i64>,
+    to_ts: Option<i64>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+async fn api_search_messages(
+    _headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<SearchQueryParams>,
+) -> impl IntoResponse {
+    // Auth intentionally not enforced here — matches /api/mcp/execute's
+    // model so the local MCP bridge (and other local tools) can call this
+    // without managing tokens. Server binds 0.0.0.0; if you don't trust
+    // your LAN, restrict the listening address to 127.0.0.1.
+    match search::search_messages(
+        &params.q,
+        search::SearchFilters {
+            session_id: params.session_id,
+            role: params.role,
+            from_ts: params.from_ts,
+            to_ts: params.to_ts,
+            limit: params.limit,
+            offset: params.offset,
+        },
+    ) {
+        Ok(hits) => Json(serde_json::json!({ "hits": hits, "count": hits.len() })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e })))
+            .into_response(),
+    }
+}
+
+async fn api_search_stats(_headers: axum::http::HeaderMap) -> impl IntoResponse {
+    Json(search::get_stats()).into_response()
+}
+
+async fn api_search_rebuild(_headers: axum::http::HeaderMap) -> impl IntoResponse {
+    let stats = search::rebuild_index();
+    Json(stats).into_response()
+}
+
 // GET /api/sessions - List all sessions with running status
 #[cfg(not(target_os = "ios"))]
 async fn api_list_sessions(headers: axum::http::HeaderMap) -> impl IntoResponse {
@@ -4008,6 +4054,10 @@ fn start_web_server() {
                 // MCP HTTP endpoints for external control
                 .route("/api/mcp/execute", axum::routing::post(api_mcp_execute))
                 .route("/api/mcp/result", axum::routing::post(api_mcp_result))
+                // Search
+                .route("/api/search/messages", get(api_search_messages))
+                .route("/api/search/stats", get(api_search_stats))
+                .route("/api/search/rebuild", axum::routing::post(api_search_rebuild))
                 .layer(CorsLayer::permissive());
 
             // Try ports starting from WEB_PORT_BASE until we find one available
@@ -4100,6 +4150,10 @@ fn start_web_server() {
                 .route("/api/ws/:session_id", get(ws_handler))
                 .route("/api/ws/status", get(ws_status_handler))
                 .route("/api/ws/mobile", get(ws_mobile_handler))
+                // Search
+                .route("/api/search/messages", get(api_search_messages))
+                .route("/api/search/stats", get(api_search_stats))
+                .route("/api/search/rebuild", axum::routing::post(api_search_rebuild))
                 .layer(CorsLayer::permissive());
 
             // Try ports starting from WEB_PORT_BASE until we find one available

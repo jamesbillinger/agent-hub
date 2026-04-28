@@ -82,8 +82,61 @@ const TOOLS = [
     name: 'list_elements',
     description: 'List all interactive elements on the page with their selectors',
     inputSchema: { type: 'object', properties: {}, required: [] }
+  },
+  {
+    name: 'search_messages',
+    description: 'Full-text search across the user\'s Claude Code conversation history. Returns ranked hits with snippets, session names, timestamps, and pointers (file_path + file_offset) to seek into the source JSONL.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search query. Bare words are AND-ed; quote phrases for exact match.' },
+        session_id: { type: 'string', description: 'Restrict to a specific Agent Hub session id.' },
+        role: { type: 'string', enum: ['user', 'assistant', 'attachment', 'system'], description: 'Filter by role.' },
+        from_ts: { type: 'integer', description: 'Inclusive lower bound on timestamp (unix millis).' },
+        to_ts: { type: 'integer', description: 'Inclusive upper bound on timestamp (unix millis).' },
+        limit: { type: 'integer', description: 'Max hits (default 50, max 500).' },
+        offset: { type: 'integer', description: 'Pagination offset.' }
+      },
+      required: ['query']
+    }
+  },
+  {
+    name: 'get_search_index_stats',
+    description: 'Return search index statistics: schema version, indexed file count, total messages, last ingest timestamp.',
+    inputSchema: { type: 'object', properties: {}, required: [] }
+  },
+  {
+    name: 'rebuild_search_index',
+    description: 'Wipe and rebuild the search index from on-disk Claude JSONL files. Slow operation; use only when the index is suspected stale.',
+    inputSchema: { type: 'object', properties: {}, required: [] }
   }
 ];
+
+// HTTP helper for /api/search/* endpoints.
+function httpJson(method, path) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { hostname: 'localhost', port: AGENT_HUB_PORT, path, method, timeout: 30000 },
+      (res) => {
+        let body = '';
+        res.on('data', (c) => (body += c));
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(body));
+          } catch (e) {
+            reject(new Error(`Bad JSON from ${path}: ${body.slice(0, 200)}`));
+          }
+        });
+      }
+    );
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Request timeout'));
+    });
+    req.end();
+  });
+}
 
 // Execute JS via HTTP API
 function executeJs(code, timeoutMs = 5000) {
@@ -241,6 +294,28 @@ const toolHandlers = {
       return { success: true, selector: '${escaped}', text: text.substring(0, 5000), length: text.length };
     })()`;
     return executeJs(js);
+  },
+
+  async search_messages(args = {}) {
+    const params = new URLSearchParams();
+    if (!args.query || typeof args.query !== 'string') {
+      throw new Error('query is required');
+    }
+    params.set('q', args.query);
+    for (const k of ['session_id', 'role', 'from_ts', 'to_ts', 'limit', 'offset']) {
+      if (args[k] !== undefined && args[k] !== null && args[k] !== '') {
+        params.set(k, String(args[k]));
+      }
+    }
+    return httpJson('GET', `/api/search/messages?${params.toString()}`);
+  },
+
+  async get_search_index_stats() {
+    return httpJson('GET', '/api/search/stats');
+  },
+
+  async rebuild_search_index() {
+    return httpJson('POST', '/api/search/rebuild');
   },
 
   async list_elements() {
