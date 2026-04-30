@@ -10,6 +10,9 @@ interface ChatViewProps {
 
 export function ChatView({ sessionId }: ChatViewProps) {
   const { sessions, sessionStatus, setActiveSession, isConnected } = useGlobalStore();
+  const cameFromSearch = useGlobalStore((s) => s.cameFromSearch);
+  const lastSearchQuery = useGlobalStore((s) => s.lastSearchQuery);
+  const triggerBackToSearch = useGlobalStore((s) => s.triggerBackToSearch);
   const { messages } = useSessionStore();
 
   const session = sessions.get(sessionId);
@@ -55,6 +58,20 @@ export function ChatView({ sessionId }: ChatViewProps) {
           <div className="w-2.5 h-2.5 rounded-full bg-blue-500 animate-pulse" />
         )}
       </div>
+
+      {/* Back-to-search pill: visible when the user landed here via a
+          search hit. Tap returns to the SearchPanel pre-filled with the
+          original query, with the same hit list cached. */}
+      {cameFromSearch && lastSearchQuery && (
+        <button
+          onClick={triggerBackToSearch}
+          className="mx-3 mt-2 px-3 py-1.5 self-start inline-flex items-center gap-2 text-xs rounded-full bg-[#222] border border-[#3c3c3c] text-gray-200 hover:border-[#0e9fd8]"
+        >
+          <span className="text-[#0e9fd8]">←</span>
+          <span>Back to search results</span>
+          <span className="text-gray-500 truncate max-w-[200px]">"{lastSearchQuery}"</span>
+        </button>
+      )}
 
       {/* Messages */}
       <div className="flex-1 overflow-hidden">

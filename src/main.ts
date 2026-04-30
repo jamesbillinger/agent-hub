@@ -911,6 +911,17 @@ document.addEventListener("DOMContentLoaded", async () => {
     searchQuery = sessionSearchInput.value.toLowerCase();
     renderSessionList();
     scheduleContentSearch(sessionSearchInput.value);
+    // Any new typing dismisses the back pill — the user is starting a
+    // new search, not returning to an old one.
+    hideSearchBackPill();
+  });
+  // Refocusing the search input means the user is heading back to look
+  // at results; the explicit pill is no longer needed.
+  sessionSearchInput.addEventListener("focus", () => hideSearchBackPill());
+
+  // Wire the back pill: re-render the overlay from the cached snapshot.
+  document.getElementById("search-back-pill")?.addEventListener("click", () => {
+    reopenSearchOverlayFromSnapshot();
   });
 
   // Esc inside the search box clears the query and hides the overlay,
@@ -3306,6 +3317,11 @@ let searchOverlayTimer: number | null = null;
 let searchOverlaySeq = 0;
 let pendingScrollTargetUuid: string | null = null;
 
+/// Snapshot of the last search the user jumped from. Used by the
+/// "Back to search results" pill to re-render the overlay instantly
+/// without a re-query when the user wants to back out of a hit.
+let lastSearchSnapshot: { query: string; hits: SearchHit[] } | null = null;
+
 function scheduleContentSearch(rawQuery: string) {
   if (searchOverlayTimer !== null) {
     window.clearTimeout(searchOverlayTimer);
@@ -3357,6 +3373,9 @@ async function renderSearchOverlay(hits: SearchHit[], query: string) {
   const list = document.getElementById("search-overlay-results");
   if (!list) return;
   setOverlayQuery(query, hits.length);
+  // Snapshot for the "Back" pill — overwritten every render so it's
+  // always the most recent thing the user saw.
+  lastSearchSnapshot = { query, hits };
 
   if (hits.length === 0) {
     showOverlayMessage(`<div class="search-result-empty">No matches for "${escapeHtml(query)}"</div>`);
@@ -3570,10 +3589,44 @@ async function jumpToSearchHit(hit: SearchHit) {
   // search input keeps its value (handy for picking another result later).
   const overlay = document.getElementById("search-overlay");
   if (overlay) overlay.hidden = true;
+  // Show the "Back" pill so the user can reverse this if they clicked the
+  // wrong hit. The pill itself reads from lastSearchSnapshot.
+  showSearchBackPill();
   if (activeSessionId !== hit.session_id) {
     await switchToSession(hit.session_id);
   }
   scrollToPendingTarget();
+}
+
+function showSearchBackPill() {
+  const pill = document.getElementById("search-back-pill");
+  const queryEl = document.getElementById("search-back-pill-query");
+  if (!pill || !queryEl || !lastSearchSnapshot) return;
+  queryEl.textContent = `"${lastSearchSnapshot.query}"`;
+  pill.hidden = false;
+}
+
+function hideSearchBackPill() {
+  const pill = document.getElementById("search-back-pill");
+  if (pill) pill.hidden = true;
+}
+
+/// Re-open the overlay from the cached snapshot. Instant — no re-query.
+function reopenSearchOverlayFromSnapshot() {
+  if (!lastSearchSnapshot) return;
+  const overlay = document.getElementById("search-overlay");
+  if (!overlay) return;
+  // Sync sidebar input so closing the overlay later behaves correctly.
+  if (sessionSearchInput && sessionSearchInput.value !== lastSearchSnapshot.query) {
+    sessionSearchInput.value = lastSearchSnapshot.query;
+    searchQuery = lastSearchSnapshot.query.toLowerCase();
+    renderSessionList();
+  }
+  overlay.hidden = false;
+  setOverlayQuery(lastSearchSnapshot.query, lastSearchSnapshot.hits.length);
+  // Render synchronously from cache.
+  void renderSearchOverlay(lastSearchSnapshot.hits, lastSearchSnapshot.query);
+  hideSearchBackPill();
 }
 
 function scrollToPendingTarget() {
@@ -3786,6 +3839,8 @@ function createSessionItem(session: Session, index: number): HTMLElement {
     const target = e.target as HTMLElement;
     if (!target.classList.contains("close-btn") && !target.classList.contains("drag-handle")) {
       switchToSession(session.id);
+      // Manual sidebar nav supersedes any prior "came from search" state.
+      hideSearchBackPill();
     }
   });
 

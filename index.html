@@ -99,6 +99,15 @@
           <p>Create a new session to get started with Claude or another agent.</p>
           <button id="empty-new-session-btn">Create Session</button>
         </div>
+        <!-- Floating "Back to search results" pill: shown when the user
+             jumped here from a search hit. Click reopens the overlay
+             from cache (instant, no re-query). -->
+        <button id="search-back-pill" class="search-back-pill" hidden>
+          <span class="back-arrow">←</span>
+          <span class="back-label">Back to search results</span>
+          <span id="search-back-pill-query" class="back-query"></span>
+        </button>
+
         <!-- Search overlay: appears on top of whatever's in #main when the
              sidebar search input has 3+ characters. Hidden by default. -->
         <div id="search-overlay" hidden>

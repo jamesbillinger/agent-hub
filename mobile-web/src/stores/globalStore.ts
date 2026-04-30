@@ -26,6 +26,20 @@ interface GlobalState {
   pendingScrollTargetUuid: string | null;
   setPendingScrollTarget: (uuid: string | null) => void;
 
+  // Search "back" trail. When a search hit is tapped:
+  //   lastSearchQuery := the query that produced the hit list
+  //   cameFromSearch  := true
+  // ChatView shows a "Back to search" pill while cameFromSearch is true.
+  // Tapping it triggers pendingSearchOpen, which SessionsView consumes to
+  // re-open the SearchPanel pre-filled with lastSearchQuery.
+  lastSearchQuery: string | null;
+  cameFromSearch: boolean;
+  pendingSearchOpen: boolean;
+  rememberSearchQuery: (q: string) => void;
+  triggerBackToSearch: () => void;
+  consumePendingSearchOpen: () => string | null;
+  clearSearchBackTrail: () => void;
+
   // Actions
   setSessions: (sessions: Session[]) => void;
   setFolders: (folders: Folder[]) => void;
@@ -50,6 +64,19 @@ export const useGlobalStore = create<GlobalState>((set, get) => ({
   showActiveSessionsGroup: true,
   pendingScrollTargetUuid: null,
   setPendingScrollTarget: (uuid) => set({ pendingScrollTargetUuid: uuid }),
+
+  lastSearchQuery: null,
+  cameFromSearch: false,
+  pendingSearchOpen: false,
+  rememberSearchQuery: (q) => set({ lastSearchQuery: q, cameFromSearch: true }),
+  triggerBackToSearch: () => set({ pendingSearchOpen: true, cameFromSearch: false }),
+  consumePendingSearchOpen: () => {
+    const q = get().lastSearchQuery;
+    if (!get().pendingSearchOpen) return null;
+    set({ pendingSearchOpen: false });
+    return q;
+  },
+  clearSearchBackTrail: () => set({ cameFromSearch: false }),
 
   setSessions: (sessions) => {
     const sessionsMap = new Map<string, Session>();
@@ -136,7 +163,9 @@ export const useGlobalStore = create<GlobalState>((set, get) => ({
     set({ sessionStatus: statusMap });
   },
 
-  setActiveSession: (id) => set({ activeSessionId: id }),
+  // Navigation: clear cameFromSearch by default so the back-pill only
+  // shows when a search-hit handler explicitly sets it after this call.
+  setActiveSession: (id) => set({ activeSessionId: id, cameFromSearch: false }),
 
   setConnected: (connected) => set({ isConnected: connected }),
 

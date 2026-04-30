@@ -4,13 +4,15 @@ import { api, type SearchHit, type MessageContext, type ContextEntry } from '../
 
 interface SearchPanelProps {
   onClose: () => void;
+  initialQuery?: string;
 }
 
-export function SearchPanel({ onClose }: SearchPanelProps) {
+export function SearchPanel({ onClose, initialQuery }: SearchPanelProps) {
   const setActiveSession = useGlobalStore((s) => s.setActiveSession);
   const setPendingScrollTarget = useGlobalStore((s) => s.setPendingScrollTarget);
+  const rememberSearchQuery = useGlobalStore((s) => s.rememberSearchQuery);
 
-  const [query, setQuery] = useState('');
+  const [query, setQuery] = useState(initialQuery ?? '');
   const [hits, setHits] = useState<SearchHit[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -52,6 +54,9 @@ export function SearchPanel({ onClose }: SearchPanelProps) {
   const handleHitTap = (hit: SearchHit) => {
     setPendingScrollTarget(hit.uuid);
     setActiveSession(hit.session_id);
+    // Mark the back-trail AFTER setActiveSession (which clears it by default).
+    // ChatView reads cameFromSearch to decide whether to show the pill.
+    rememberSearchQuery(query.trim());
     onClose();
   };
 

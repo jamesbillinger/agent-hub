@@ -3581,6 +3581,42 @@ body.resizing-sidebar {
   border-radius: 2px;
 }
 /* ======================================================
+   Floating "Back to search results" pill
+   ====================================================== */
+.search-back-pill {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 25; /* above chat, below overlay (z=30) */
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px 5px 8px;
+  background: var(--bg-tertiary, #232323);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color, #2a2a2a);
+  border-radius: 999px;
+  font-size: 11px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  user-select: none;
+}
+.search-back-pill[hidden] { display: none; }
+.search-back-pill:hover {
+  background: var(--hover-bg, rgba(255,255,255,0.08));
+  border-color: var(--accent-blue, #4a9eff);
+}
+.search-back-pill .back-arrow { font-size: 13px; color: var(--accent-blue, #4a9eff); }
+.search-back-pill .back-query {
+  color: var(--text-dim);
+  font-family: var(--font-mono, monospace);
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ======================================================
    Search overlay (main-area takeover when sidebar search has 3+ chars)
    ====================================================== */
 #search-overlay {

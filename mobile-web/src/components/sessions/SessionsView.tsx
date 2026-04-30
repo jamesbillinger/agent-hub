@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useGlobalStore, useAuthStore } from '../../stores';
 import { websocketService } from '../../services/websocket';
 import { api } from '../../services/api';
@@ -10,6 +10,21 @@ export function SessionsView() {
   const logout = useAuthStore((s) => s.logout);
   const [showNewSessionModal, setShowNewSessionModal] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
+  const [searchInitialQuery, setSearchInitialQuery] = useState<string | undefined>(undefined);
+  const pendingSearchOpen = useGlobalStore((s) => s.pendingSearchOpen);
+  const consumePendingSearchOpen = useGlobalStore((s) => s.consumePendingSearchOpen);
+
+  // If ChatView triggered "back to search", re-open the panel pre-filled
+  // with the cached query. Subscribes specifically to pendingSearchOpen
+  // so this only fires when the flag flips.
+  useEffect(() => {
+    if (!pendingSearchOpen) return;
+    const q = consumePendingSearchOpen();
+    if (q !== null) {
+      setSearchInitialQuery(q);
+      setShowSearch(true);
+    }
+  }, [pendingSearchOpen, consumePendingSearchOpen]);
   const [newSessionName, setNewSessionName] = useState('');
   const [newSessionDir, setNewSessionDir] = useState('~/dev/');
   const [isCreating, setIsCreating] = useState(false);
@@ -48,7 +63,12 @@ export function SessionsView() {
 
   return (
     <div className="h-full flex flex-col bg-[#1a1a1a]">
-      {showSearch && <SearchPanel onClose={() => setShowSearch(false)} />}
+      {showSearch && (
+        <SearchPanel
+          onClose={() => { setShowSearch(false); setSearchInitialQuery(undefined); }}
+          initialQuery={searchInitialQuery}
+        />
+      )}
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-[#3c3c3c] pt-[env(safe-area-inset-top)]">
         <div className="flex items-center gap-2">
