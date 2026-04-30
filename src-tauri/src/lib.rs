@@ -1020,6 +1020,23 @@ fn import_orphan_jsonls() -> Result<search::ImportStats, String> {
     Ok(search::import_orphans())
 }
 
+/// Propose links between stranded sessions and unlinked JSONLs by scoring
+/// (cwd, time, name) similarity. Pure read; the UI / caller decides which
+/// proposals to accept.
+#[tauri::command]
+fn propose_session_jsonl_reconciliation() -> Result<search::ReconciliationProposal, String> {
+    Ok(search::propose_reconciliation())
+}
+
+/// Apply a previously-proposed reconciliation: re-link sessions, optionally
+/// delete unmatched stranded ones, optionally import unmatched JSONLs as new.
+#[tauri::command]
+fn apply_session_jsonl_reconciliation(
+    actions: search::ReconciliationActions,
+) -> Result<search::ReconciliationResult, String> {
+    Ok(search::apply_reconciliation(actions))
+}
+
 #[tauri::command]
 fn get_message_context(
     message_id: i64,
@@ -4496,7 +4513,9 @@ pub fn run() {
             search_messages,
             get_message_context,
             list_orphan_jsonls,
-            import_orphan_jsonls
+            import_orphan_jsonls,
+            propose_session_jsonl_reconciliation,
+            apply_session_jsonl_reconciliation
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -4569,7 +4588,9 @@ pub fn run() {
             search_messages,
             get_message_context,
             list_orphan_jsonls,
-            import_orphan_jsonls
+            import_orphan_jsonls,
+            propose_session_jsonl_reconciliation,
+            apply_session_jsonl_reconciliation
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -916,6 +916,376 @@ pub struct ImportStats {
     pub backfill: BackfillStats,
 }
 
+// =====================================================================
+//  Reconciliation: match stranded sessions ↔ unlinked JSONLs
+// =====================================================================
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StrandedSession {
+    pub session_id: String,
+    pub name: String,
+    pub working_dir: String,
+    pub created_at: Option<i64>, // unix millis
+    pub agent_type: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MatchProposal {
+    pub session_id: String,
+    pub session_name: String,
+    pub session_working_dir: String,
+    pub claude_session_id: String,
+    pub jsonl_path: String,
+    pub jsonl_home: String,
+    pub jsonl_cwd: Option<String>,
+    pub jsonl_first_ts: Option<i64>,
+    pub jsonl_first_message: Option<String>,
+    pub jsonl_message_count: u32,
+    pub score: i32,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconciliationProposal {
+    pub matches: Vec<MatchProposal>,
+    pub orphan_sessions: Vec<StrandedSession>,
+    pub orphan_jsonls: Vec<OrphanJsonl>,
+}
+
+/// A session is "stranded" when:
+/// - claude_session_id is NULL/empty, OR
+/// - claude_session_id is set but no on-disk JSONL exists for it
+///   (i.e. not present in the current scan_all_jsonl_files() output).
+/// Only claude-json sessions are considered (other agent types don't
+/// have JSONL history).
+fn list_stranded_sessions(known_jsonl_ids: &std::collections::HashSet<String>) -> Vec<StrandedSession> {
+    let conn = crate::DB_CONNECTION.lock();
+    let mut stmt = match conn.prepare(
+        "SELECT id, name, working_dir, created_at, claude_session_id, agent_type
+         FROM sessions
+         WHERE agent_type = 'claude-json' OR agent_type = 'claude'",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?, // ISO datetime string
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    rows.into_iter()
+        .filter(|(_, _, _, _, claude_id, _)| {
+            match claude_id {
+                None => true,
+                Some(s) if s.is_empty() => true,
+                Some(s) => !known_jsonl_ids.contains(s),
+            }
+        })
+        .map(|(id, name, working_dir, created_at, _claude_id, agent_type)| {
+            let created_ms = chrono::DateTime::parse_from_rfc3339(&created_at)
+                .ok()
+                .map(|dt| dt.timestamp_millis());
+            StrandedSession {
+                session_id: id,
+                name,
+                working_dir,
+                created_at: created_ms,
+                agent_type,
+            }
+        })
+        .collect()
+}
+
+/// Score a (session, jsonl) pair. Higher = better match.
+/// Components:
+///   +120 cwd exact match (after tilde expansion)
+///   + 60 cwd prefix match
+///   + 40 |jsonl.first_ts - session.created_at| < 1 hour
+///   + 20 |jsonl.first_ts - session.created_at| < 1 day
+///   +  5 |jsonl.first_ts - session.created_at| < 30 days
+///   + 25 session.name appears in first message (case-insensitive)
+///   + 25 first 30 chars of first message appears in session.name
+fn score_match(session: &StrandedSession, jsonl: &OrphanJsonl) -> (i32, Vec<String>) {
+    let mut score = 0;
+    let mut reasons = Vec::new();
+
+    let session_cwd = shellexpand::tilde(&session.working_dir).to_string();
+    let jsonl_cwd_opt = jsonl.cwd.as_deref().map(|c| shellexpand::tilde(c).to_string());
+
+    if let Some(ref jsonl_cwd) = jsonl_cwd_opt {
+        if jsonl_cwd == &session_cwd {
+            score += 120;
+            reasons.push("cwd matches".to_string());
+        } else if jsonl_cwd.starts_with(&session_cwd) || session_cwd.starts_with(jsonl_cwd) {
+            score += 60;
+            reasons.push("cwd prefix matches".to_string());
+        }
+    }
+
+    if let (Some(s_ts), Some(j_ts)) = (session.created_at, jsonl.first_ts) {
+        let diff = (s_ts - j_ts).abs();
+        if diff < 60 * 60 * 1000 {
+            score += 40;
+            reasons.push("created within an hour".to_string());
+        } else if diff < 24 * 60 * 60 * 1000 {
+            score += 20;
+            reasons.push("created same day".to_string());
+        } else if diff < 30 * 24 * 60 * 60 * 1000 {
+            score += 5;
+        }
+    }
+
+    if let Some(ref first_msg) = jsonl.first_message_preview {
+        let lower_msg = first_msg.to_lowercase();
+        let lower_name = session.name.to_lowercase();
+        if !lower_name.is_empty() && lower_name.len() > 3 && lower_msg.contains(&lower_name) {
+            score += 25;
+            reasons.push("name appears in first message".to_string());
+        }
+        let prefix: String = first_msg.chars().take(30).collect();
+        let prefix_lower = prefix.trim().to_lowercase();
+        if prefix_lower.len() > 4 && lower_name.contains(&prefix_lower) {
+            score += 25;
+            reasons.push("first message appears in name".to_string());
+        }
+    }
+
+    (score, reasons)
+}
+
+/// Build proposals for review by the UI. No DB writes.
+pub fn propose_reconciliation() -> ReconciliationProposal {
+    // 1) Snapshot: which claude_session_ids exist on disk.
+    let all_jsonls: Vec<(String, std::path::PathBuf)> = scan_all_jsonl_files();
+    let known_ids: std::collections::HashSet<String> = all_jsonls
+        .iter()
+        .filter_map(|(_, p)| p.file_stem().and_then(|s| s.to_str()).map(String::from))
+        .collect();
+
+    // 2) Stranded sessions = sessions whose JSONL we don't have.
+    let stranded = list_stranded_sessions(&known_ids);
+
+    // 3) Unlinked JSONLs already known.
+    let orphans = list_orphan_jsonls();
+
+    // 4) Score every (session, jsonl) pair, drop pairs with score < 50.
+    const MIN_SCORE: i32 = 50;
+    let mut candidates: Vec<(i32, Vec<String>, usize, usize)> = Vec::new();
+    for (si, sess) in stranded.iter().enumerate() {
+        for (oi, orphan) in orphans.iter().enumerate() {
+            let (s, reasons) = score_match(sess, orphan);
+            if s >= MIN_SCORE {
+                candidates.push((s, reasons, si, oi));
+            }
+        }
+    }
+    // Highest-scoring first; greedy assignment so each end pairs at most once.
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut session_used = vec![false; stranded.len()];
+    let mut jsonl_used = vec![false; orphans.len()];
+    let mut matches: Vec<MatchProposal> = Vec::new();
+
+    for (score, reasons, si, oi) in candidates {
+        if session_used[si] || jsonl_used[oi] {
+            continue;
+        }
+        let sess = &stranded[si];
+        let orphan = &orphans[oi];
+        matches.push(MatchProposal {
+            session_id: sess.session_id.clone(),
+            session_name: sess.name.clone(),
+            session_working_dir: sess.working_dir.clone(),
+            claude_session_id: orphan.claude_session_id.clone(),
+            jsonl_path: orphan.file_path.clone(),
+            jsonl_home: orphan.claude_home.clone(),
+            jsonl_cwd: orphan.cwd.clone(),
+            jsonl_first_ts: orphan.first_ts,
+            jsonl_first_message: orphan.first_message_preview.clone(),
+            jsonl_message_count: orphan.message_count,
+            score,
+            reasons,
+        });
+        session_used[si] = true;
+        jsonl_used[oi] = true;
+    }
+
+    let orphan_sessions: Vec<StrandedSession> = stranded
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !session_used[*i])
+        .map(|(_, s)| s)
+        .collect();
+    let orphan_jsonls: Vec<OrphanJsonl> = orphans
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !jsonl_used[*i])
+        .map(|(_, o)| o)
+        .collect();
+
+    ReconciliationProposal {
+        matches,
+        orphan_sessions,
+        orphan_jsonls,
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ReconciliationActions {
+    pub accept_matches: Vec<AcceptedMatch>,
+    pub delete_session_ids: Vec<String>,
+    pub import_jsonl_ids: Vec<String>, // claude_session_ids to import
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AcceptedMatch {
+    pub session_id: String,
+    pub claude_session_id: String,
+    pub claude_home: String,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct ReconciliationResult {
+    pub matched: u32,
+    pub deleted: u32,
+    pub imported: u32,
+    pub errors: u32,
+    pub backfill_rows: u64,
+}
+
+/// Apply user-approved actions. Writes are gated to the items the user
+/// explicitly confirmed (so you can uncheck a borderline match in the UI).
+pub fn apply_reconciliation(actions: ReconciliationActions) -> ReconciliationResult {
+    let mut result = ReconciliationResult::default();
+
+    // 1) Matches: re-link stranded session rows.
+    {
+        let conn = crate::DB_CONNECTION.lock();
+        for m in &actions.accept_matches {
+            // Update sessions.claude_session_id; if the session has env_vars
+            // missing CLAUDE_CONFIG_DIR but the JSONL came from a non-default
+            // home, set it so resume goes to the right place.
+            let updated = conn.execute(
+                "UPDATE sessions SET claude_session_id = ?1 WHERE id = ?2",
+                params![m.claude_session_id, m.session_id],
+            );
+            match updated {
+                Ok(_) => result.matched += 1,
+                Err(e) => {
+                    eprintln!("[search] match update failed for {}: {}", m.session_id, e);
+                    result.errors += 1;
+                    continue;
+                }
+            }
+            if m.claude_home != "~/.claude" {
+                let _ = conn.execute(
+                    "UPDATE sessions
+                     SET env_vars = COALESCE(env_vars, '{}')
+                     WHERE id = ?1 AND (env_vars IS NULL OR env_vars NOT LIKE '%CLAUDE_CONFIG_DIR%')",
+                    [&m.session_id],
+                );
+                let env_json = format!(
+                    r#"{{"CLAUDE_CONFIG_DIR":"{}"}}"#,
+                    m.claude_home.replace('"', "\\\"")
+                );
+                let _ = conn.execute(
+                    "UPDATE sessions SET env_vars = ?2
+                     WHERE id = ?1 AND (env_vars IS NULL OR env_vars = '' OR env_vars = '{}')",
+                    params![m.session_id, env_json],
+                );
+            }
+        }
+    }
+
+    // 2) Deletes: stranded sessions the user agreed to drop.
+    {
+        let conn = crate::DB_CONNECTION.lock();
+        for sid in &actions.delete_session_ids {
+            delete_search_data_for_session(&conn, sid);
+            match conn.execute("DELETE FROM sessions WHERE id = ?1", [sid]) {
+                Ok(_) => result.deleted += 1,
+                Err(e) => {
+                    eprintln!("[search] delete session failed for {}: {}", sid, e);
+                    result.errors += 1;
+                }
+            }
+        }
+    }
+
+    // 3) Imports: build OrphanJsonl-style sessions for selected unlinked files.
+    if !actions.import_jsonl_ids.is_empty() {
+        let want: std::collections::HashSet<String> = actions.import_jsonl_ids.iter().cloned().collect();
+        let orphans = list_orphan_jsonls();
+        let folder_id = ensure_imported_folder();
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let cmd = "claude --print --verbose --input-format stream-json --output-format stream-json --dangerously-skip-permissions";
+        let conn = crate::DB_CONNECTION.lock();
+        for orphan in orphans.into_iter().filter(|o| want.contains(&o.claude_session_id)) {
+            let session_id = uuid::Uuid::new_v4().to_string();
+            let name = orphan
+                .first_message_preview
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| match orphan.first_ts {
+                    Some(ts) => format!(
+                        "Imported {}",
+                        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ts)
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_else(|| "session".into())
+                    ),
+                    None => "Imported session".into(),
+                });
+            let working_dir = orphan
+                .cwd
+                .clone()
+                .unwrap_or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "/".into()));
+            let created_at = orphan
+                .first_ts
+                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_else(|| now_iso.clone());
+            let env_vars: Option<String> = if orphan.claude_home != "~/.claude" {
+                Some(format!(
+                    r#"{{"CLAUDE_CONFIG_DIR":"{}"}}"#,
+                    orphan.claude_home.replace('"', "\\\"")
+                ))
+            } else {
+                None
+            };
+            let res = conn.execute(
+                "INSERT INTO sessions
+                  (id, name, agent_type, command, working_dir, created_at,
+                   claude_session_id, sort_order, folder_id, env_vars)
+                 VALUES (?1, ?2, 'claude-json', ?3, ?4, ?5, ?6, 99999, ?7, ?8)",
+                params![
+                    session_id, name, cmd, working_dir, created_at,
+                    orphan.claude_session_id, folder_id, env_vars
+                ],
+            );
+            if res.is_ok() {
+                result.imported += 1;
+            } else {
+                result.errors += 1;
+            }
+        }
+    }
+
+    // 4) Run backfill: pass-1 direct claude_session_id matches will pick up
+    //    every newly-linked file, and the parentUuid walk covers resume
+    //    ancestors automatically.
+    let bf = run_backfill();
+    result.backfill_rows = bf.rows_inserted;
+    result
+}
+
 /// JSONL files we know about that aren't linked to a session yet.
 pub fn list_orphan_jsonls() -> Vec<OrphanJsonl> {
     let known: std::collections::HashSet<String> = {
