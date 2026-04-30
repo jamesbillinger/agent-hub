@@ -3380,9 +3380,12 @@ async function renderSearchOverlay(hits: SearchHit[], query: string) {
 
     const headerEl = document.createElement("div");
     headerEl.className = "search-session-header";
+    const latestTs = group.hits.reduce((m, h) => (h.ts > m ? h.ts : m), 0);
+    const latest = latestTs > 0 ? formatHitDate(latestTs) : null;
     headerEl.innerHTML = `
       <span class="session-name">${escapeHtml(group.name)}</span>
       <span class="session-folder">${escapeHtml(formatFolderBreadcrumb(sessionId))}</span>
+      ${latest ? `<span class="session-last" title="Latest match in this session: ${escapeHtml(latest.full)}">latest match: ${escapeHtml(latest.short)}</span>` : ""}
       <span class="session-hits">${group.hits.length} hit${group.hits.length === 1 ? "" : "s"}</span>
     `;
     groupEl.appendChild(headerEl);
@@ -3415,11 +3418,15 @@ function buildHitCard(hit: SearchHit): HTMLElement {
   card.dataset.uuid = hit.uuid;
   card.dataset.needsContext = "1";
 
+  const date = hit.ts > 0 ? formatHitDate(hit.ts) : null;
+  const sessionName = hit.session_name || "(unnamed)";
+
   card.innerHTML = `
     <div class="search-result-meta">
       <span class="search-result-role ${hit.role}">${hit.role}</span>
-      ${hit.ts > 0 ? `<span class="search-result-time">${escapeHtml(formatRelativeTime(hit.ts))}</span>` : ""}
-      <span class="search-result-turn">turn ${"…"}</span>
+      <span class="search-result-session" title="${escapeHtml(sessionName)}">${escapeHtml(sessionName)}</span>
+      ${date ? `<span class="search-result-time" title="${escapeHtml(date.full)}">${escapeHtml(date.short)}</span>` : ""}
+      <span class="search-result-turn">msg …</span>
     </div>
     <div class="search-result-context">
       <div class="search-result-line is-hit">
@@ -3441,8 +3448,8 @@ async function hydrateCardContext(card: HTMLElement) {
   try {
     ctx = await invoke<MessageContext>("get_message_context", {
       messageId,
-      before: 2,
-      after: 2,
+      before: 3,
+      after: 3,
     });
   } catch {
     card.removeAttribute("data-needs-context");
@@ -3450,20 +3457,22 @@ async function hydrateCardContext(card: HTMLElement) {
   }
 
   // Replace the single hit-line with a stack of context + the highlighted hit.
+  // Tool_result-only `user` records (the CLI's wire format for tool output
+  // sent back to Claude) are dropped — they're noise, not user-visible
+  // content. The hit itself is always shown.
   const ctxEl = card.querySelector(".search-result-context") as HTMLElement | null;
   if (!ctxEl) return;
   ctxEl.innerHTML = "";
-  const all = [
+  const items = [
     ...ctx.before.map((e) => ({ entry: e, hit: false })),
     ...(ctx.hit ? [{ entry: ctx.hit, hit: true }] : []),
     ...ctx.after.map((e) => ({ entry: e, hit: false })),
-  ];
-  for (const { entry, hit } of all) {
+  ].filter(({ entry, hit }) => hit || isMeaningfulContextEntry(entry));
+
+  for (const { entry, hit } of items) {
     const line = document.createElement("div");
     line.className = `search-result-line${hit ? " is-hit" : ""}`;
-    const text = entry.role === "user" || entry.role === "assistant"
-      ? extractRenderableText(entry.message)
-      : extractRenderableText(entry.message);
+    const text = extractRenderableText(entry.message);
     line.innerHTML = `
       <div class="line-role">${escapeHtml(entry.role)}</div>
       <div class="line-text">${escapeHtml(text || "(empty)")}</div>
@@ -3471,18 +3480,25 @@ async function hydrateCardContext(card: HTMLElement) {
     ctxEl.appendChild(line);
   }
 
-  // Update the turn label using the hit's turn_index.
   if (ctx.hit) {
-    const turnLabel = card.querySelector(".search-result-turn");
-    if (turnLabel) turnLabel.textContent = `turn ${ctx.hit.turn_index}`;
+    const msgLabel = card.querySelector(".search-result-turn");
+    if (msgLabel) msgLabel.textContent = `msg ${ctx.hit.turn_index}`;
   }
   card.removeAttribute("data-needs-context");
+}
+
+/// True if this context entry contains text the user would care to see.
+/// Filters out user records that are pure tool_result wrappers, attachments
+/// without any human-readable surface, etc.
+function isMeaningfulContextEntry(entry: ContextEntry): boolean {
+  const text = extractRenderableText(entry.message);
+  if (text.trim().length > 0) return true;
+  return false;
 }
 
 // Pull a short, plain-text representation from a JSONL message Value.
 function extractRenderableText(msg: Record<string, unknown>): string {
   if (!msg || typeof msg !== "object") return "";
-  // user.message.content can be string or array of blocks
   const inner = (msg as any).message;
   if (typeof inner?.content === "string") return inner.content;
   if (Array.isArray(inner?.content)) {
@@ -3490,15 +3506,45 @@ function extractRenderableText(msg: Record<string, unknown>): string {
     for (const block of inner.content) {
       if (block?.type === "text" && typeof block.text === "string") parts.push(block.text);
       else if (block?.type === "thinking" && typeof block.thinking === "string") parts.push(block.thinking);
-      else if (block?.type === "tool_use") parts.push(`[${block.name ?? "tool_use"}]`);
-      else if (block?.type === "tool_result") parts.push("[tool_result]");
+      else if (block?.type === "tool_use") {
+        const name = block.name ?? "tool_use";
+        const input = block.input ? JSON.stringify(block.input) : "";
+        parts.push(input ? `${name}: ${input.length > 80 ? input.slice(0, 80) + "…" : input}` : name);
+      }
+      // tool_result and image blocks are intentionally skipped — they're
+      // either noise (tool_result) or non-text (image). If a user record
+      // is *only* tool_results, the caller filters it out entirely.
     }
     return parts.join("\n");
   }
-  // system.content
   if (typeof (msg as any).content === "string") return (msg as any).content;
   if ((msg as any).attachment?.type) return `[${(msg as any).attachment.type}]`;
   return "";
+}
+
+// Format a unix-millis timestamp for search results: shows enough info
+// to tell you *when* without being verbose. Hover for full ISO.
+function formatHitDate(ms: number): { short: string; full: string } {
+  const d = new Date(ms);
+  const now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  const isYesterday = d.toDateString() === yesterday.toDateString();
+  const sameYear = d.getFullYear() === now.getFullYear();
+  const time = d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+
+  let short: string;
+  if (sameDay) short = `today ${time}`;
+  else if (isYesterday) short = `yesterday ${time}`;
+  else if ((now.getTime() - ms) < 7 * 86_400_000) {
+    short = `${d.toLocaleDateString(undefined, { weekday: "short" })} ${time}`;
+  } else if (sameYear) {
+    short = d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  } else {
+    short = d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  }
+  return { short, full: d.toLocaleString() };
 }
 
 function formatFolderBreadcrumb(sessionId: string): string {

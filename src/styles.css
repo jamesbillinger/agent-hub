@@ -3649,6 +3649,9 @@ body.resizing-sidebar {
   background: var(--bg-secondary, #1f1f1f);
 }
 .search-session-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
   display: flex;
   align-items: baseline;
   gap: 8px;
@@ -3664,8 +3667,14 @@ body.resizing-sidebar {
   font-weight: 400;
   font-size: 11px;
 }
-.search-session-header .session-hits {
+.search-session-header .session-last {
+  color: var(--text-dim);
+  font-weight: 400;
+  font-size: 11px;
   margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+.search-session-header .session-hits {
   color: var(--text-dim);
   font-weight: 400;
   font-size: 11px;
@@ -3685,6 +3694,20 @@ body.resizing-sidebar {
   font-size: 10px;
   color: var(--text-dim);
   margin-bottom: 6px;
+}
+.search-result-session {
+  color: var(--text-secondary, #a0a0a0);
+  font-weight: 600;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.search-result-time {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  cursor: help;
 }
 .search-result-role {
   text-transform: uppercase;
