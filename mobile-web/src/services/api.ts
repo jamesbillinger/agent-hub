@@ -96,6 +96,19 @@ class ApiService {
     return this.request(`/api/sessions/${sessionId}/buffer`);
   }
 
+  // Search context — hit's neighbors for the rich result card
+  async getMessageContext(params: {
+    message_id: number;
+    before?: number;
+    after?: number;
+  }): Promise<MessageContext> {
+    const qs = new URLSearchParams();
+    qs.set('message_id', String(params.message_id));
+    if (params.before !== undefined) qs.set('before', String(params.before));
+    if (params.after !== undefined) qs.set('after', String(params.after));
+    return this.request(`/api/search/context?${qs.toString()}`);
+  }
+
   // Search
   async searchMessages(params: {
     q: string;
@@ -128,6 +141,20 @@ export interface SearchHit {
   ts: number;
   snippet: string;
   rank: number;
+}
+
+export interface ContextEntry {
+  uuid: string;
+  role: string;
+  ts: number;
+  turn_index: number;
+  message: Record<string, unknown>;
+}
+
+export interface MessageContext {
+  before: ContextEntry[];
+  hit: ContextEntry | null;
+  after: ContextEntry[];
 }
 
 export const api = new ApiService();

@@ -1021,6 +1021,15 @@ fn import_orphan_jsonls() -> Result<search::ImportStats, String> {
 }
 
 #[tauri::command]
+fn get_message_context(
+    message_id: i64,
+    before: Option<u32>,
+    after: Option<u32>,
+) -> Result<search::MessageContext, String> {
+    search::get_message_context(message_id, before.unwrap_or(3), after.unwrap_or(3))
+}
+
+#[tauri::command]
 fn search_messages(
     query: String,
     session_id: Option<String>,
@@ -3033,6 +3042,28 @@ async fn api_search_messages(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct ContextQueryParams {
+    message_id: i64,
+    before: Option<u32>,
+    after: Option<u32>,
+}
+
+async fn api_search_context(
+    _headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<ContextQueryParams>,
+) -> impl IntoResponse {
+    match search::get_message_context(
+        params.message_id,
+        params.before.unwrap_or(3),
+        params.after.unwrap_or(3),
+    ) {
+        Ok(ctx) => Json(ctx).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e})))
+            .into_response(),
+    }
+}
+
 async fn api_search_stats(_headers: axum::http::HeaderMap) -> impl IntoResponse {
     Json(search::get_stats()).into_response()
 }
@@ -4124,6 +4155,7 @@ fn start_web_server() {
                 .route("/api/mcp/result", axum::routing::post(api_mcp_result))
                 // Search
                 .route("/api/search/messages", get(api_search_messages))
+                .route("/api/search/context", get(api_search_context))
                 .route("/api/search/stats", get(api_search_stats))
                 .route("/api/search/rebuild", axum::routing::post(api_search_rebuild))
                 .layer(CorsLayer::permissive());
@@ -4220,6 +4252,7 @@ fn start_web_server() {
                 .route("/api/ws/mobile", get(ws_mobile_handler))
                 // Search
                 .route("/api/search/messages", get(api_search_messages))
+                .route("/api/search/context", get(api_search_context))
                 .route("/api/search/stats", get(api_search_stats))
                 .route("/api/search/rebuild", axum::routing::post(api_search_rebuild))
                 .layer(CorsLayer::permissive());
@@ -4461,6 +4494,7 @@ pub fn run() {
             rebuild_search_index,
             get_search_index_stats,
             search_messages,
+            get_message_context,
             list_orphan_jsonls,
             import_orphan_jsonls
         ])
@@ -4533,6 +4567,7 @@ pub fn run() {
             rebuild_search_index,
             get_search_index_stats,
             search_messages,
+            get_message_context,
             list_orphan_jsonls,
             import_orphan_jsonls
         ])

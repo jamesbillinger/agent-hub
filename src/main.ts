@@ -913,6 +913,19 @@ document.addEventListener("DOMContentLoaded", async () => {
     scheduleContentSearch(sessionSearchInput.value);
   });
 
+  // Esc inside the search box clears the query and hides the overlay,
+  // restoring whatever session was active underneath.
+  sessionSearchInput.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      if (sessionSearchInput.value) {
+        sessionSearchInput.value = "";
+        sessionSearchInput.dispatchEvent(new Event("input", { bubbles: true }));
+      } else {
+        sessionSearchInput.blur();
+      }
+    }
+  });
+
   sortSelect.addEventListener("change", () => {
     currentSort = sortSelect.value as SortOption;
     // Update session list class for drag handle visibility
@@ -3252,8 +3265,14 @@ function getFilteredAndSortedSessions(): Session[] {
 }
 
 // ----------------------------------------------------------------------
-//  Content search (FTS hits across all sessions, rendered under the
-//  session list). The fast title filter remains in renderSessionList.
+//  Search overlay
+//
+//  When the sidebar search input has 3+ chars we show a full-area
+//  overlay above whatever's in #main. It lists every FTS hit grouped
+//  by session, with before/after context lines fetched per-hit. Clicking
+//  a card opens the session and scrolls to the matching message.
+//  Clearing the input (or pressing Esc) just hides the overlay — the
+//  underlying chat stays mounted, so you're back exactly where you were.
 // ----------------------------------------------------------------------
 
 interface SearchHit {
@@ -3270,105 +3289,223 @@ interface SearchHit {
   rank: number;
 }
 
-let contentSearchTimer: number | null = null;
-let contentSearchSeq = 0;
+interface ContextEntry {
+  uuid: string;
+  role: string;
+  ts: number;
+  turn_index: number;
+  message: Record<string, unknown>;
+}
+interface MessageContext {
+  before: ContextEntry[];
+  hit: ContextEntry | null;
+  after: ContextEntry[];
+}
+
+let searchOverlayTimer: number | null = null;
+let searchOverlaySeq = 0;
 let pendingScrollTargetUuid: string | null = null;
 
 function scheduleContentSearch(rawQuery: string) {
-  if (contentSearchTimer !== null) {
-    window.clearTimeout(contentSearchTimer);
-    contentSearchTimer = null;
+  if (searchOverlayTimer !== null) {
+    window.clearTimeout(searchOverlayTimer);
+    searchOverlayTimer = null;
   }
   const query = rawQuery.trim();
-  // Hide the section for empty / very short queries; keeps title filter
-  // feeling instant and avoids hitting the index for noise.
+  const overlay = document.getElementById("search-overlay");
+  if (!overlay) return;
+
   if (query.length < 3) {
-    renderContentMatches(null, "");
+    overlay.hidden = true;
     return;
   }
-  const seq = ++contentSearchSeq;
-  contentSearchTimer = window.setTimeout(async () => {
-    contentSearchTimer = null;
+
+  // Show overlay immediately with a loading state, then fill in hits.
+  overlay.hidden = false;
+  setOverlayQuery(query, null);
+  showOverlayMessage('<div class="search-result-loading">Searching…</div>');
+
+  const seq = ++searchOverlaySeq;
+  searchOverlayTimer = window.setTimeout(async () => {
+    searchOverlayTimer = null;
     try {
-      const hits = await invoke<SearchHit[]>("search_messages", { query, limit: 50 });
-      // Drop late responses that lost the race to a newer query.
-      if (seq !== contentSearchSeq) return;
-      renderContentMatches(hits, query);
+      const hits = await invoke<SearchHit[]>("search_messages", { query, limit: 100 });
+      if (seq !== searchOverlaySeq) return;
+      await renderSearchOverlay(hits, query);
     } catch (err) {
-      console.error("search_messages failed:", err);
-      if (seq === contentSearchSeq) renderContentMatches([], query);
+      if (seq !== searchOverlaySeq) return;
+      showOverlayMessage(
+        `<div class="search-result-empty">Search error: ${escapeHtml(String(err))}</div>`
+      );
     }
   }, 220);
 }
 
-function renderContentMatches(hits: SearchHit[] | null, query: string) {
-  const container = document.getElementById("content-matches");
-  if (!container) return;
-  const list = container.querySelector(".content-matches-list") as HTMLElement;
-  const count = container.querySelector(".content-matches-count") as HTMLElement;
-  if (!list || !count) return;
+function setOverlayQuery(query: string, count: number | null) {
+  const q = document.getElementById("search-overlay-query");
+  const c = document.getElementById("search-overlay-count");
+  if (q) q.textContent = `"${query}"`;
+  if (c) c.textContent = count == null ? "" : `· ${count} match${count === 1 ? "" : "es"}`;
+}
 
-  if (!hits) {
-    container.hidden = true;
-    list.innerHTML = "";
-    count.textContent = "";
-    return;
-  }
+function showOverlayMessage(html: string) {
+  const list = document.getElementById("search-overlay-results");
+  if (list) list.innerHTML = html;
+}
+
+async function renderSearchOverlay(hits: SearchHit[], query: string) {
+  const list = document.getElementById("search-overlay-results");
+  if (!list) return;
+  setOverlayQuery(query, hits.length);
 
   if (hits.length === 0) {
-    container.hidden = false;
-    count.textContent = "0";
-    list.innerHTML = `<div class="content-match" style="cursor:default;color:var(--text-dim);font-style:italic">No matches for "${escapeHtml(query)}"</div>`;
+    showOverlayMessage(`<div class="search-result-empty">No matches for "${escapeHtml(query)}"</div>`);
     return;
   }
 
-  container.hidden = false;
-  count.textContent = String(hits.length);
-
-  const frag = document.createDocumentFragment();
+  // Group hits by session (preserves rank order within each group).
+  const groups = new Map<string, { name: string; hits: SearchHit[] }>();
   for (const hit of hits) {
-    const row = document.createElement("div");
-    row.className = "content-match";
-    row.dataset.sessionId = hit.session_id;
-    row.dataset.uuid = hit.uuid;
+    const key = hit.session_id;
+    if (!groups.has(key)) {
+      groups.set(key, { name: hit.session_name || "(unnamed)", hits: [] });
+    }
+    groups.get(key)!.hits.push(hit);
+  }
 
-    const meta = document.createElement("div");
-    meta.className = "content-match-meta";
+  list.innerHTML = "";
+  for (const [sessionId, group] of groups) {
+    const groupEl = document.createElement("div");
+    groupEl.className = "search-session-group";
 
-    const sessName = document.createElement("span");
-    sessName.className = "content-match-session";
-    sessName.textContent = hit.session_name || "(unnamed)";
-    meta.appendChild(sessName);
+    const headerEl = document.createElement("div");
+    headerEl.className = "search-session-header";
+    headerEl.innerHTML = `
+      <span class="session-name">${escapeHtml(group.name)}</span>
+      <span class="session-folder">${escapeHtml(formatFolderBreadcrumb(sessionId))}</span>
+      <span class="session-hits">${group.hits.length} hit${group.hits.length === 1 ? "" : "s"}</span>
+    `;
+    groupEl.appendChild(headerEl);
 
-    const role = document.createElement("span");
-    role.className = `content-match-role ${hit.role}`;
-    role.textContent = hit.role;
-    meta.appendChild(role);
-
-    if (hit.ts > 0) {
-      const ago = document.createElement("span");
-      ago.className = "content-match-ago";
-      ago.textContent = formatRelativeTime(hit.ts);
-      meta.appendChild(ago);
+    for (const hit of group.hits) {
+      groupEl.appendChild(buildHitCard(hit));
     }
 
-    row.appendChild(meta);
-
-    const snip = document.createElement("div");
-    snip.className = "content-match-snippet";
-    // The server already wraps matches in <mark>...</mark>; everything else
-    // is escaped on the server side from a plain-text column.
-    snip.innerHTML = hit.snippet;
-    row.appendChild(snip);
-
-    row.addEventListener("click", () => {
-      jumpToSearchHit(hit);
-    });
-
-    frag.appendChild(row);
+    list.appendChild(groupEl);
   }
-  list.innerHTML = "";
-  list.appendChild(frag);
+
+  // Lazy-fetch context for each card as it scrolls into view.
+  const cards = list.querySelectorAll<HTMLElement>(".search-result-card[data-needs-context]");
+  const io = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      const el = entry.target as HTMLElement;
+      io.unobserve(el);
+      void hydrateCardContext(el);
+    }
+  }, { rootMargin: "200px" });
+  cards.forEach((c) => io.observe(c));
+}
+
+function buildHitCard(hit: SearchHit): HTMLElement {
+  const card = document.createElement("div");
+  card.className = "search-result-card";
+  card.dataset.messageId = String(hit.message_id);
+  card.dataset.sessionId = hit.session_id;
+  card.dataset.uuid = hit.uuid;
+  card.dataset.needsContext = "1";
+
+  card.innerHTML = `
+    <div class="search-result-meta">
+      <span class="search-result-role ${hit.role}">${hit.role}</span>
+      ${hit.ts > 0 ? `<span class="search-result-time">${escapeHtml(formatRelativeTime(hit.ts))}</span>` : ""}
+      <span class="search-result-turn">turn ${"…"}</span>
+    </div>
+    <div class="search-result-context">
+      <div class="search-result-line is-hit">
+        <div class="line-role">${hit.role}</div>
+        <div class="line-text">${hit.snippet}</div>
+      </div>
+    </div>
+    <div class="search-result-actions">Open in session →</div>
+  `;
+
+  card.addEventListener("click", () => jumpToSearchHit(hit));
+  return card;
+}
+
+async function hydrateCardContext(card: HTMLElement) {
+  const messageId = Number(card.dataset.messageId);
+  if (!messageId) return;
+  let ctx: MessageContext;
+  try {
+    ctx = await invoke<MessageContext>("get_message_context", {
+      messageId,
+      before: 2,
+      after: 2,
+    });
+  } catch {
+    card.removeAttribute("data-needs-context");
+    return;
+  }
+
+  // Replace the single hit-line with a stack of context + the highlighted hit.
+  const ctxEl = card.querySelector(".search-result-context") as HTMLElement | null;
+  if (!ctxEl) return;
+  ctxEl.innerHTML = "";
+  const all = [
+    ...ctx.before.map((e) => ({ entry: e, hit: false })),
+    ...(ctx.hit ? [{ entry: ctx.hit, hit: true }] : []),
+    ...ctx.after.map((e) => ({ entry: e, hit: false })),
+  ];
+  for (const { entry, hit } of all) {
+    const line = document.createElement("div");
+    line.className = `search-result-line${hit ? " is-hit" : ""}`;
+    const text = entry.role === "user" || entry.role === "assistant"
+      ? extractRenderableText(entry.message)
+      : extractRenderableText(entry.message);
+    line.innerHTML = `
+      <div class="line-role">${escapeHtml(entry.role)}</div>
+      <div class="line-text">${escapeHtml(text || "(empty)")}</div>
+    `;
+    ctxEl.appendChild(line);
+  }
+
+  // Update the turn label using the hit's turn_index.
+  if (ctx.hit) {
+    const turnLabel = card.querySelector(".search-result-turn");
+    if (turnLabel) turnLabel.textContent = `turn ${ctx.hit.turn_index}`;
+  }
+  card.removeAttribute("data-needs-context");
+}
+
+// Pull a short, plain-text representation from a JSONL message Value.
+function extractRenderableText(msg: Record<string, unknown>): string {
+  if (!msg || typeof msg !== "object") return "";
+  // user.message.content can be string or array of blocks
+  const inner = (msg as any).message;
+  if (typeof inner?.content === "string") return inner.content;
+  if (Array.isArray(inner?.content)) {
+    const parts: string[] = [];
+    for (const block of inner.content) {
+      if (block?.type === "text" && typeof block.text === "string") parts.push(block.text);
+      else if (block?.type === "thinking" && typeof block.thinking === "string") parts.push(block.thinking);
+      else if (block?.type === "tool_use") parts.push(`[${block.name ?? "tool_use"}]`);
+      else if (block?.type === "tool_result") parts.push("[tool_result]");
+    }
+    return parts.join("\n");
+  }
+  // system.content
+  if (typeof (msg as any).content === "string") return (msg as any).content;
+  if ((msg as any).attachment?.type) return `[${(msg as any).attachment.type}]`;
+  return "";
+}
+
+function formatFolderBreadcrumb(sessionId: string): string {
+  const session = sessions.get(sessionId);
+  if (!session?.folderId) return "";
+  const folder = folders.get(session.folderId);
+  return folder ? `· ${folder.name}` : "";
 }
 
 function formatRelativeTime(ms: number): string {
@@ -3383,10 +3520,13 @@ function formatRelativeTime(ms: number): string {
 
 async function jumpToSearchHit(hit: SearchHit) {
   pendingScrollTargetUuid = hit.uuid;
+  // Hide the overlay first so the chat is visible underneath. The sidebar
+  // search input keeps its value (handy for picking another result later).
+  const overlay = document.getElementById("search-overlay");
+  if (overlay) overlay.hidden = true;
   if (activeSessionId !== hit.session_id) {
     await switchToSession(hit.session_id);
   }
-  // The session may need a moment to render its history; retry briefly.
   scrollToPendingTarget();
 }
 
@@ -3394,8 +3534,6 @@ function scrollToPendingTarget() {
   if (!pendingScrollTargetUuid) return;
   const uuid = pendingScrollTargetUuid;
   const tryFind = (attemptsLeft: number) => {
-    // Scope to .chat-message — sidebar .content-match rows also carry
-    // data-uuid (so we know what to jump to) and would otherwise match.
     const el = document.querySelector(
       `.chat-message[data-uuid="${CSS.escape(uuid)}"]`
     ) as HTMLElement | null;
@@ -3403,7 +3541,6 @@ function scrollToPendingTarget() {
       pendingScrollTargetUuid = null;
       el.scrollIntoView({ behavior: "smooth", block: "center" });
       el.classList.remove("scroll-target-flash");
-      // Force reflow so the animation re-fires when re-targeting same uuid
       void el.offsetWidth;
       el.classList.add("scroll-target-flash");
       return;

@@ -76,13 +76,6 @@
         </div>
         <div id="active-sessions"></div>
         <div id="session-list"></div>
-        <div id="content-matches" class="content-matches" hidden>
-          <div class="content-matches-header">
-            <span class="content-matches-label">Content matches</span>
-            <span class="content-matches-count"></span>
-          </div>
-          <div class="content-matches-list"></div>
-        </div>
       </div>
 
       <!-- Sidebar Resize Handle -->
@@ -105,6 +98,18 @@
           <h2>No Active Session</h2>
           <p>Create a new session to get started with Claude or another agent.</p>
           <button id="empty-new-session-btn">Create Session</button>
+        </div>
+        <!-- Search overlay: appears on top of whatever's in #main when the
+             sidebar search input has 3+ characters. Hidden by default. -->
+        <div id="search-overlay" hidden>
+          <div class="search-overlay-header">
+            <span class="search-overlay-label">Searching history for</span>
+            <span id="search-overlay-query" class="search-overlay-query"></span>
+            <span id="search-overlay-count" class="search-overlay-count"></span>
+            <span class="search-overlay-spacer"></span>
+            <span class="search-overlay-hint">Esc to close</span>
+          </div>
+          <div id="search-overlay-results" class="search-overlay-results"></div>
         </div>
       </div>
     </div>

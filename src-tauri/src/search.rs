@@ -1240,6 +1240,153 @@ fn sanitize_fts_query(raw: &str) -> String {
         .join(" AND ")
 }
 
+/// Read a single JSONL line at `file_offset` from `file_path` and return
+/// it as parsed JSON. Used by the rich search-results view to fetch the
+/// full record for a hit without re-loading the whole session.
+pub fn read_message_at(file_path: &str, file_offset: i64) -> Result<Value, String> {
+    let mut file = File::open(file_path).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(file_offset.max(0) as u64))
+        .map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(file);
+    let mut buf = String::new();
+    let n = reader.read_line(&mut buf).map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("offset past end of file".into());
+    }
+    serde_json::from_str::<Value>(buf.trim()).map_err(|e| format!("parse: {}", e))
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContextEntry {
+    pub uuid: String,
+    pub role: String,
+    pub ts: i64,
+    pub turn_index: i32, // ordinal in this session, by ts
+    pub message: Value,  // the full JSONL record
+}
+
+#[derive(Debug, Serialize)]
+pub struct MessageContext {
+    pub before: Vec<ContextEntry>,
+    pub hit: Option<ContextEntry>,
+    pub after: Vec<ContextEntry>,
+}
+
+/// Pull the matching message plus N before / N after from the same
+/// session, ordered by ts. Each entry includes its full JSONL line so
+/// the renderer can show real content, not just the snippet.
+pub fn get_message_context(message_id: i64, before: u32, after: u32) -> Result<MessageContext, String> {
+    let conn = crate::DB_CONNECTION.lock();
+    // Anchor: the hit row.
+    let (anchor_session, anchor_ts, anchor_uuid, anchor_path, anchor_offset, anchor_role): (
+        String, i64, String, String, i64, String,
+    ) = conn
+        .query_row(
+            "SELECT session_id, ts, uuid, file_path, file_offset, role
+             FROM message_index WHERE id = ?1",
+            [message_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .map_err(|e| format!("hit not found: {}", e))?;
+
+    // Fetch the bracketing rows in one query each.
+    let mut before_stmt = conn
+        .prepare(
+            "SELECT id, ts, uuid, role, file_path, file_offset
+             FROM message_index
+             WHERE session_id = ?1 AND (ts < ?2 OR (ts = ?2 AND id < ?3))
+             ORDER BY ts DESC, id DESC LIMIT ?4",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut after_stmt = conn
+        .prepare(
+            "SELECT id, ts, uuid, role, file_path, file_offset
+             FROM message_index
+             WHERE session_id = ?1 AND (ts > ?2 OR (ts = ?2 AND id > ?3))
+             ORDER BY ts ASC, id ASC LIMIT ?4",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let row_to_entry = |id: i64, ts: i64, uuid: String, role: String, path: String, offset: i64, turn_index: i32| -> ContextEntry {
+        let _ = id;
+        let message = read_message_at(&path, offset).unwrap_or(Value::Null);
+        ContextEntry { uuid, role, ts, turn_index, message }
+    };
+
+    // Approximate turn_index = row count up to this id within the session.
+    // Cheap to compute since session_id+ts is indexed.
+    let turn_for = |id: i64, ts: i64| -> i32 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM message_index
+             WHERE session_id = ?1 AND (ts < ?2 OR (ts = ?2 AND id <= ?3))",
+            params![&anchor_session, ts, id],
+            |r| r.get::<_, i32>(0),
+        )
+        .unwrap_or(0)
+    };
+
+    let mut before_rows: Vec<ContextEntry> = before_stmt
+        .query_map(
+            params![&anchor_session, anchor_ts, message_id, before as i64],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .map(|(id, ts, uuid, role, path, offset)| {
+            let ti = turn_for(id, ts);
+            row_to_entry(id, ts, uuid, role, path, offset, ti)
+        })
+        .collect();
+    before_rows.reverse(); // oldest → newest for display
+
+    let after_rows: Vec<ContextEntry> = after_stmt
+        .query_map(
+            params![&anchor_session, anchor_ts, message_id, after as i64],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .map(|(id, ts, uuid, role, path, offset)| {
+            let ti = turn_for(id, ts);
+            row_to_entry(id, ts, uuid, role, path, offset, ti)
+        })
+        .collect();
+
+    let hit_turn = turn_for(message_id, anchor_ts);
+    let hit_message = read_message_at(&anchor_path, anchor_offset).unwrap_or(Value::Null);
+    let hit = ContextEntry {
+        uuid: anchor_uuid,
+        role: anchor_role,
+        ts: anchor_ts,
+        turn_index: hit_turn,
+        message: hit_message,
+    };
+
+    Ok(MessageContext {
+        before: before_rows,
+        hit: Some(hit),
+        after: after_rows,
+    })
+}
+
 pub fn search_messages(query: &str, filters: SearchFilters) -> Result<Vec<SearchHit>, String> {
     let q = sanitize_fts_query(query);
     if q.is_empty() {
