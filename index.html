@@ -64,7 +64,10 @@
           </div>
         </div>
         <div id="sidebar-controls">
-          <input type="text" id="session-search" placeholder="Search sessions and content..." />
+          <div class="session-search-wrap">
+            <input type="text" id="session-search" placeholder="Search sessions and content..." />
+            <button type="button" id="session-search-clear" class="session-search-clear" hidden aria-label="Clear search">×</button>
+          </div>
           <div id="sort-controls">
             <select id="sort-select">
               <option value="custom">Custom Order</option>

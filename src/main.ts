@@ -914,6 +914,16 @@ document.addEventListener("DOMContentLoaded", async () => {
     // Any new typing dismisses the back pill — the user is starting a
     // new search, not returning to an old one.
     hideSearchBackPill();
+    // Show/hide the inline clear button based on whether there's text.
+    const clearBtn = document.getElementById("session-search-clear");
+    if (clearBtn) clearBtn.hidden = sessionSearchInput.value.length === 0;
+  });
+
+  // Inline X button on the search input — same effect as Esc / clearing manually.
+  document.getElementById("session-search-clear")?.addEventListener("click", () => {
+    sessionSearchInput.value = "";
+    sessionSearchInput.dispatchEvent(new Event("input", { bubbles: true }));
+    sessionSearchInput.focus();
   });
   // Refocusing the search input means the user is heading back to look
   // at results; the explicit pill is no longer needed.
@@ -3838,9 +3848,22 @@ function createSessionItem(session: Session, index: number): HTMLElement {
   item.addEventListener("click", (e) => {
     const target = e.target as HTMLElement;
     if (!target.classList.contains("close-btn") && !target.classList.contains("drag-handle")) {
+      // If the user picks a session while the search overlay is up, that's a
+      // navigation OUT of the overlay — hide it so the chat is visible. Keep
+      // the search input value so they can return via the Back pill (if there
+      // are cached results) or by reopening the overlay manually.
+      const overlay = document.getElementById("search-overlay");
+      const cameFromOverlay = overlay && !overlay.hidden;
+      if (overlay) overlay.hidden = true;
+
       switchToSession(session.id);
-      // Manual sidebar nav supersedes any prior "came from search" state.
-      hideSearchBackPill();
+
+      if (cameFromOverlay && lastSearchSnapshot) {
+        showSearchBackPill();
+      } else {
+        // Manual nav (no active search) — clear any stale back-trail.
+        hideSearchBackPill();
+      }
     }
   });
 
