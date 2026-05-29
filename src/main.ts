@@ -4667,7 +4667,7 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
         const settingsDefault = appSettings.default_model ? `Settings default: \`${appSettings.default_model}\`` : "No settings default (using CLI config)";
         addChatMessage(sessionId, {
           type: "system",
-          result: `**Current model:** ${currentModel}\n${settingsDefault}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`opus\` (1M), \`opus-200k\`, \`sonnet\`, \`haiku\`, \`opus-4.6\`, \`sonnet-4.6\`, \`default\`\n**Full IDs:** \`claude-opus-4-7[1m]\`, \`claude-opus-4-7\`, \`claude-sonnet-4-7\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
+          result: `**Current model:** ${currentModel}\n${settingsDefault}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`opus\` (1M), \`opus-200k\`, \`sonnet\`, \`haiku\`, \`opus-4.7\`, \`opus-4.6\`, \`sonnet-4.6\`, \`default\`\n**Full IDs:** \`claude-opus-4-8[1m]\`, \`claude-opus-4-8\`, \`claude-sonnet-4-7\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
         });
         return true;
       }
@@ -4697,10 +4697,11 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
 
       // Map shorthand names to model IDs
       const MODEL_ALIASES: Record<string, string> = {
-        opus: "claude-opus-4-7[1m]",
-        "opus-1m": "claude-opus-4-7[1m]",
-        "opus-200k": "claude-opus-4-7",
+        opus: "claude-opus-4-8[1m]",
+        "opus-1m": "claude-opus-4-8[1m]",
+        "opus-200k": "claude-opus-4-8",
         sonnet: "claude-sonnet-4-7",
+        "opus-4.7": "claude-opus-4-7[1m]",
         "opus-4.6": "claude-opus-4-6[1m]",
         "sonnet-4.6": "claude-sonnet-4-6",
         haiku: "claude-haiku-4-5-20251001",
@@ -6129,6 +6130,8 @@ function formatTokens(tokens: number): string {
 
 // Max context by model (conservative estimates for display)
 const MODEL_MAX_CONTEXT: Record<string, number> = {
+  "claude-opus-4-8[1m]": 1000000,
+  "claude-opus-4-8": 200000,
   "claude-opus-4-7[1m]": 1000000,
   "claude-opus-4-7": 200000,
   "claude-sonnet-4-7": 200000,
