@@ -312,6 +312,7 @@ interface ChatSession {
   pastedTextBlocks: PastedTextBlock[]; // Pasted text blocks (like CC)
   pasteBlockCounter: number; // Counter for paste block IDs
   cwd: string; // Working directory from init message
+  model?: string; // Active model ID resolved by the CLI (from init message)
   // Streaming stats
   toolUseCount: number;
   streamingTokens: number;
@@ -4662,12 +4663,21 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
       }
 
       if (!args) {
-        // Show current model and usage
-        const currentModel = session.command.match(/--model\s+'([^']*)'/)?.[1] || session.command.match(/--model\s+(\S+)/)?.[1] || "default (from CLI config)";
+        // Show current model and usage.
+        // Prefer the model the CLI actually resolved (from the init JSON message);
+        // fall back to whatever --model is on the launch command.
+        const requestedModel = session.command.match(/--model\s+'([^']*)'/)?.[1] || session.command.match(/--model\s+(\S+)/)?.[1];
+        const activeModel = chatSession.model || requestedModel || "default (from CLI config)";
+        const maxContext = MODEL_MAX_CONTEXT[activeModel] || MODEL_MAX_CONTEXT.default;
+        const contextLine = `**Context window:** ${formatTokens(maxContext)} tokens`;
+        // If the resolved model differs from the requested one, surface that (e.g. Fable 5 fallback to Opus on a refusal)
+        const mismatchLine = chatSession.model && requestedModel && chatSession.model !== requestedModel
+          ? `\n_(requested \`${requestedModel}\`, CLI resolved \`${chatSession.model}\`)_`
+          : "";
         const settingsDefault = appSettings.default_model ? `Settings default: \`${appSettings.default_model}\`` : "No settings default (using CLI config)";
         addChatMessage(sessionId, {
           type: "system",
-          result: `**Current model:** ${currentModel}\n${settingsDefault}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`opus\` (1M), \`opus-200k\`, \`sonnet\`, \`haiku\`, \`opus-4.7\`, \`opus-4.6\`, \`sonnet-4.6\`, \`default\`\n**Full IDs:** \`claude-opus-4-8[1m]\`, \`claude-opus-4-8\`, \`claude-sonnet-4-7\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
+          result: `**Current model:** ${activeModel}${mismatchLine}\n${contextLine}\n${settingsDefault}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`fable\` (1M), \`opus\` (1M), \`opus-200k\`, \`sonnet\`, \`haiku\`, \`opus-4.7\`, \`opus-4.6\`, \`sonnet-4.6\`, \`default\`\n**Full IDs:** \`claude-fable-5\`, \`claude-opus-4-8[1m]\`, \`claude-opus-4-8\`, \`claude-sonnet-4-7\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
         });
         return true;
       }
@@ -4697,6 +4707,10 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
 
       // Map shorthand names to model IDs
       const MODEL_ALIASES: Record<string, string> = {
+        fable: "claude-fable-5",
+        "fable-5": "claude-fable-5",
+        mythos: "claude-mythos-5",
+        "mythos-5": "claude-mythos-5",
         opus: "claude-opus-4-8[1m]",
         "opus-1m": "claude-opus-4-8[1m]",
         "opus-200k": "claude-opus-4-8",
@@ -5854,6 +5868,10 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
     if (message.cwd) {
       chatSession.cwd = message.cwd;
     }
+    // Store the model the CLI actually resolved (authoritative source for /model)
+    if (message.model) {
+      chatSession.model = message.model;
+    }
 
     // Insert or update init message at the very beginning
     const existingInit = chatSession.messagesEl.querySelector(".init-details") as HTMLElement;
@@ -6130,6 +6148,8 @@ function formatTokens(tokens: number): string {
 
 // Max context by model (conservative estimates for display)
 const MODEL_MAX_CONTEXT: Record<string, number> = {
+  "claude-fable-5": 1000000,
+  "claude-mythos-5": 1000000,
   "claude-opus-4-8[1m]": 1000000,
   "claude-opus-4-8": 200000,
   "claude-opus-4-7[1m]": 1000000,
@@ -6152,7 +6172,9 @@ const AUTOCOMPACT_BUFFER = 45000;
  * Update the context percentage indicator for a chat session
  */
 function updateContextIndicator(chatSession: ChatSession, model?: string): void {
-  const maxContext = MODEL_MAX_CONTEXT[model || "default"] || MODEL_MAX_CONTEXT.default;
+  // Prefer an explicit model, else the model the CLI resolved for this session.
+  const activeModel = model || chatSession.model || "default";
+  const maxContext = MODEL_MAX_CONTEXT[activeModel] || MODEL_MAX_CONTEXT.default;
   const usableContext = maxContext - AUTOCOMPACT_BUFFER;
 
   const totalTokens = chatSession.totalInputTokens;
