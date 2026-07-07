@@ -3415,54 +3415,64 @@ async fn api_webhook_teams(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "empty message"}))).into_response();
     }
 
-    let short: String = message.chars().take(50).collect();
-    let suffix = if message.chars().count() > 50 { "…" } else { "" };
-    let session_name = format!("Issue: {}{}", short, suffix);
-    let session_id = generate_token();
+    const TEAMS_SESSION_NAME: &str = "Teams Issues";
     let command = "claude --print --verbose --input-format stream-json --output-format stream-json --dangerously-skip-permissions".to_string();
     let working_dir = std::env::var("AGENT_HUB_WEBHOOK_WORKDIR").unwrap_or_else(|_| "~/dev/pplsi".to_string());
-
-    let min_sort_order = load_sessions()
-        .map(|sessions| sessions.iter().map(|s| s.sort_order).min().unwrap_or(0))
-        .unwrap_or(0);
-
-    let session = SessionData {
-        id: session_id.clone(),
-        name: session_name,
-        agent_type: "claude-json".to_string(),
-        command: command.clone(),
-        working_dir: working_dir.clone(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        claude_session_id: None,
-        sort_order: min_sort_order - 1,
-        folder_id: None,
-        env_vars: None,
-    };
-
-    if let Err(e) = save_session(session.clone()) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response();
-    }
 
     let app = { APP_HANDLE.lock().clone() };
     let Some(app) = app else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "App not initialized").into_response();
     };
 
-    let _ = app.emit("remote-session-created", serde_json::json!({
-        "session": {
-            "id": session.id,
-            "name": session.name,
-            "agent_type": session.agent_type,
-            "working_dir": session.working_dir,
+    // Find or create the persistent Teams Issues session
+    let session_id = match load_sessions() {
+        Ok(sessions) => sessions.into_iter().find(|s| s.name == TEAMS_SESSION_NAME).map(|s| s.id),
+        Err(_) => None,
+    };
+
+    let session_id = match session_id {
+        Some(id) => id,
+        None => {
+            let id = generate_token();
+            let min_sort_order = load_sessions()
+                .map(|sessions| sessions.iter().map(|s| s.sort_order).min().unwrap_or(0))
+                .unwrap_or(0);
+            let session = SessionData {
+                id: id.clone(),
+                name: TEAMS_SESSION_NAME.to_string(),
+                agent_type: "claude-json".to_string(),
+                command: command.clone(),
+                working_dir: working_dir.clone(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                claude_session_id: None,
+                sort_order: min_sort_order - 1,
+                folder_id: None,
+                env_vars: None,
+            };
+            if let Err(e) = save_session(session.clone()) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response();
+            }
+            let _ = app.emit("remote-session-created", serde_json::json!({
+                "session": {
+                    "id": session.id,
+                    "name": session.name,
+                    "agent_type": session.agent_type,
+                    "working_dir": session.working_dir,
+                }
+            }));
+            id
         }
-    }));
+    };
 
-    if let Err(e) = spawn_json_process(app.clone(), session_id.clone(), command, Some(working_dir), None, Some(false), None) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response();
+    // Start the process if not already running
+    let is_running = { JSON_BROADCASTERS.lock().contains_key(&session_id) };
+    if !is_running {
+        if let Err(e) = spawn_json_process(app.clone(), session_id.clone(), command, Some(working_dir), None, Some(false), None) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response();
+        }
+        let _ = app.emit("remote-session-started", session_id.clone());
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
-    let _ = app.emit("remote-session-started", session_id.clone());
-
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let link_line = if link.is_empty() { String::new() } else { format!("\nLink: {}", link) };
     let text = format!(
