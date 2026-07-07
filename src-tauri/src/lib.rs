@@ -3386,6 +3386,97 @@ async fn api_start_session(
     }))).into_response()
 }
 
+// POST /api/webhook/teams - Receive a Teams issue and create a claude-json session
+//
+// Payload: { "from": "...", "message": "...", "link": "..." }
+// Auth:    X-Webhook-Secret header checked against AGENT_HUB_WEBHOOK_SECRET env var (if set)
+#[cfg(not(target_os = "ios"))]
+async fn api_webhook_teams(
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let secret = std::env::var("AGENT_HUB_WEBHOOK_SECRET").unwrap_or_default();
+    if !secret.is_empty() {
+        let provided = headers
+            .get("x-webhook-secret")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if provided != secret {
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid secret"}))).into_response();
+        }
+    }
+
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+    let from_name = payload.get("from").and_then(|v| v.as_str()).unwrap_or("Unknown");
+    let message = payload.get("message").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let link = payload.get("link").and_then(|v| v.as_str()).unwrap_or("");
+
+    if message.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "empty message"}))).into_response();
+    }
+
+    let short: String = message.chars().take(50).collect();
+    let suffix = if message.chars().count() > 50 { "…" } else { "" };
+    let session_name = format!("Issue: {}{}", short, suffix);
+    let session_id = generate_token();
+    let command = "claude --print --verbose --input-format stream-json --output-format stream-json --dangerously-skip-permissions".to_string();
+    let working_dir = std::env::var("AGENT_HUB_WEBHOOK_WORKDIR").unwrap_or_else(|_| "~/dev/pplsi".to_string());
+
+    let min_sort_order = load_sessions()
+        .map(|sessions| sessions.iter().map(|s| s.sort_order).min().unwrap_or(0))
+        .unwrap_or(0);
+
+    let session = SessionData {
+        id: session_id.clone(),
+        name: session_name,
+        agent_type: "claude-json".to_string(),
+        command: command.clone(),
+        working_dir: working_dir.clone(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        claude_session_id: None,
+        sort_order: min_sort_order - 1,
+        folder_id: None,
+        env_vars: None,
+    };
+
+    if let Err(e) = save_session(session.clone()) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response();
+    }
+
+    let app = { APP_HANDLE.lock().clone() };
+    let Some(app) = app else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "App not initialized").into_response();
+    };
+
+    let _ = app.emit("remote-session-created", serde_json::json!({
+        "session": {
+            "id": session.id,
+            "name": session.name,
+            "agent_type": session.agent_type,
+            "working_dir": session.working_dir,
+        }
+    }));
+
+    if let Err(e) = spawn_json_process(app.clone(), session_id.clone(), command, Some(working_dir), None, Some(false), None) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response();
+    }
+    let _ = app.emit("remote-session-started", session_id.clone());
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let link_line = if link.is_empty() { String::new() } else { format!("\nLink: {}", link) };
+    let prompt = format!(
+        "New issue from Teams support channel.\n\nFrom: {}{}\n---\n{}\n---\n\nPlease research this issue:\n1. Check relevant code, recent deploys, and known bugs for context\n2. Determine the right team/person to assign it to\n3. Use /jira to create a ticket with a clear summary, steps to reproduce, and your findings\n4. Post a brief summary of what you found and why you assigned it that way\n",
+        from_name, link_line, message
+    );
+
+    if let Err(e) = write_to_process(session_id.clone(), prompt) {
+        eprintln!("[webhook] write_to_process failed for {}: {}", session_id, e);
+    }
+
+    Json(serde_json::json!({"status": "ok", "session_id": session_id})).into_response()
+}
+
 // POST /api/sessions/{id}/interrupt - Interrupt a running session
 #[cfg(not(target_os = "ios"))]
 async fn api_interrupt_session(
@@ -4164,6 +4255,7 @@ fn start_web_server() {
                 .route("/api/sessions/:session_id/buffer", get(api_get_buffer))
                 .route("/api/sessions/:session_id/start", axum::routing::post(api_start_session))
                 .route("/api/sessions/:session_id/interrupt", axum::routing::post(api_interrupt_session))
+                .route("/api/webhook/teams", axum::routing::post(api_webhook_teams))
                 .route("/api/ws/:session_id", get(ws_handler))
                 .route("/api/ws/status", get(ws_status_handler))
                 .route("/api/ws/mobile", get(ws_mobile_handler))
