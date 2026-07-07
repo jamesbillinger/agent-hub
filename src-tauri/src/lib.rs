@@ -3465,10 +3465,14 @@ async fn api_webhook_teams(
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let link_line = if link.is_empty() { String::new() } else { format!("\nLink: {}", link) };
-    let prompt = format!(
-        "New issue from Teams support channel.\n\nFrom: {}{}\n---\n{}\n---\n\nPlease research this issue:\n1. Check relevant code, recent deploys, and known bugs for context\n2. Determine the right team/person to assign it to\n3. Use /jira to create a ticket with a clear summary, steps to reproduce, and your findings\n4. Post a brief summary of what you found and why you assigned it that way\n",
+    let text = format!(
+        "New issue from Teams support channel.\n\nFrom: {}{}\n---\n{}\n---\n\nPlease research this issue:\n1. Check relevant code, recent deploys, and known bugs for context\n2. Determine the right team/person to assign it to\n3. Use /jira to create a ticket with a clear summary, steps to reproduce, and your findings\n4. Post a brief summary of what you found and why you assigned it that way",
         from_name, link_line, message
     );
+    let prompt = serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": text }
+    }).to_string() + "\n";
 
     if let Err(e) = write_to_process(session_id.clone(), prompt) {
         eprintln!("[webhook] write_to_process failed for {}: {}", session_id, e);
