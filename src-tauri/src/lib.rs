@@ -544,6 +544,18 @@ struct FolderData {
     collapsed: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ScheduledJob {
+    id: String,
+    name: String,
+    cron_expr: String,
+    prompt: String,
+    enabled: bool,
+    last_run_at: Option<String>,
+    next_run_at: String,
+    created_at: String,
+}
+
 /// Claude JSON message content item (text, tool_use, tool_result, image)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClaudeContentItem {
@@ -763,6 +775,21 @@ fn run_db_migrations() {
         [],
     ).expect("Failed to create recently_closed table");
 
+    // Create scheduled_jobs table for cron-based prompt scheduling
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS scheduled_jobs (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            cron_expr TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            last_run_at TEXT,
+            next_run_at TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )",
+        [],
+    ).expect("Failed to create scheduled_jobs table");
+
     // Search: schema-versioned migrations for message_index + session_files +
     // FTS. Drops/recreates if SCHEMA_VERSION has changed.
     search::run_search_migrations(&conn);
@@ -813,6 +840,37 @@ fn delete_paired_device_db(token: &str) -> Result<(), String> {
     let conn = DB_CONNECTION.lock();
     conn.execute("DELETE FROM paired_devices WHERE token = ?1", params![token])
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn load_scheduled_jobs() -> Result<Vec<ScheduledJob>, String> {
+    let conn = DB_CONNECTION.lock();
+    let mut stmt = conn.prepare(
+        "SELECT id, name, cron_expr, prompt, enabled, last_run_at, next_run_at, created_at FROM scheduled_jobs ORDER BY created_at ASC"
+    ).map_err(|e| e.to_string())?;
+    let jobs = stmt.query_map([], |row| {
+        Ok(ScheduledJob {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            cron_expr: row.get(2)?,
+            prompt: row.get(3)?,
+            enabled: row.get::<_, i64>(4)? != 0,
+            last_run_at: row.get(5)?,
+            next_run_at: row.get(6)?,
+            created_at: row.get(7)?,
+        })
+    }).map_err(|e| e.to_string())?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|e| e.to_string())?;
+    Ok(jobs)
+}
+
+fn save_scheduled_job(job: &ScheduledJob) -> Result<(), String> {
+    let conn = DB_CONNECTION.lock();
+    conn.execute(
+        "INSERT OR REPLACE INTO scheduled_jobs (id, name, cron_expr, prompt, enabled, last_run_at, next_run_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![job.id, job.name, job.cron_expr, job.prompt, job.enabled as i64, job.last_run_at, job.next_run_at, job.created_at],
+    ).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -889,6 +947,21 @@ fn generate_token() -> String {
         .unwrap()
         .as_nanos();
     format!("{:x}{:x}", seed, seed.wrapping_mul(0x5DEECE66D))
+}
+
+fn next_run_for_expr(expr: &str) -> Result<String, String> {
+    use std::str::FromStr;
+    let fields: Vec<&str> = expr.trim().split_whitespace().collect();
+    let seven_field = match fields.len() {
+        5 => format!("0 {} *", expr.trim()),
+        7 => expr.trim().to_string(),
+        _ => return Err(format!("Expected 5-field cron expression, got {} fields", fields.len())),
+    };
+    let schedule = cron::Schedule::from_str(&seven_field)
+        .map_err(|e| format!("Invalid cron expression: {}", e))?;
+    schedule.upcoming(chrono::Utc).next()
+        .map(|t| t.to_rfc3339())
+        .ok_or_else(|| "No upcoming run time".to_string())
 }
 
 // Check if a token is valid
@@ -1067,6 +1140,55 @@ fn search_messages(
             offset,
         },
     )
+}
+
+// --- Scheduled job commands ---
+
+#[tauri::command]
+fn list_scheduled_jobs() -> Result<Vec<ScheduledJob>, String> {
+    load_scheduled_jobs()
+}
+
+#[tauri::command]
+fn create_scheduled_job(name: String, cron_expr: String, prompt: String) -> Result<ScheduledJob, String> {
+    let next_run_at = next_run_for_expr(&cron_expr)?;
+    let job = ScheduledJob {
+        id: generate_token(),
+        name,
+        cron_expr,
+        prompt,
+        enabled: true,
+        last_run_at: None,
+        next_run_at,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    save_scheduled_job(&job)?;
+    Ok(job)
+}
+
+#[tauri::command]
+fn update_scheduled_job(id: String, name: Option<String>, cron_expr: Option<String>, prompt: Option<String>, enabled: Option<bool>) -> Result<ScheduledJob, String> {
+    let mut jobs = load_scheduled_jobs()?;
+    let job = jobs.iter_mut().find(|j| j.id == id)
+        .ok_or_else(|| "Job not found".to_string())?;
+    if let Some(n) = name { job.name = n; }
+    if let Some(p) = prompt { job.prompt = p; }
+    if let Some(e) = enabled { job.enabled = e; }
+    if let Some(expr) = cron_expr {
+        job.next_run_at = next_run_for_expr(&expr)?;
+        job.cron_expr = expr;
+    }
+    let job_clone = job.clone();
+    save_scheduled_job(&job_clone)?;
+    Ok(job_clone)
+}
+
+#[tauri::command]
+fn delete_scheduled_job(id: String) -> Result<(), String> {
+    let conn = DB_CONNECTION.lock();
+    conn.execute("DELETE FROM scheduled_jobs WHERE id = ?1", [&id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // --- Folder commands ---
@@ -3558,6 +3680,166 @@ async fn api_interrupt_session(
     }))).into_response()
 }
 
+// ============== Scheduler ==============
+
+#[cfg(not(target_os = "ios"))]
+fn fire_job(job: &ScheduledJob) {
+    let app = { APP_HANDLE.lock().clone() };
+    let Some(app) = app else { return; };
+
+    let command = "claude --print --verbose --input-format stream-json --output-format stream-json --dangerously-skip-permissions".to_string();
+    let working_dir = std::env::var("AGENT_HUB_WEBHOOK_WORKDIR").unwrap_or_else(|_| "~/dev/pplsi".to_string());
+    let session_name = format!("[Scheduled] {}", job.name);
+
+    // Find or create dedicated session
+    let session_id = match load_sessions() {
+        Ok(sessions) => sessions.into_iter().find(|s| s.name == session_name).map(|s| s.id),
+        Err(_) => None,
+    };
+
+    let session_id = match session_id {
+        Some(id) => id,
+        None => {
+            let id = generate_token();
+            let min_sort_order = load_sessions()
+                .map(|sessions| sessions.iter().map(|s| s.sort_order).min().unwrap_or(0))
+                .unwrap_or(0);
+            let session = SessionData {
+                id: id.clone(),
+                name: session_name.clone(),
+                agent_type: "claude-json".to_string(),
+                command: command.clone(),
+                working_dir: working_dir.clone(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                claude_session_id: None,
+                sort_order: min_sort_order - 1,
+                folder_id: None,
+                env_vars: None,
+            };
+            if save_session(session.clone()).is_err() { return; }
+            let _ = app.emit("remote-session-created", serde_json::json!({
+                "session": { "id": &id, "name": &session_name, "agent_type": "claude-json", "working_dir": &working_dir }
+            }));
+            id
+        }
+    };
+
+    // Start if not running (will resume previous Claude session if claude_session_id is set)
+    let is_running = { JSON_BROADCASTERS.lock().contains_key(&session_id) };
+    if !is_running {
+        // Load session to get claude_session_id for resuming
+        let session = load_sessions().ok()
+            .and_then(|sessions| sessions.into_iter().find(|s| s.id == session_id));
+        let claude_session_id = session.as_ref().and_then(|s| s.claude_session_id.clone());
+        let should_resume = claude_session_id.is_some();
+        if spawn_json_process(app.clone(), session_id.clone(), command, Some(working_dir), claude_session_id, Some(should_resume), None).is_err() {
+            return;
+        }
+        let _ = app.emit("remote-session-started", session_id.clone());
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+
+    // Send prompt as stream-json
+    let prompt_json = serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": &job.prompt }
+    }).to_string() + "\n";
+
+    if let Err(e) = write_to_process(session_id.clone(), prompt_json) {
+        eprintln!("[scheduler] write_to_process failed for job '{}': {}", job.name, e);
+    }
+
+    // Update last_run_at and next_run_at
+    let mut updated = job.clone();
+    updated.last_run_at = Some(chrono::Utc::now().to_rfc3339());
+    updated.next_run_at = next_run_for_expr(&job.cron_expr).unwrap_or_else(|_| {
+        (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339()
+    });
+    let _ = save_scheduled_job(&updated);
+}
+
+#[cfg(not(target_os = "ios"))]
+fn start_scheduler() {
+    std::thread::spawn(|| {
+        // Wait 30s before first check so app finishes initializing
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        loop {
+            let now = chrono::Utc::now();
+            if let Ok(jobs) = load_scheduled_jobs() {
+                for job in jobs {
+                    if !job.enabled { continue; }
+                    let due = chrono::DateTime::parse_from_rfc3339(&job.next_run_at)
+                        .map(|t| t.with_timezone(&chrono::Utc))
+                        .map(|t| t <= now)
+                        .unwrap_or(false);
+                    if due {
+                        let job_clone = job.clone();
+                        std::thread::spawn(move || fire_job(&job_clone));
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    });
+}
+
+// ============================================
+// Schedule HTTP API handlers
+// ============================================
+
+async fn api_list_schedules(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    if let Some(err) = check_auth(&headers) { return err.into_response(); }
+    match load_scheduled_jobs() {
+        Ok(jobs) => Json(serde_json::json!(jobs)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+async fn api_create_schedule(headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>) -> impl IntoResponse {
+    if let Some(err) = check_auth(&headers) { return err.into_response(); }
+    let name = match body.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "name required"}))).into_response(),
+    };
+    let cron_expr = match body.get("cron_expr").and_then(|v| v.as_str()) {
+        Some(c) => c.to_string(),
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "cron_expr required"}))).into_response(),
+    };
+    let prompt = match body.get("prompt").and_then(|v| v.as_str()) {
+        Some(p) => p.to_string(),
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "prompt required"}))).into_response(),
+    };
+    let next_run_at = match next_run_for_expr(&cron_expr) {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    };
+    let job = ScheduledJob { id: generate_token(), name, cron_expr, prompt, enabled: true, last_run_at: None, next_run_at, created_at: chrono::Utc::now().to_rfc3339() };
+    match save_scheduled_job(&job) {
+        Ok(()) => Json(serde_json::json!(job)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+async fn api_update_schedule(headers: axum::http::HeaderMap, Path(id): Path<String>, Json(body): Json<serde_json::Value>) -> impl IntoResponse {
+    if let Some(err) = check_auth(&headers) { return err.into_response(); }
+    let name = body.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let cron_expr = body.get("cron_expr").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let prompt = body.get("prompt").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let enabled = body.get("enabled").and_then(|v| v.as_bool());
+    match update_scheduled_job(id, name, cron_expr, prompt, enabled) {
+        Ok(job) => Json(serde_json::json!(job)).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+async fn api_delete_schedule(headers: axum::http::HeaderMap, Path(id): Path<String>) -> impl IntoResponse {
+    if let Some(err) = check_auth(&headers) { return err.into_response(); }
+    match delete_scheduled_job(id) {
+        Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
 // POST /api/mcp/execute - Execute JS in the webview and return result
 // This allows external MCP bridges to control the UI via HTTP
 #[cfg(not(target_os = "ios"))]
@@ -4281,6 +4563,8 @@ fn start_web_server() {
                 .route("/api/search/context", get(api_search_context))
                 .route("/api/search/stats", get(api_search_stats))
                 .route("/api/search/rebuild", axum::routing::post(api_search_rebuild))
+                .route("/api/schedules", get(api_list_schedules).post(api_create_schedule))
+                .route("/api/schedules/:id", axum::routing::patch(api_update_schedule).delete(api_delete_schedule))
                 .layer(CorsLayer::permissive());
 
             // Try ports starting from WEB_PORT_BASE until we find one available
@@ -4378,6 +4662,8 @@ fn start_web_server() {
                 .route("/api/search/context", get(api_search_context))
                 .route("/api/search/stats", get(api_search_stats))
                 .route("/api/search/rebuild", axum::routing::post(api_search_rebuild))
+                .route("/api/schedules", get(api_list_schedules).post(api_create_schedule))
+                .route("/api/schedules/:id", axum::routing::patch(api_update_schedule).delete(api_delete_schedule))
                 .layer(CorsLayer::permissive());
 
             // Try ports starting from WEB_PORT_BASE until we find one available
@@ -4506,6 +4792,9 @@ fn setup_app(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // Start web server for remote access
     start_web_server();
 
+    // Start cron scheduler for scheduled jobs
+    start_scheduler();
+
     // Clean up orphaned processes from previous app instance
     // We can't reattach to them (no stdin/stdout handles), so kill them
     std::thread::spawn(|| {
@@ -4581,6 +4870,10 @@ pub fn run() {
             kill_pty,
             spawn_json_process,
             write_to_process,
+            list_scheduled_jobs,
+            create_scheduled_job,
+            update_scheduled_job,
+            delete_scheduled_job,
             interrupt_json_process,
             kill_json_process,
             load_sessions,
@@ -4662,6 +4955,10 @@ pub fn run() {
             // spawn_pty, write_pty, resize_pty, kill_pty
             load_sessions,
             save_session,
+            list_scheduled_jobs,
+            create_scheduled_job,
+            update_scheduled_job,
+            delete_scheduled_job,
             delete_session,
             update_session_claude_id,
             list_claude_sessions,

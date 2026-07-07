@@ -3856,3 +3856,67 @@ body.resizing-sidebar {
   100% { background: transparent; }
 }
 
+.settings-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.settings-section-header h3 {
+  margin: 0;
+}
+.scheduled-jobs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.scheduled-job-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  background: var(--bg-secondary, #1e1e1e);
+  border-radius: 6px;
+  gap: 12px;
+}
+.job-info {
+  flex: 1;
+  min-width: 0;
+}
+.job-name {
+  font-weight: 500;
+  font-size: 13px;
+}
+.job-meta {
+  font-size: 11px;
+  color: var(--text-muted, #888);
+  margin-top: 2px;
+}
+.job-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.job-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  cursor: pointer;
+  color: var(--text-muted, #888);
+}
+.danger-btn {
+  background: none;
+  border: 1px solid #c0392b;
+  color: #c0392b;
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.danger-btn:hover {
+  background: #c0392b;
+  color: white;
+}
+

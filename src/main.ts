@@ -856,6 +856,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   isMobileLayout = checkMobileLayout();
   window.addEventListener("resize", updateMobileLayout);
   initMobileMenuInfo();
+  initScheduleUI();
 
   // Mobile header event listeners
   document.getElementById("mobile-back-btn")?.addEventListener("click", navigateBackToList);
@@ -6941,6 +6942,9 @@ async function showSettingsModal(): Promise<void> {
   // Populate search index stats
   await populateSearchIndexStats();
 
+  // Populate scheduled jobs list
+  await loadScheduledJobs();
+
   settingsModal.classList.add("visible");
 }
 
@@ -8042,3 +8046,149 @@ function debouncedSaveWindowState(): void {
 
 // Listen for window resize to save state
 window.addEventListener("resize", debouncedSaveWindowState);
+
+// ─── Scheduled Jobs ──────────────────────────────────────────────────────────
+
+interface ScheduledJob {
+  id: string;
+  name: string;
+  cron_expr: string;
+  prompt: string;
+  enabled: boolean;
+  last_run_at: string | null;
+  next_run_at: string;
+  created_at: string;
+}
+
+let editingScheduleId: string | null = null;
+
+function formatNextRun(iso: string): string {
+  const d = new Date(iso);
+  const now = new Date();
+  const diffMs = d.getTime() - now.getTime();
+  const diffMins = Math.round(diffMs / 60000);
+  if (diffMins < 60) return `in ${diffMins}m`;
+  if (diffMins < 1440) return `in ${Math.round(diffMins / 60)}h`;
+  return `in ${Math.round(diffMins / 1440)}d`;
+}
+
+async function loadScheduledJobs() {
+  const listEl = document.getElementById('scheduled-jobs-list');
+  const emptyEl = document.getElementById('scheduled-jobs-empty');
+  if (!listEl) return;
+
+  let jobs: ScheduledJob[] = [];
+  try {
+    jobs = await invoke<ScheduledJob[]>('list_scheduled_jobs');
+  } catch (e) {
+    console.error('Failed to load scheduled jobs:', e);
+    return;
+  }
+
+  // Remove existing job rows (keep empty notice)
+  listEl.querySelectorAll('.scheduled-job-item').forEach(el => el.remove());
+
+  if (emptyEl) emptyEl.style.display = jobs.length === 0 ? '' : 'none';
+
+  for (const job of jobs) {
+    const item = document.createElement('div');
+    item.className = 'scheduled-job-item';
+    item.dataset.id = job.id;
+    item.innerHTML = `
+      <div class="job-info">
+        <div class="job-name">${job.name}</div>
+        <div class="job-meta"><code>${job.cron_expr}</code> · next ${formatNextRun(job.next_run_at)}${job.last_run_at ? ' · last ran ' + new Date(job.last_run_at).toLocaleString() : ''}</div>
+      </div>
+      <div class="job-actions">
+        <label class="job-toggle" title="${job.enabled ? 'Enabled' : 'Disabled'}">
+          <input type="checkbox" class="job-enabled-toggle" ${job.enabled ? 'checked' : ''} />
+          <span>${job.enabled ? 'On' : 'Off'}</span>
+        </label>
+        <button class="job-edit-btn secondary-btn">Edit</button>
+        <button class="job-delete-btn danger-btn">Delete</button>
+      </div>
+    `;
+
+    item.querySelector('.job-enabled-toggle')!.addEventListener('change', async (e) => {
+      const enabled = (e.target as HTMLInputElement).checked;
+      try {
+        await invoke('update_scheduled_job', { id: job.id, enabled });
+        await loadScheduledJobs();
+      } catch (err) {
+        console.error('Failed to toggle job:', err);
+      }
+    });
+
+    item.querySelector('.job-edit-btn')!.addEventListener('click', () => openScheduleModal(job));
+    item.querySelector('.job-delete-btn')!.addEventListener('click', async () => {
+      if (!confirm(`Delete scheduled job "${job.name}"?`)) return;
+      try {
+        await invoke('delete_scheduled_job', { id: job.id });
+        await loadScheduledJobs();
+      } catch (err) {
+        console.error('Failed to delete job:', err);
+      }
+    });
+
+    listEl.appendChild(item);
+  }
+}
+
+function openScheduleModal(job?: ScheduledJob) {
+  editingScheduleId = job?.id ?? null;
+  const modal = document.getElementById('schedule-modal')!;
+  const title = document.getElementById('schedule-modal-title')!;
+  const nameEl = document.getElementById('schedule-modal-name') as HTMLInputElement;
+  const cronEl = document.getElementById('schedule-modal-cron') as HTMLInputElement;
+  const promptEl = document.getElementById('schedule-modal-prompt') as HTMLTextAreaElement;
+
+  title.textContent = job ? 'Edit Scheduled Job' : 'New Scheduled Job';
+  nameEl.value = job?.name ?? '';
+  cronEl.value = job?.cron_expr ?? '';
+  promptEl.value = job?.prompt ?? '';
+  modal.style.display = 'flex';
+  nameEl.focus();
+}
+
+function closeScheduleModal() {
+  const modal = document.getElementById('schedule-modal')!;
+  modal.style.display = 'none';
+  editingScheduleId = null;
+}
+
+async function saveScheduleModal() {
+  const nameEl = document.getElementById('schedule-modal-name') as HTMLInputElement;
+  const cronEl = document.getElementById('schedule-modal-cron') as HTMLInputElement;
+  const promptEl = document.getElementById('schedule-modal-prompt') as HTMLTextAreaElement;
+
+  const name = nameEl.value.trim();
+  const cron_expr = cronEl.value.trim();
+  const prompt = promptEl.value.trim();
+
+  if (!name || !cron_expr || !prompt) {
+    alert('All fields are required.');
+    return;
+  }
+
+  try {
+    if (editingScheduleId) {
+      await invoke('update_scheduled_job', { id: editingScheduleId, name, cronExpr: cron_expr, prompt });
+    } else {
+      await invoke('create_scheduled_job', { name, cronExpr: cron_expr, prompt });
+    }
+    closeScheduleModal();
+    await loadScheduledJobs();
+  } catch (err: any) {
+    alert(`Failed to save: ${err}`);
+  }
+}
+
+// Wire up schedule modal buttons (call this from init)
+function initScheduleUI() {
+  document.getElementById('schedule-add-btn')?.addEventListener('click', () => openScheduleModal());
+  document.getElementById('schedule-modal-cancel')?.addEventListener('click', closeScheduleModal);
+  document.getElementById('schedule-modal-save')?.addEventListener('click', saveScheduleModal);
+  document.getElementById('schedule-modal')?.addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) closeScheduleModal();
+  });
+}
