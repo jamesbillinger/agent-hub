@@ -4678,7 +4678,7 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
         const settingsDefault = appSettings.default_model ? `Settings default: \`${appSettings.default_model}\`` : "No settings default (using CLI config)";
         addChatMessage(sessionId, {
           type: "system",
-          result: `**Current model:** ${activeModel}${mismatchLine}\n${contextLine}\n${settingsDefault}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`fable\` (1M), \`opus\` (1M), \`opus-200k\`, \`sonnet\`, \`haiku\`, \`opus-4.7\`, \`opus-4.6\`, \`sonnet-4.6\`, \`default\`\n**Full IDs:** \`claude-fable-5\`, \`claude-opus-4-8[1m]\`, \`claude-opus-4-8\`, \`claude-sonnet-4-7\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
+          result: `**Current model:** ${activeModel}${mismatchLine}\n${contextLine}\n${settingsDefault}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`fable\` (1M), \`fable-200k\`, \`opus\` (1M), \`opus-200k\`, \`sonnet\`, \`haiku\`, \`opus-4.7\`, \`opus-4.6\`, \`sonnet-4.6\`, \`default\`\n**Full IDs:** \`claude-fable-5[1m]\`, \`claude-fable-5\`, \`claude-opus-4-8[1m]\`, \`claude-opus-4-8\`, \`claude-sonnet-4-7\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
         });
         return true;
       }
@@ -4708,8 +4708,10 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
 
       // Map shorthand names to model IDs
       const MODEL_ALIASES: Record<string, string> = {
-        fable: "claude-fable-5",
-        "fable-5": "claude-fable-5",
+        fable: "claude-fable-5[1m]",
+        "fable-1m": "claude-fable-5[1m]",
+        "fable-200k": "claude-fable-5",
+        "fable-5": "claude-fable-5[1m]",
         mythos: "claude-mythos-5",
         "mythos-5": "claude-mythos-5",
         opus: "claude-opus-4-8[1m]",
@@ -6149,7 +6151,8 @@ function formatTokens(tokens: number): string {
 
 // Max context by model (conservative estimates for display)
 const MODEL_MAX_CONTEXT: Record<string, number> = {
-  "claude-fable-5": 1000000,
+  "claude-fable-5[1m]": 1000000,
+  "claude-fable-5": 200000,
   "claude-mythos-5": 1000000,
   "claude-opus-4-8[1m]": 1000000,
   "claude-opus-4-8": 200000,
