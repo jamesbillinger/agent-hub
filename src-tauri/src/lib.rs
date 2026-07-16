@@ -624,6 +624,10 @@ struct ClaudeJsonMessage {
     uuid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "parentUuid")]
     parent_uuid: Option<String>,
+    // Set on messages emitted from inside a subagent (Task tool) — used by the
+    // frontend to exclude subagent context from the context indicator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_tool_use_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<ClaudeMessageInner>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -656,6 +660,10 @@ struct ClaudeJsonMessage {
     num_turns: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<ClaudeUsage>,
+    // Per-model usage from result events (cumulative within a process run).
+    // Kept as raw JSON so new CLI fields pass through untouched.
+    #[serde(rename = "modelUsage", skip_serializing_if = "Option::is_none")]
+    model_usage: Option<serde_json::Value>,
     // Status/compaction fields
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<String>,
@@ -1108,6 +1116,65 @@ fn apply_session_jsonl_reconciliation(
     actions: search::ReconciliationActions,
 ) -> Result<search::ReconciliationResult, String> {
     Ok(search::apply_reconciliation(actions))
+}
+
+/// Read the Claude Code OAuth access token: macOS Keychain first (where the
+/// CLI stores it), then ~/.claude/.credentials.json as a fallback.
+fn read_claude_oauth_token() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = std::process::Command::new("security")
+            .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+            .output()
+        {
+            if output.status.success() {
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                    if let Some(token) = json
+                        .pointer("/claudeAiOauth/accessToken")
+                        .and_then(|v| v.as_str())
+                    {
+                        return Ok(token.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let path = dirs::home_dir()
+        .ok_or_else(|| "could not determine home directory".to_string())?
+        .join(".claude")
+        .join(".credentials.json");
+    let data = std::fs::read_to_string(&path).map_err(|_| {
+        "no Claude Code credentials found (Keychain lookup failed and ~/.claude/.credentials.json is missing)".to_string()
+    })?;
+    let json: serde_json::Value =
+        serde_json::from_str(&data).map_err(|e| format!("failed to parse credentials: {}", e))?;
+    json.pointer("/claudeAiOauth/accessToken")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "no accessToken in Claude Code credentials".to_string())
+}
+
+/// Fetch plan usage limits (session / weekly percentages) from the same
+/// endpoint the Claude Code CLI uses for /usage.
+#[tauri::command]
+async fn fetch_claude_usage_limits() -> Result<serde_json::Value, String> {
+    let token = read_claude_oauth_token()?;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://api.anthropic.com/api/oauth/usage")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("Content-Type", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("usage request failed: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("usage endpoint returned {}", resp.status()));
+    }
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("failed to parse usage response: {}", e))
 }
 
 #[tauri::command]
@@ -4914,7 +4981,8 @@ pub fn run() {
             list_orphan_jsonls,
             import_orphan_jsonls,
             propose_session_jsonl_reconciliation,
-            apply_session_jsonl_reconciliation
+            apply_session_jsonl_reconciliation,
+            fetch_claude_usage_limits
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -4993,7 +5061,8 @@ pub fn run() {
             list_orphan_jsonls,
             import_orphan_jsonls,
             propose_session_jsonl_reconciliation,
-            apply_session_jsonl_reconciliation
+            apply_session_jsonl_reconciliation,
+            fetch_claude_usage_limits
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

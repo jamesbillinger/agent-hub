@@ -221,6 +221,17 @@ interface PtyOutput {
   data: string;
 }
 
+// One model's entry in a result event's modelUsage map
+interface ModelUsageEntry {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+  webSearchRequests?: number;
+  costUSD?: number;
+  contextWindow?: number;
+}
+
 // JSON streaming message types from Claude
 interface ClaudeJsonMessage {
   type: "system" | "user" | "assistant" | "result";
@@ -229,6 +240,8 @@ interface ClaudeJsonMessage {
   // JSONL line uuid (present when messages come from on-disk history;
   // may be absent on fresh stream-json envelopes from the CLI).
   uuid?: string;
+  // Set on messages emitted from inside a subagent (Task tool)
+  parent_tool_use_id?: string | null;
   message?: {
     id: string;
     type: string;
@@ -265,6 +278,8 @@ interface ClaudeJsonMessage {
     cache_creation_input_tokens?: number;
     cache_read_input_tokens?: number;
   };
+  // Per-model usage on result messages; cumulative within one process run
+  modelUsage?: Record<string, ModelUsageEntry>;
   // Status/compaction fields
   status?: string;
   compact_metadata?: {
@@ -318,8 +333,9 @@ interface ChatSession {
   streamingTokens: number;
   startTime: number | null;
   // Context tracking
-  totalInputTokens: number; // Cumulative input tokens for context %
+  totalInputTokens: number; // Current context size (latest top-level API call)
   totalOutputTokens: number;
+  contextWindow?: number; // Real context window reported by the CLI's modelUsage
   dirty: boolean; // Track if messages changed since last save
 }
 
@@ -618,6 +634,33 @@ function updateSessionActivityIndicator(sessionId: string, isActive: boolean): v
       }
     }
   }
+}
+
+/**
+ * Re-mark a session as processing when stream activity arrives while it's
+ * flagged idle. Turns aren't only started by the user: background Task
+ * agents re-invoke the model via task notifications (and hooks/auto-compact
+ * can too), each preceded by a genuine `result` event that flips
+ * isProcessing off — so without this the sidebar dot sits solid while
+ * messages stream by.
+ */
+function markSessionProcessingFromStream(sessionId: string, chatSession: ChatSession, message: ClaudeJsonMessage): void {
+  if (chatSession.isProcessing) return;
+
+  const isWork =
+    message.type === "assistant" ||
+    message.type === "user" ||
+    (message.type === "system" &&
+      ["task_started", "task_progress", "task_updated", "task_notification"].includes(message.subtype as string));
+  if (!isWork) return;
+
+  chatSession.isProcessing = true;
+  chatSession.startTime = chatSession.startTime ?? Date.now();
+  updateSessionActivityIndicator(sessionId, true);
+  const thinkingEl = chatSession.containerEl.querySelector(".chat-thinking") as HTMLElement;
+  if (thinkingEl) thinkingEl.style.display = "flex";
+  chatSession.statusEl.textContent = "Working...";
+  chatSession.statusEl.className = "chat-status";
 }
 
 // Buffer for accumulating output to detect multi-line error messages
@@ -1281,8 +1324,16 @@ document.addEventListener("DOMContentLoaded", async () => {
   function flushMessageBuffer() {
     messageFlushScheduled = false;
     for (const [sessionId, messages] of messageBuffer) {
+      const cs = chatSessions.get(sessionId);
       for (const message of messages) {
         addChatMessage(sessionId, message);
+        if (cs) {
+          // Background-initiated turns (task notifications etc.) must re-light
+          // the activity indicator even though the user didn't send anything
+          markSessionProcessingFromStream(sessionId, cs, message);
+          // Track live context size from assistant events / compact boundaries
+          updateContextFromMessage(cs, message);
+        }
         // Handle result message completion
         handleResultMessage(sessionId, message);
       }
@@ -1324,11 +1375,11 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (tokenDetails.length > 0) {
         parts.push(tokenDetails.join("/"));
       }
-
-      chatSession.totalInputTokens = totalIn;
-      chatSession.totalOutputTokens = usage.output_tokens || 0;
-      updateContextIndicator(chatSession);
+      // Note: totalIn here is the whole turn's summed usage (every API call),
+      // NOT the current context size — the indicator is fed from assistant
+      // events in updateContextFromMessage instead.
     }
+    updateContextWindowFromResult(chatSession, message);
 
     if (message.duration_ms) {
       const secs = (message.duration_ms / 1000).toFixed(1);
@@ -4533,6 +4584,7 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
 • \`/status\` - Show session status
 
 **Claude Commands (passed through):**
+• \`/usage\` - Per-model session usage, cost, and plan limit bars
 • \`/compact [instructions]\` - Compact conversation context
 • \`/cost\` - Show token usage and cost
 • \`/context\` - Show detailed context usage (MCP, tools, skills, etc.)
@@ -4781,6 +4833,71 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
         result: `Suspended ${suspendedCount} other session(s). Send a message in any session to resume it.`,
       });
       return true;
+
+    case "usage": {
+      // Render a local usage panel (per-model breakdown across all runs of
+      // this session + plan limit bars), then fall through to the CLI for
+      // its "what's contributing to your limits usage" analytics.
+      const { totals, totalCost, apiMs, turns } = computeSessionModelUsage(chatSession.messages);
+
+      const lines: string[] = ["**Session usage** _(all runs of this Agent Hub session)_", ""];
+      const models = Object.keys(totals).sort();
+      if (models.length === 0) {
+        lines.push("_No per-model usage recorded yet — it accumulates from responses received going forward._");
+      } else {
+        lines.push("| Model | Input | Output | Cache read | Cache write | Cost |");
+        lines.push("|---|---:|---:|---:|---:|---:|");
+        for (const model of models) {
+          const u = totals[model];
+          lines.push(
+            `| ${model} | ${formatTokensCompact(u.inputTokens || 0)} | ${formatTokensCompact(u.outputTokens || 0)} | ${formatTokensCompact(u.cacheReadInputTokens || 0)} | ${formatTokensCompact(u.cacheCreationInputTokens || 0)} | $${(u.costUSD || 0).toFixed(2)} |`,
+          );
+        }
+        lines.push("");
+        lines.push(`**Total:** $${totalCost.toFixed(2)} · ${turns} turn${turns === 1 ? "" : "s"} · API time ${formatApiDuration(apiMs)}`);
+      }
+
+      try {
+        const limitsResp = await invoke<{
+          limits?: Array<{
+            kind?: string;
+            percent?: number;
+            resets_at?: string;
+            scope?: { model?: { display_name?: string } };
+          }>;
+        }>("fetch_claude_usage_limits");
+        const entries = (limitsResp.limits || []).filter((l) => typeof l.percent === "number");
+        if (entries.length > 0) {
+          lines.push("", "**Plan limits**", "", "```");
+          for (const l of entries) {
+            const label =
+              l.kind === "session"
+                ? "Current session"
+                : l.kind === "weekly_all"
+                  ? "Current week (all models)"
+                  : l.scope?.model?.display_name
+                    ? `Current week (${l.scope.model.display_name})`
+                    : l.kind || "Limit";
+            const resets = l.resets_at
+              ? new Date(l.resets_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
+              : "";
+            lines.push(label);
+            lines.push(`${buildUsageBar(l.percent!)} ${l.percent}% used${resets ? ` · resets ${resets}` : ""}`);
+            lines.push("");
+          }
+          lines.push("```");
+        }
+      } catch (err) {
+        lines.push("", `_Plan limits unavailable: ${err}_`);
+      }
+
+      // Defer so the panel lands after the caller adds the user's "/usage"
+      // bubble; the CLI's contributing-analytics response follows it.
+      const usagePanel = lines.join("\n");
+      setTimeout(() => addChatMessage(sessionId, { type: "system", result: usagePanel }), 0);
+      // Also send /usage to the CLI for the contributing-analytics section.
+      return false;
+    }
 
     // These commands work in JSON mode and are passed through to Claude
     case "compact":
@@ -5973,6 +6090,11 @@ function processChatOutput(sessionId: string, data: string) {
 
       addChatMessage(sessionId, message);
 
+      // Background-initiated turns must re-light the activity indicator
+      markSessionProcessingFromStream(sessionId, chatSession, message);
+      // Track live context size from assistant events / compact boundaries
+      updateContextFromMessage(chatSession, message);
+
       // Check if response is complete - only the FINAL result has num_turns or total_cost_usd
       // Intermediate results (from Task subagents) don't have these fields
       const isFinalResult = message.type === "result" && (message.num_turns !== undefined || message.total_cost_usd !== undefined || message.duration_ms !== undefined);
@@ -6005,13 +6127,10 @@ function processChatOutput(sessionId: string, data: string) {
           if (tokenDetails.length > 0) {
             parts.push(tokenDetails.join("/"));
           }
-
-          // Update cumulative tokens for context indicator
-          // The result message contains the cumulative usage for the entire turn
-          chatSession.totalInputTokens = totalIn;
-          chatSession.totalOutputTokens = usage.output_tokens || 0;
-          updateContextIndicator(chatSession);
+          // Note: totalIn is the whole turn's summed usage, not context size —
+          // the indicator is fed from assistant events in updateContextFromMessage.
         }
+        updateContextWindowFromResult(chatSession, message);
 
         // Duration from API
         if (message.duration_ms) {
@@ -6149,6 +6268,86 @@ function formatTokens(tokens: number): string {
   return tokens.toString();
 }
 
+function formatTokensCompact(tokens: number): string {
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}m`;
+  if (tokens >= 1000) return `${(tokens / 1000).toFixed(1)}k`;
+  return tokens.toString();
+}
+
+function formatApiDuration(ms: number): string {
+  const totalSecs = Math.round(ms / 1000);
+  const h = Math.floor(totalSecs / 3600);
+  const m = Math.floor((totalSecs % 3600) / 60);
+  const s = totalSecs % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+/**
+ * Aggregate per-model usage across all process runs of a session.
+ * modelUsage on each result event is cumulative within one run, so we keep
+ * the latest snapshot per run and sum snapshots across runs. Run boundaries
+ * are detected by session_id changes (each --resume forks a new Claude
+ * session id) or by counters going backwards (same id, fresh process).
+ */
+function computeSessionModelUsage(messages: ClaudeJsonMessage[]): {
+  totals: Record<string, ModelUsageEntry>;
+  totalCost: number;
+  apiMs: number;
+  turns: number;
+} {
+  const totals: Record<string, ModelUsageEntry> = {};
+  let totalCost = 0;
+  let apiMs = 0;
+  let turns = 0;
+
+  const addRun = (run: Record<string, ModelUsageEntry> | null) => {
+    if (!run) return;
+    for (const [model, u] of Object.entries(run)) {
+      const t = (totals[model] ||= {});
+      t.inputTokens = (t.inputTokens || 0) + (u.inputTokens || 0);
+      t.outputTokens = (t.outputTokens || 0) + (u.outputTokens || 0);
+      t.cacheReadInputTokens = (t.cacheReadInputTokens || 0) + (u.cacheReadInputTokens || 0);
+      t.cacheCreationInputTokens = (t.cacheCreationInputTokens || 0) + (u.cacheCreationInputTokens || 0);
+      t.costUSD = (t.costUSD || 0) + (u.costUSD || 0);
+      totalCost += u.costUSD || 0;
+    }
+  };
+
+  let runKey: string | null = null;
+  let runUsage: Record<string, ModelUsageEntry> | null = null;
+
+  for (const m of messages) {
+    if (m.type !== "result") continue;
+    if (m.duration_api_ms) apiMs += m.duration_api_ms;
+    if (m.num_turns !== undefined || m.total_cost_usd !== undefined) turns++;
+    if (!m.modelUsage) continue;
+
+    const key = m.session_id || "unknown";
+    const wentBackwards =
+      runUsage !== null &&
+      Object.entries(m.modelUsage).some(([model, u]) => {
+        const prev = runUsage![model];
+        return prev !== undefined && (u.outputTokens || 0) < (prev.outputTokens || 0);
+      });
+    if (key !== runKey || wentBackwards) {
+      addRun(runUsage);
+      runKey = key;
+    }
+    runUsage = { ...m.modelUsage };
+  }
+  addRun(runUsage);
+
+  return { totals, totalCost, apiMs, turns };
+}
+
+function buildUsageBar(percent: number, width = 25): string {
+  const clamped = Math.max(0, Math.min(100, percent));
+  const filled = Math.round((clamped / 100) * width);
+  return "█".repeat(filled) + "░".repeat(width - filled);
+}
+
 // Max context by model (conservative estimates for display)
 const MODEL_MAX_CONTEXT: Record<string, number> = {
   "claude-fable-5[1m]": 1000000,
@@ -6173,12 +6372,53 @@ const MODEL_MAX_CONTEXT: Record<string, number> = {
 const AUTOCOMPACT_BUFFER = 45000;
 
 /**
+ * Track the current context size from a streamed message.
+ *
+ * Each top-level assistant event's usage reflects the context footprint of
+ * that single API call (input + cache read + cache creation), so the latest
+ * one IS the live context size. This naturally follows compaction and /reset:
+ * the next call simply reports a smaller context. Subagent messages
+ * (parent_tool_use_id set) run in their own context and are ignored, as are
+ * synthetic messages (zero usage). A compact boundary clears the value until
+ * the next real call reports the post-compact size.
+ */
+function updateContextFromMessage(chatSession: ChatSession, message: ClaudeJsonMessage): void {
+  if (message.type === "system" && message.subtype === "compact_boundary") {
+    chatSession.totalInputTokens = 0;
+    chatSession.totalOutputTokens = 0;
+    updateContextIndicator(chatSession);
+    return;
+  }
+  if (message.type !== "assistant" || message.parent_tool_use_id) return;
+  const u = message.message?.usage;
+  if (!u) return;
+  const ctx = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+  if (ctx <= 0) return;
+  chatSession.totalInputTokens = ctx;
+  chatSession.totalOutputTokens = u.output_tokens || 0;
+  updateContextIndicator(chatSession);
+}
+
+/**
+ * Capture the real context window from a result event's modelUsage (e.g.
+ * 1m for claude-fable-5[1m]) so the indicator doesn't rely on the static
+ * MODEL_MAX_CONTEXT table.
+ */
+function updateContextWindowFromResult(chatSession: ChatSession, message: ClaudeJsonMessage): void {
+  if (message.type !== "result" || !message.modelUsage) return;
+  const exact = chatSession.model ? message.modelUsage[chatSession.model]?.contextWindow : undefined;
+  const windows = Object.values(message.modelUsage).map((m) => m.contextWindow || 0);
+  const cw = exact || (windows.length ? Math.max(...windows) : 0);
+  if (cw > 0) chatSession.contextWindow = cw;
+}
+
+/**
  * Update the context percentage indicator for a chat session
  */
 function updateContextIndicator(chatSession: ChatSession, model?: string): void {
   // Prefer an explicit model, else the model the CLI resolved for this session.
   const activeModel = model || chatSession.model || "default";
-  const maxContext = MODEL_MAX_CONTEXT[activeModel] || MODEL_MAX_CONTEXT.default;
+  const maxContext = chatSession.contextWindow || MODEL_MAX_CONTEXT[activeModel] || MODEL_MAX_CONTEXT.default;
   const usableContext = maxContext - AUTOCOMPACT_BUFFER;
 
   const totalTokens = chatSession.totalInputTokens;
@@ -6214,7 +6454,8 @@ function showContextDetails(sessionId: string): void {
   const chatSession = chatSessions.get(sessionId);
   if (!session || !chatSession) return;
 
-  const maxContext = MODEL_MAX_CONTEXT.default;
+  const activeModel = chatSession.model || "default";
+  const maxContext = chatSession.contextWindow || MODEL_MAX_CONTEXT[activeModel] || MODEL_MAX_CONTEXT.default;
   const usableContext = maxContext - AUTOCOMPACT_BUFFER;
   const totalTokens = chatSession.totalInputTokens;
   const percentage = Math.round((totalTokens / usableContext) * 100);
@@ -6701,20 +6942,10 @@ async function loadChatMessages(sessionId: string, chatSession: ChatSession): Pr
       for (const msg of nonInitMessages) {
         chatSession.messages.push(msg);
         renderChatMessage(chatSession, msg);
-      }
-
-      // Restore context indicator from the most recent result message with usage
-      // Look backwards through messages to find the latest usage data
-      for (let i = nonInitMessages.length - 1; i >= 0; i--) {
-        const msg = nonInitMessages[i];
-        if (msg.type === "result" && msg.usage) {
-          const usage = msg.usage;
-          const totalIn = (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0);
-          chatSession.totalInputTokens = totalIn;
-          chatSession.totalOutputTokens = usage.output_tokens || 0;
-          updateContextIndicator(chatSession);
-          break;
-        }
+        // Replay context tracking in order so the indicator reflects the
+        // latest top-level API call, honoring compact boundaries.
+        updateContextFromMessage(chatSession, msg);
+        updateContextWindowFromResult(chatSession, msg);
       }
     }
   } catch (err) {
