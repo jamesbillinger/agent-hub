@@ -2635,6 +2635,19 @@ body.resizing-sidebar {
   border-top: 1px solid var(--border-color);
 }
 
+.chat-model {
+  font-size: 11px;
+  color: var(--badge-claude-text);
+  background: var(--badge-claude-bg);
+  padding: 1px 8px;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+
+.chat-model:empty {
+  display: none;
+}
+
 .chat-status {
   font-size: 12px;
   color: var(--text-muted);
@@ -3970,13 +3983,47 @@ body.resizing-sidebar {
 #grid-container {
   flex: 1;
   display: none;
-  grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
   grid-auto-rows: minmax(300px, calc(50vh - 34px));
   align-content: start;
   gap: 14px;
   padding: 50px 16px 16px;
   overflow-y: auto;
   background: var(--bg-primary);
+}
+
+/* Fewer cards -> bigger cells: 1 fills the pane, 2 split it, 3-4 go 2x2 */
+@media (min-width: 800px) {
+  #grid-container[data-count="1"] {
+    grid-template-columns: 1fr;
+  }
+  #grid-container[data-count="1"],
+  #grid-container[data-count="2"] {
+    grid-auto-rows: calc(100vh - 66px);
+  }
+  #grid-container[data-count="3"],
+  #grid-container[data-count="4"] {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* Zoomed card: near-fullscreen overlay on the same DOM */
+#grid-container.has-zoom::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background: var(--bg-modal-overlay);
+  z-index: 150;
+}
+
+.grid-card.zoomed {
+  position: fixed;
+  top: 24px;
+  left: 24px;
+  right: 24px;
+  bottom: 24px;
+  z-index: 200;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.45);
 }
 
 .grid-empty {
@@ -4033,7 +4080,8 @@ body.resizing-sidebar {
   text-decoration: underline;
 }
 
-.grid-card-close {
+.grid-card-close,
+.grid-card-zoom {
   flex-shrink: 0;
   width: 20px;
   height: 20px;
@@ -4048,9 +4096,31 @@ body.resizing-sidebar {
   cursor: pointer;
 }
 
-.grid-card-close:hover {
+.grid-card-zoom {
+  font-size: 12px;
+}
+
+.grid-card-close:hover,
+.grid-card-zoom:hover {
   color: var(--text-primary);
   background: var(--bg-hover);
+}
+
+.grid-card-model {
+  flex-shrink: 0;
+  max-width: 30%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  color: var(--badge-claude-text);
+  background: var(--badge-claude-bg);
+}
+
+.grid-card-model:empty {
+  display: none;
 }
 
 .grid-card .status-dot {
@@ -4147,6 +4217,7 @@ body.resizing-sidebar {
 }
 
 .grid-card-body .chat-status,
+.grid-card-body .chat-model,
 .grid-card-body .chat-context {
   font-size: 10px;
 }

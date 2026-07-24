@@ -418,6 +418,7 @@ let gridViewActive = false;
 const gridDismissed: Set<string> = new Set(); // Cards closed by the user for this grid session
 const gridPinned: Set<string> = new Set(); // Sessions opened while in grid - stay as cards even when idle/stopped
 let gridTicker: number | null = null; // 1s interval refreshing elapsed times on cards
+let gridZoomedSessionId: string | null = null; // Card currently popped out as an overlay
 
 // Render coalescing - prevents redundant re-renders when multiple state changes occur
 let renderSessionListPending = false;
@@ -870,6 +871,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   gridContainerEl = document.getElementById("grid-container")!;
   gridToggleBtn = document.getElementById("grid-toggle-btn") as HTMLButtonElement;
   gridToggleBtn.addEventListener("click", () => setGridView(!gridViewActive));
+  // Clicking the dimmed backdrop closes a zoomed card
+  gridContainerEl.addEventListener("click", (e) => {
+    if (gridZoomedSessionId && e.target === gridContainerEl) unzoomGridCard();
+  });
   emptyStateEl = document.getElementById("empty-state")!;
   newSessionModal = document.getElementById("new-session-modal")!;
   sessionNameInput = document.getElementById("session-name") as HTMLInputElement;
@@ -1872,6 +1877,8 @@ document.addEventListener("DOMContentLoaded", async () => {
 
       if (chatSearchBar) {
         hideChatSearch();
+      } else if (gridZoomedSessionId) {
+        unzoomGridCard();
       } else if (settingsModal.classList.contains("visible")) {
         hideSettingsModal();
       } else if (aboutModal.classList.contains("visible")) {
@@ -4517,6 +4524,10 @@ function syncGridCards(): void {
     empty.innerHTML = `<div class="icon">⊞</div><p>No active sessions.<br>Sessions appear here while they're running.</p>`;
     gridContainerEl.appendChild(empty);
   }
+
+  // Adaptive layout: fewer cards get bigger cells (1 fills the pane, 2 split
+  // it, 3-4 go 2x2); beyond that the auto-fit packing takes over
+  gridContainerEl.dataset.count = String(Math.min(desired.length, 5));
 }
 
 /**
@@ -4533,11 +4544,47 @@ function focusGridCard(sessionId: string): void {
 }
 
 /**
+ * Pop a card out as a near-fullscreen overlay (or back). Pure CSS state on
+ * the same DOM - no re-parenting, so scroll/focus/streaming carry through.
+ */
+function toggleGridZoom(sessionId: string): void {
+  const card = gridContainerEl.querySelector(`.grid-card[data-session-id="${sessionId}"]`) as HTMLElement | null;
+  if (!card) return;
+  if (card.classList.contains("zoomed")) {
+    unzoomGridCard();
+    return;
+  }
+  unzoomGridCard(); // only one zoomed card at a time
+  card.classList.add("zoomed");
+  gridContainerEl.classList.add("has-zoom");
+  gridZoomedSessionId = sessionId;
+  const cs = chatSessions.get(sessionId);
+  requestAnimationFrame(() => {
+    if (cs) cs.messagesEl.scrollTop = cs.messagesEl.scrollHeight;
+    (card.querySelector(".chat-input") as HTMLTextAreaElement | null)?.focus();
+  });
+}
+
+function unzoomGridCard(): void {
+  const card = gridContainerEl.querySelector(".grid-card.zoomed") as HTMLElement | null;
+  gridContainerEl.classList.remove("has-zoom");
+  const sid = gridZoomedSessionId;
+  gridZoomedSessionId = null;
+  if (!card) return;
+  card.classList.remove("zoomed");
+  const cs = sid ? chatSessions.get(sid) : undefined;
+  requestAnimationFrame(() => {
+    if (cs) cs.messagesEl.scrollTop = cs.messagesEl.scrollHeight;
+  });
+}
+
+/**
  * Move a card's embedded chat view back to #chat-container. Cards host the
  * session's real .chat-session DOM, so it must be returned before the card
  * goes away or the single-session view would lose the conversation.
  */
 function releaseGridCardDom(card: HTMLElement): void {
+  if (card.classList.contains("zoomed")) unzoomGridCard();
   const chatEl = card.querySelector(".chat-session");
   if (chatEl) chatContainerEl.appendChild(chatEl);
 }
@@ -4552,7 +4599,9 @@ function createGridCard(session: Session): HTMLElement {
     <div class="grid-card-header">
       <span class="status-dot"></span>
       <span class="grid-card-title" title="Open full view">${escapeHtml(session.name)}</span>
+      <span class="grid-card-model" title="Active model"></span>
       <span class="grid-card-status"></span>
+      ${isChat ? `<button class="grid-card-zoom" title="Zoom (Esc to close)">⤢</button>` : ""}
       <button class="grid-card-close" title="Remove from grid">×</button>
     </div>
     <div class="grid-card-body">
@@ -4573,6 +4622,14 @@ function createGridCard(session: Session): HTMLElement {
     card.remove();
     syncGridCards();
   });
+
+  if (isChat) {
+    card.querySelector(".grid-card-zoom")!.addEventListener("click", () => toggleGridZoom(session.id));
+    // Double-click the header (not its buttons) also zooms
+    card.querySelector(".grid-card-header")!.addEventListener("dblclick", (e) => {
+      if ((e.target as HTMLElement).tagName !== "BUTTON") toggleGridZoom(session.id);
+    });
+  }
 
   if (isChat) {
     const body = card.querySelector(".grid-card-body") as HTMLElement;
@@ -4606,6 +4663,34 @@ function createGridCard(session: Session): HTMLElement {
   return card;
 }
 
+/**
+ * Compact human label for a model id: "claude-opus-5[1m]" -> "opus-5 · 1M".
+ * Falls back to the --model flag on the launch command when the CLI hasn't
+ * reported the resolved model yet (session not started this run).
+ */
+function formatModelLabel(sessionId: string): string {
+  const cs = chatSessions.get(sessionId);
+  const session = sessions.get(sessionId);
+  const requested = session?.command.match(/--model\s+'([^']*)'/)?.[1]
+    || session?.command.match(/--model\s+(\S+)/)?.[1];
+  // While running, the CLI-resolved model is authoritative; otherwise show
+  // what the next start will request (a loaded init may be a stale older run)
+  const model = session?.isRunning ? (cs?.model || requested) : (requested || cs?.model);
+  if (!model) return "";
+  let m = model.replace(/^claude-/, "");
+  const oneM = m.includes("[1m]");
+  m = m.replace("[1m]", "").replace(/-\d{8}$/, "");
+  return oneM ? `${m} · 1M` : m;
+}
+
+/** Refresh the model label in a session's chat footer (full view and grid cards). */
+function updateModelIndicator(sessionId: string): void {
+  const cs = chatSessions.get(sessionId);
+  if (!cs) return;
+  const el = cs.containerEl.querySelector(".chat-model") as HTMLElement | null;
+  if (el) el.textContent = formatModelLabel(sessionId);
+}
+
 function formatGridElapsed(ms: number): string {
   const secs = Math.floor(ms / 1000);
   if (secs < 60) return `${secs}s`;
@@ -4636,6 +4721,8 @@ function updateGridCardStatus(sessionId: string): void {
 
   const dot = card.querySelector(".status-dot") as HTMLElement;
   const statusEl = card.querySelector(".grid-card-status") as HTMLElement;
+  const modelEl = card.querySelector(".grid-card-model") as HTMLElement;
+  if (modelEl) modelEl.textContent = formatModelLabel(sessionId);
 
   card.classList.toggle("working", !!cs?.isProcessing);
   if (cs?.isProcessing) {
@@ -4731,6 +4818,7 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
     </div>
     <div class="chat-footer">
       <div class="chat-status">Ready</div>
+      <div class="chat-model" title="Active model"></div>
       <div class="chat-context" title="Context usage">—</div>
     </div>
   `;
@@ -4927,6 +5015,9 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
   if (chatSession.messages.length > 0 && !session.hasBeenStarted) {
     session.hasBeenStarted = true;
   }
+
+  // Show the model even before the CLI reports one (falls back to --model flag)
+  updateModelIndicator(session.id);
 
   return chatSession;
 }
@@ -6375,6 +6466,7 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
     // Store the model the CLI actually resolved (authoritative source for /model)
     if (message.model) {
       chatSession.model = message.model;
+      updateModelIndicator(sessionId);
     }
 
     // Insert or update init message at the very beginning
@@ -7318,6 +7410,8 @@ async function loadChatMessages(sessionId: string, chatSession: ChatSession): Pr
       if (latestInit) {
         chatSession.messages.push(latestInit);
         renderChatMessage(chatSession, latestInit);
+        if (latestInit.model) chatSession.model = latestInit.model;
+        updateModelIndicator(sessionId);
 
         // If session is missing claudeSessionId, extract it from the init message
         const session = sessions.get(sessionId);
