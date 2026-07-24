@@ -737,7 +737,7 @@ async function autoRecoverClaudeSession(sessionId: string): Promise<void> {
   if (session.isRunning) {
     try {
       if (session.agentType === "claude-json") {
-        await invoke("kill_json_process", { sessionId });
+        await killJsonProcessIntentionally(sessionId);
       } else {
         await invoke("kill_pty", { sessionId });
       }
@@ -770,11 +770,7 @@ async function resetClaudeSessionId(sessionId: string): Promise<void> {
 
   // Kill the current process if running
   if (session.isRunning) {
-    try {
-      await invoke("kill_json_process", { sessionId });
-    } catch {
-      // Might already be dead
-    }
+    await killJsonProcessIntentionally(sessionId);
     session.isRunning = false;
   }
 
@@ -803,7 +799,7 @@ async function resetClaudeSessionId(sessionId: string): Promise<void> {
     addChatMessage(sessionId, {
       type: "system",
       subtype: "stopped",
-      result: `--- Context reset at ${timestamp} ---\nPrevious session: ${oldSessionId?.substring(0, 8) || "none"}...\nNew session: ${session.claudeSessionId.substring(0, 8)}...\nChat history preserved. Claude will start fresh on next message.`,
+      result: `--- Context reset at ${timestamp} ---\n**Claude's memory of this conversation is now cleared.** The next message starts a brand-new session — Claude will not remember anything above. The chat log is kept for display only.\n(previous Claude session: ${oldSessionId?.substring(0, 8) || "none"}… → new: ${session.claudeSessionId.substring(0, 8)}…)`,
     });
   }
 
@@ -1504,18 +1500,46 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   await listen<{ session_id: string; exit_code?: number }>("json-process-exit", async (event) => {
+    // Expected kill (model switch, reset, suspend, close): the initiator owns
+    // state and any restart. Bail out so this stale exit event can't mark a
+    // freshly restarted process as stopped or trigger the resume fallback.
+    if (intentionalKills.delete(event.payload.session_id)) {
+      resumeAttemptedSessions.delete(event.payload.session_id);
+      sessionReceivedInit.delete(event.payload.session_id);
+      renderSessionList();
+      updateStartBanner();
+      return;
+    }
+
     const session = sessions.get(event.payload.session_id);
     if (session) {
       session.isRunning = false;
 
-      // If we tried to resume and it failed before Claude even started (no init message),
-      // retry without --resume (session may not exist in this CLAUDE_CONFIG_DIR)
+      // If we tried to resume and it failed before Claude even started (no init
+      // message), retry the resume once — startup failures are often transient
+      // (CLI crash, network) and dropping to a fresh session loses all context.
+      // Only after a second failure fall back to fresh, and say so loudly.
       if (resumeAttemptedSessions.has(event.payload.session_id) && event.payload.exit_code !== 0) {
         resumeAttemptedSessions.delete(event.payload.session_id);
         const receivedInit = sessionReceivedInit.has(event.payload.session_id);
         sessionReceivedInit.delete(event.payload.session_id);
         if (!receivedInit) {
-          console.log(`Resume failed for ${session.name} (no init received), retrying as fresh session`);
+          const attempts = (resumeRetryCounts.get(event.payload.session_id) || 0) + 1;
+          resumeRetryCounts.set(event.payload.session_id, attempts);
+
+          if (attempts <= 1) {
+            console.log(`Resume failed for ${session.name} (exit ${event.payload.exit_code}), retrying resume once`);
+            addChatMessage(event.payload.session_id, {
+              type: "system",
+              result: `⚠️ Session failed to start (exit code ${event.payload.exit_code ?? "unknown"}) — retrying resume...`,
+            });
+            startingJsonSessions.delete(event.payload.session_id);
+            await startJsonProcess(session);
+            return;
+          }
+
+          console.log(`Resume failed twice for ${session.name}, falling back to a fresh session`);
+          resumeRetryCounts.delete(event.payload.session_id);
           // Find the last user message to re-send after retry
           const chatSession = chatSessions.get(event.payload.session_id);
           if (chatSession) {
@@ -1527,8 +1551,13 @@ document.addEventListener("DOMContentLoaded", async () => {
             }
           }
           // Clear the claudeSessionId so it starts fresh (but keep hasBeenStarted for history)
+          const oldClaudeId = session.claudeSessionId;
           session.claudeSessionId = undefined;
           await saveSessionToDb(session);
+          addChatMessage(event.payload.session_id, {
+            type: "system",
+            result: `**⚠️ Could not resume the previous Claude session — starting fresh.**\nClaude will NOT remember the conversation above (the chat log is kept for display only). Your last message will be re-sent to the new session.\nPrevious Claude session: \`${oldClaudeId || "unknown"}\` — its transcript may still exist in your Claude config dir; you can try \`claude --resume ${oldClaudeId || "<id>"}\` from a terminal to recover it.`,
+          });
           // Retry
           startingJsonSessions.delete(event.payload.session_id);
           await startJsonProcess(session);
@@ -2458,7 +2487,7 @@ async function saveSessionFromModal() {
       if (session.isRunning && oldEnvVars !== session.envVars) {
         console.log(`Env vars changed on running session "${session.name}" — restarting process`);
         if (isJsonAgent(session.agentType)) {
-          await invoke("kill_json_process", { sessionId: session.id });
+          await killJsonProcessIntentionally(session.id);
           // Small delay to let the process exit cleanly
           await new Promise(r => setTimeout(r, 500));
           await startJsonProcess(session);
@@ -3054,6 +3083,49 @@ const resumeAttemptedSessions = new Set<string>();
 const sessionReceivedInit = new Set<string>();
 // Track pending user messages that need to be re-sent after a retry
 const pendingRetryMessages = new Map<string, string>();
+// Count consecutive failed resume attempts per session, so we can retry the
+// resume once before falling back to a fresh (context-less) session
+const resumeRetryCounts = new Map<string, number>();
+// Sessions killed on purpose (model switch, reset, suspend, close). Their exit
+// events are expected: the initiator manages state and any restart, so the
+// exit handler must not run crash/retry handling — a stale exit event landing
+// after the replacement process started would clobber it.
+const intentionalKills = new Set<string>();
+
+/**
+ * Kill a session's JSON process as part of a deliberate restart/shutdown.
+ * Marks the exit as expected and clears the processing UI without the
+ * "stopped unexpectedly" alarm.
+ */
+async function killJsonProcessIntentionally(sessionId: string): Promise<void> {
+  intentionalKills.add(sessionId);
+  try {
+    await invoke("kill_json_process", { sessionId });
+  } catch {
+    // Might already be dead
+  }
+  const cs = chatSessions.get(sessionId);
+  if (cs && cs.isProcessing) {
+    cs.isProcessing = false;
+    updateSessionActivityIndicator(sessionId, false);
+    const thinkingEl = cs.containerEl.querySelector(".chat-thinking") as HTMLElement;
+    if (thinkingEl) thinkingEl.style.display = "none";
+  }
+}
+
+/**
+ * Wait for an in-flight turn to finish before restarting a session (e.g. a
+ * model switch). Killing the CLI mid-turn risks losing the tail of the
+ * transcript. Returns false if the turn was still running at the timeout.
+ */
+async function waitForTurnEnd(sessionId: string, timeoutMs: number = 120000): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (!chatSessions.get(sessionId)?.isProcessing) return true;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return !chatSessions.get(sessionId)?.isProcessing;
+}
 
 async function startJsonProcess(session: Session) {
   if (session.isRunning) return;
@@ -3155,7 +3227,7 @@ async function closeSession(sessionId: string) {
 
   // Kill process (PTY or JSON)
   if (isJsonAgent(session.agentType)) {
-    invoke("kill_json_process", { sessionId });
+    killJsonProcessIntentionally(sessionId);
     // Remove chat UI
     const chatSession = chatSessions.get(sessionId);
     if (chatSession) {
@@ -4881,7 +4953,7 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
 • \`/clear\` - Clear chat display (keeps conversation in Claude's context)
 • \`/exit\` - Suspend session (frees memory, resumes on next message)
 • \`/exitall\` - Suspend all other sessions
-• \`/reset\` - Reset Claude's context (keeps chat history visible)
+• \`/reset\` - **Wipe Claude's memory** of this conversation and start fresh (chat log stays visible, but Claude won't remember it)
 • \`/model [name]\` - Switch Claude model (opus, sonnet, haiku, or full ID)
 • \`/restart\` - Restart an inactive session process
 • \`/status\` - Show session status
@@ -4923,11 +4995,7 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
       }
 
       // Kill the process
-      try {
-        await invoke("kill_json_process", { sessionId });
-      } catch {
-        // Might already be dead
-      }
+      await killJsonProcessIntentionally(sessionId);
       session.isRunning = false;
 
       // Update UI
@@ -4962,7 +5030,7 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
 
       // Kill the current process if running
       if (session.isRunning) {
-        await invoke("kill_json_process", { sessionId });
+        await killJsonProcessIntentionally(sessionId);
         session.isRunning = false;
       }
 
@@ -4986,7 +5054,7 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
       addChatMessage(sessionId, {
         type: "system",
         subtype: "stopped",
-        result: `--- Context reset at ${timestamp} ---\nPrevious session: ${oldSessionId?.substring(0, 8)}...\nNew session: ${session.claudeSessionId.substring(0, 8)}...\nChat history preserved. Claude will start fresh on next message.`,
+        result: `--- Context reset at ${timestamp} ---\n**Claude's memory of this conversation is now cleared.** The next message starts a brand-new session — Claude will not remember anything above. The chat log is kept for display only.\n(previous Claude session: ${oldSessionId?.substring(0, 8)}… → new: ${session.claudeSessionId.substring(0, 8)}…)`,
       });
 
       // Update status
@@ -5043,11 +5111,17 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
       if (argLower === "default" || argLower === "reset") {
         session.command = session.command.replace(/\s*--model\s+'[^']*'/, "").replace(/\s*--model\s+\S+/, "");
 
+        // Don't kill mid-turn — the CLI could lose the tail of the transcript
+        if (chatSession.isProcessing) {
+          addChatMessage(sessionId, { type: "system", result: "Waiting for the current turn to finish before switching models… (Esc interrupts it)" });
+          if (!(await waitForTurnEnd(sessionId))) {
+            addChatMessage(sessionId, { type: "system", result: "⚠️ Turn still running after 2 minutes — switching anyway; the in-flight turn may be cut short." });
+          }
+        }
+
         // Kill, save, restart
         if (session.isRunning) {
-          try {
-            await invoke("kill_json_process", { sessionId });
-          } catch { /* might already be dead */ }
+          await killJsonProcessIntentionally(sessionId);
           session.isRunning = false;
         }
         await saveSessionToDb(session);
@@ -5089,13 +5163,17 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
 
       session.command = newCommand;
 
+      // Don't kill mid-turn — the CLI could lose the tail of the transcript
+      if (chatSession.isProcessing) {
+        addChatMessage(sessionId, { type: "system", result: "Waiting for the current turn to finish before switching models… (Esc interrupts it)" });
+        if (!(await waitForTurnEnd(sessionId))) {
+          addChatMessage(sessionId, { type: "system", result: "⚠️ Turn still running after 2 minutes — switching anyway; the in-flight turn may be cut short." });
+        }
+      }
+
       // Kill the current process if running
       if (session.isRunning) {
-        try {
-          await invoke("kill_json_process", { sessionId });
-        } catch {
-          // Might already be dead
-        }
+        await killJsonProcessIntentionally(sessionId);
         session.isRunning = false;
       }
 
@@ -5120,7 +5198,7 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
       for (const [sid, sess] of sessions) {
         if (sess.isRunning && sid !== sessionId) {
           try {
-            await invoke("kill_json_process", { sessionId: sid });
+            await killJsonProcessIntentionally(sid);
             sess.isRunning = false;
             const cs = chatSessions.get(sid);
             if (cs) {
@@ -6131,6 +6209,7 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
   if (message.type === "system" && message.subtype === "init") {
     // Mark that Claude actually started (sent an init message) for this session
     sessionReceivedInit.add(sessionId);
+    resumeRetryCounts.delete(sessionId);
     const hasInit = chatSession.messages.some(
       m => m.type === "system" && m.subtype === "init"
     );
@@ -6842,6 +6921,9 @@ function showContextDetails(sessionId: string): void {
   });
 
   modal.querySelector(".reset-btn")!.addEventListener("click", () => {
+    if (!confirm("Reset context? Claude will forget this entire conversation — the chat log stays visible, but the next message starts from scratch. (To shrink context without losing it, use Compact instead.)")) {
+      return;
+    }
     closeModal();
     handleSlashCommand(sessionId, "/reset");
   });
