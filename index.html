@@ -96,6 +96,9 @@
         </div>
         <!-- Chat container for JSON-based sessions -->
         <div id="chat-container" style="display: none;"></div>
+        <!-- Grid view: all active sessions as live cards -->
+        <div id="grid-container" style="display: none;"></div>
+        <button id="grid-toggle-btn" class="grid-toggle-btn" title="Toggle grid view (⌘⇧G)">⊞</button>
         <div id="empty-state">
           <div class="icon">⌘</div>
           <h2>No Active Session</h2>
@@ -229,6 +232,8 @@
             <label for="settings-default-model">Default Claude Model</label>
             <select id="settings-default-model">
               <option value="">CLI Default</option>
+              <option value="claude-opus-5[1m]">Opus 5 (1M)</option>
+              <option value="claude-opus-5">Opus 5 (200k)</option>
               <option value="claude-fable-5[1m]">Fable 5 (1M)</option>
               <option value="claude-fable-5">Fable 5 (200k)</option>
               <option value="claude-mythos-5">Mythos 5 (1M)</option>

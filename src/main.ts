@@ -360,6 +360,7 @@ interface AppSettings {
   renderer: "webgl" | "dom";
   remote_pin?: string | null;
   show_active_sessions_group: boolean;
+  grid_view?: boolean;
   default_model?: string | null;
   claude_config_dir?: string | null;
   claude_search_dirs?: string[];
@@ -399,6 +400,7 @@ let appSettings: AppSettings = {
   read_aloud_enabled: false,
   renderer: "webgl",
   show_active_sessions_group: true,
+  default_model: "claude-opus-5[1m]",
   claude_config_dir: null,
   claude_search_dirs: ["~/.claude"],
 };
@@ -410,6 +412,12 @@ let isResizingSidebar = false;
 type MobileView = "list" | "session";
 let currentMobileView: MobileView = "list";
 let isMobileLayout = false;
+
+// Grid view state - shows all active sessions as cards instead of one chat at a time
+let gridViewActive = false;
+const gridDismissed: Set<string> = new Set(); // Cards closed by the user for this grid session
+const gridPinned: Set<string> = new Set(); // Sessions opened while in grid - stay as cards even when idle/stopped
+let gridTicker: number | null = null; // 1s interval refreshing elapsed times on cards
 
 // Render coalescing - prevents redundant re-renders when multiple state changes occur
 let renderSessionListPending = false;
@@ -611,6 +619,7 @@ function recordSessionInput(sessionId: string): void {
  * For JSON sessions, also updates the status dot to show processing state.
  */
 function updateSessionActivityIndicator(sessionId: string, isActive: boolean): void {
+  if (gridViewActive) updateGridCardStatus(sessionId);
   const sessionItem = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
   if (sessionItem) {
     if (isActive) {
@@ -827,6 +836,8 @@ let activeSessionsEl: HTMLElement;
 let sessionListEl: HTMLElement;
 let terminalContainerEl: HTMLElement;
 let chatContainerEl: HTMLElement;
+let gridContainerEl: HTMLElement;
+let gridToggleBtn: HTMLButtonElement;
 let emptyStateEl: HTMLElement;
 let newSessionModal: HTMLElement;
 let sessionNameInput: HTMLInputElement;
@@ -860,6 +871,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   sessionListEl = document.getElementById("session-list")!;
   terminalContainerEl = document.getElementById("terminal-container")!;
   chatContainerEl = document.getElementById("chat-container")!;
+  gridContainerEl = document.getElementById("grid-container")!;
+  gridToggleBtn = document.getElementById("grid-toggle-btn") as HTMLButtonElement;
+  gridToggleBtn.addEventListener("click", () => setGridView(!gridViewActive));
   emptyStateEl = document.getElementById("empty-state")!;
   newSessionModal = document.getElementById("new-session-modal")!;
   sessionNameInput = document.getElementById("session-name") as HTMLInputElement;
@@ -891,6 +905,11 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Load window state and app settings
   await loadWindowState();
   await loadAppSettings();
+
+  // Restore grid view if it was active last time (desktop only)
+  if (appSettings.grid_view && !checkMobileLayout()) {
+    setGridView(true, false);
+  }
 
   // Set up sidebar resize
   setupSidebarResize();
@@ -1337,6 +1356,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         // Handle result message completion
         handleResultMessage(sessionId, message);
       }
+      if (gridViewActive) updateGridCardStatus(sessionId);
     }
     messageBuffer.clear();
   }
@@ -1797,6 +1817,11 @@ document.addEventListener("DOMContentLoaded", async () => {
     if ((e.metaKey || e.ctrlKey) && e.key === "b") {
       e.preventDefault();
       toggleSidebar();
+    }
+    // Cmd+Shift+G to toggle grid view
+    if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "g") {
+      e.preventDefault();
+      setGridView(!gridViewActive);
     }
     // Cmd+F to search in active chat session
     if ((e.metaKey || e.ctrlKey) && e.key === "f") {
@@ -2521,6 +2546,7 @@ function updateMobileLayout(): void {
   isMobileLayout = checkMobileLayout();
 
   if (isMobileLayout) {
+    if (gridViewActive) setGridView(false, false);
     setMobileView(currentMobileView);
   } else {
     document.body.classList.remove("mobile-view-list", "mobile-view-session");
@@ -2566,6 +2592,21 @@ async function initMobileMenuInfo(): Promise<void> {
 }
 
 async function switchToSession(sessionId: string) {
+  if (gridViewActive) {
+    const target = sessions.get(sessionId);
+    if (target && isJsonAgent(target.agentType)) {
+      // Stay in the grid: make sure the session has a card, then focus it
+      activeSessionId = sessionId;
+      gridPinned.add(sessionId);
+      syncGridCards();
+      focusGridCard(sessionId);
+      renderSessionList();
+      return;
+    }
+    // Terminal sessions can't be embedded in a card - fall back to full view
+    setGridView(false);
+  }
+
   // Hide current session UI
   if (activeSessionId) {
     const currentSession = sessions.get(activeSessionId);
@@ -3737,6 +3778,10 @@ function renderSessionListImmediate() {
   sessionListEl.innerHTML = "";
   activeSessionsEl.innerHTML = "";
 
+  // Keep grid cards in sync with session membership (isRunning changes
+  // always funnel through this render)
+  if (gridViewActive) syncGridCards();
+
   const sortedSessions = getFilteredAndSortedSessions();
 
   // Show "no results" message if search has no matches
@@ -4199,6 +4244,17 @@ async function createFolder(name?: string) {
 }
 
 function updateView() {
+  // Grid view replaces all single-session panes
+  if (gridViewActive) {
+    emptyStateEl.style.display = "none";
+    terminalContainerEl.style.display = "none";
+    chatContainerEl.style.display = "none";
+    gridContainerEl.style.display = "grid";
+    updateMobileHeader();
+    return;
+  }
+  gridContainerEl.style.display = "none";
+
   const hasActiveSession = activeSessionId !== null;
   const activeSession = activeSessionId ? sessions.get(activeSessionId) : null;
   const isJsonSession = activeSession && isJsonAgent(activeSession.agentType);
@@ -4274,6 +4330,253 @@ function updateStartBanner() {
     }
   } else {
     startBanner.style.display = "none";
+  }
+}
+
+// ============================================
+// Grid View - all active sessions as live cards
+// ============================================
+
+/**
+ * Toggle the grid view on/off. Grid view replaces the single-session pane
+ * with a card per active session (status, latest response, quick input).
+ */
+function setGridView(active: boolean, persist: boolean = true): void {
+  if (isMobileLayout) active = false;
+  if (gridViewActive === active) {
+    if (active) syncGridCards();
+    updateView();
+    return;
+  }
+  gridViewActive = active;
+  gridToggleBtn.classList.toggle("active", active);
+  gridToggleBtn.textContent = active ? "▤" : "⊞";
+  gridToggleBtn.title = active ? "Back to single session (⌘⇧G)" : "Grid view (⌘⇧G)";
+
+  // Show/hide the grid container first so cards are built while it has
+  // layout - scrollHeight is 0 inside display:none, breaking scroll-to-bottom
+  updateView();
+
+  if (active) {
+    gridDismissed.clear();
+    gridPinned.clear();
+    if (activeSessionId) gridPinned.add(activeSessionId);
+    syncGridCards();
+    if (gridTicker === null) {
+      gridTicker = window.setInterval(() => {
+        gridContainerEl.querySelectorAll<HTMLElement>(".grid-card").forEach((card) => {
+          if (card.dataset.sessionId) updateGridCardStatus(card.dataset.sessionId);
+        });
+      }, 1000);
+    }
+  } else {
+    if (gridTicker !== null) {
+      window.clearInterval(gridTicker);
+      gridTicker = null;
+    }
+    // Return embedded chat views to the normal chat container before
+    // dropping the cards
+    gridContainerEl.querySelectorAll<HTMLElement>(".grid-card").forEach(releaseGridCardDom);
+    gridContainerEl.innerHTML = "";
+    // The selection may have moved while in the grid; re-point the
+    // single-session view at the current selection
+    if (activeSessionId && chatSessions.has(activeSessionId)) {
+      showChatSession(activeSessionId);
+    }
+  }
+
+  if (persist) {
+    appSettings.grid_view = active;
+    saveAppSettings();
+  }
+}
+
+/** Sessions that should have a card: running ones, the selection, and any the user opened while in the grid. */
+function getGridSessions(): Session[] {
+  const list = Array.from(sessions.values()).filter(
+    (s) => (s.isRunning || s.id === activeSessionId || gridPinned.has(s.id)) && !gridDismissed.has(s.id)
+  );
+  return list.sort((a, b) => a.sortOrder - b.sortOrder);
+}
+
+/**
+ * Reconcile grid cards with the current session set without rebuilding
+ * existing cards (rebuilding would wipe card input focus/drafts).
+ */
+function syncGridCards(): void {
+  if (!gridViewActive) return;
+  const desired = getGridSessions();
+  const desiredIds = new Set(desired.map((s) => s.id));
+
+  gridContainerEl.querySelectorAll<HTMLElement>(".grid-card").forEach((card) => {
+    if (!desiredIds.has(card.dataset.sessionId || "")) {
+      releaseGridCardDom(card);
+      card.remove();
+    }
+  });
+  gridContainerEl.querySelector(".grid-empty")?.remove();
+
+  // Insert with minimal DOM moves: re-parenting an existing card blurs any
+  // focused input inside it and resets its scroll positions, so only cards
+  // that are genuinely new or misplaced get touched
+  const existingById = new Map(
+    Array.from(gridContainerEl.querySelectorAll<HTMLElement>(".grid-card")).map((c) => [c.dataset.sessionId, c])
+  );
+  let cursor: Element | null = null;
+  for (const session of desired) {
+    const ref: Element | null = cursor ? cursor.nextElementSibling : gridContainerEl.firstElementChild;
+    let card = existingById.get(session.id);
+    if (!card) {
+      card = createGridCard(session);
+      gridContainerEl.insertBefore(card, ref);
+    } else if (card !== ref) {
+      // Preserve the conversation scroll across the move
+      const messagesEl = card.querySelector(".chat-messages") as HTMLElement | null;
+      const scrollTop = messagesEl?.scrollTop ?? 0;
+      gridContainerEl.insertBefore(card, ref);
+      if (messagesEl) messagesEl.scrollTop = scrollTop;
+    }
+    cursor = card;
+  }
+
+  if (desired.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "grid-empty";
+    empty.innerHTML = `<div class="icon">⊞</div><p>No active sessions.<br>Sessions appear here while they're running.</p>`;
+    gridContainerEl.appendChild(empty);
+  }
+}
+
+/**
+ * Scroll a session's card into view, flash it, and focus its input.
+ * Used when the user picks a sidebar session while the grid is up.
+ */
+function focusGridCard(sessionId: string): void {
+  const card = gridContainerEl.querySelector(`.grid-card[data-session-id="${sessionId}"]`) as HTMLElement | null;
+  if (!card) return;
+  card.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  card.classList.add("focused");
+  window.setTimeout(() => card.classList.remove("focused"), 1500);
+  (card.querySelector(".chat-input") as HTMLTextAreaElement | null)?.focus();
+}
+
+/**
+ * Move a card's embedded chat view back to #chat-container. Cards host the
+ * session's real .chat-session DOM, so it must be returned before the card
+ * goes away or the single-session view would lose the conversation.
+ */
+function releaseGridCardDom(card: HTMLElement): void {
+  const chatEl = card.querySelector(".chat-session");
+  if (chatEl) chatContainerEl.appendChild(chatEl);
+}
+
+function createGridCard(session: Session): HTMLElement {
+  const card = document.createElement("div");
+  card.className = "grid-card";
+  card.dataset.sessionId = session.id;
+
+  const isChat = isJsonAgent(session.agentType);
+  card.innerHTML = `
+    <div class="grid-card-header">
+      <span class="status-dot"></span>
+      <span class="grid-card-title" title="Open full view">${escapeHtml(session.name)}</span>
+      <span class="grid-card-status"></span>
+      <button class="grid-card-close" title="Remove from grid">×</button>
+    </div>
+    <div class="grid-card-body">
+      ${isChat ? "" : `<div class="grid-card-terminal-note">Terminal session — open full view to interact.</div>`}
+    </div>
+  `;
+
+  // Open the session in the normal single-session view
+  card.querySelector(".grid-card-title")!.addEventListener("click", () => {
+    setGridView(false);
+    switchToSession(session.id);
+  });
+
+  card.querySelector(".grid-card-close")!.addEventListener("click", () => {
+    gridDismissed.add(session.id);
+    gridPinned.delete(session.id);
+    releaseGridCardDom(card);
+    card.remove();
+    syncGridCards();
+  });
+
+  if (isChat) {
+    const body = card.querySelector(".grid-card-body") as HTMLElement;
+    const adopt = (cs: ChatSession) => {
+      body.appendChild(cs.containerEl);
+      // Pin to the latest message. The card may not be laid out yet
+      // (createGridCard runs before the card is appended), so retry after
+      // the frame lands and once more for late-rendering content
+      const pin = () => {
+        cs.messagesEl.scrollTop = cs.messagesEl.scrollHeight;
+      };
+      pin();
+      requestAnimationFrame(pin);
+      setTimeout(pin, 150);
+    };
+    const existing = chatSessions.get(session.id);
+    if (existing) {
+      adopt(existing);
+    } else {
+      // Builds the hidden chat view and loads saved history
+      initializeChatView(session).then((cs) => {
+        // Skip if the card left the grid while history was loading
+        if (!gridViewActive || !card.isConnected) return;
+        adopt(cs);
+        updateGridCardStatus(session.id);
+      });
+    }
+  }
+
+  updateGridCardStatus(session.id);
+  return card;
+}
+
+function formatGridElapsed(ms: number): string {
+  const secs = Math.floor(ms / 1000);
+  if (secs < 60) return `${secs}s`;
+  return `${Math.floor(secs / 60)}m ${String(secs % 60).padStart(2, "0")}s`;
+}
+
+/** Last tool_use name in the transcript, for the "using Bash" hint while working. */
+function getLastToolName(cs: ChatSession): string | null {
+  for (let i = cs.messages.length - 1; i >= 0; i--) {
+    const msg = cs.messages[i];
+    if (msg.type !== "assistant" || !Array.isArray(msg.message?.content)) continue;
+    for (let j = msg.message!.content.length - 1; j >= 0; j--) {
+      const block = msg.message!.content[j];
+      if (block.type === "tool_use" && block.name) return block.name;
+    }
+  }
+  return null;
+}
+
+/** Update the status dot and working/idle text in one card's header. */
+function updateGridCardStatus(sessionId: string): void {
+  if (!gridViewActive) return;
+  const card = gridContainerEl.querySelector(`.grid-card[data-session-id="${sessionId}"]`);
+  if (!card) return;
+  const session = sessions.get(sessionId);
+  if (!session) return;
+  const cs = chatSessions.get(sessionId);
+
+  const dot = card.querySelector(".status-dot") as HTMLElement;
+  const statusEl = card.querySelector(".grid-card-status") as HTMLElement;
+
+  card.classList.toggle("working", !!cs?.isProcessing);
+  if (cs?.isProcessing) {
+    dot.className = "status-dot processing";
+    const elapsed = cs.startTime ? ` ${formatGridElapsed(Date.now() - cs.startTime)}` : "";
+    const tool = getLastToolName(cs);
+    statusEl.textContent = `▶ working${elapsed}${tool ? ` · ${tool}` : ""}`;
+  } else if (session.isRunning) {
+    dot.className = "status-dot running";
+    statusEl.textContent = "idle";
+  } else {
+    dot.className = "status-dot";
+    statusEl.textContent = "not running";
   }
 }
 
@@ -4730,7 +5033,7 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
         const settingsDefault = appSettings.default_model ? `Settings default: \`${appSettings.default_model}\`` : "No settings default (using CLI config)";
         addChatMessage(sessionId, {
           type: "system",
-          result: `**Current model:** ${activeModel}${mismatchLine}\n${contextLine}\n${settingsDefault}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`fable\` (1M), \`fable-200k\`, \`opus\` (1M), \`opus-200k\`, \`sonnet\`, \`haiku\`, \`opus-4.7\`, \`opus-4.6\`, \`sonnet-4.6\`, \`default\`\n**Full IDs:** \`claude-fable-5[1m]\`, \`claude-fable-5\`, \`claude-opus-4-8[1m]\`, \`claude-opus-4-8\`, \`claude-sonnet-4-7\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
+          result: `**Current model:** ${activeModel}${mismatchLine}\n${contextLine}\n${settingsDefault}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`opus\` (Opus 5, 1M), \`opus-200k\`, \`fable\` (1M), \`fable-200k\`, \`sonnet\`, \`haiku\`, \`opus-4.8\`, \`opus-4.7\`, \`opus-4.6\`, \`sonnet-4.6\`, \`default\`\n**Full IDs:** \`claude-opus-5[1m]\`, \`claude-opus-5\`, \`claude-fable-5[1m]\`, \`claude-opus-4-8[1m]\`, \`claude-sonnet-4-7\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
         });
         return true;
       }
@@ -4766,9 +5069,11 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
         "fable-5": "claude-fable-5[1m]",
         mythos: "claude-mythos-5",
         "mythos-5": "claude-mythos-5",
-        opus: "claude-opus-4-8[1m]",
-        "opus-1m": "claude-opus-4-8[1m]",
-        "opus-200k": "claude-opus-4-8",
+        opus: "claude-opus-5[1m]",
+        "opus-1m": "claude-opus-5[1m]",
+        "opus-200k": "claude-opus-5",
+        "opus-5": "claude-opus-5[1m]",
+        "opus-4.8": "claude-opus-4-8[1m]",
         sonnet: "claude-sonnet-4-7",
         "opus-4.7": "claude-opus-4-7[1m]",
         "opus-4.6": "claude-opus-4-6[1m]",
@@ -6350,6 +6655,8 @@ function buildUsageBar(percent: number, width = 25): string {
 
 // Max context by model (conservative estimates for display)
 const MODEL_MAX_CONTEXT: Record<string, number> = {
+  "claude-opus-5[1m]": 1000000,
+  "claude-opus-5": 200000,
   "claude-fable-5[1m]": 1000000,
   "claude-fable-5": 200000,
   "claude-mythos-5": 1000000,
@@ -7293,6 +7600,7 @@ async function saveSettings(): Promise<void> {
     renderer: settingsRendererSelect.value as "webgl" | "dom",
     remote_pin: settingsRemotePinInput.value || null,
     show_active_sessions_group: settingsActiveSessionsGroupCheckbox.checked,
+    grid_view: appSettings.grid_view ?? false,
     claude_config_dir: (document.getElementById("settings-claude-config-dir") as HTMLInputElement).value || null,
     claude_search_dirs: (() => {
       const raw = (document.getElementById("settings-claude-search-dirs") as HTMLTextAreaElement).value;

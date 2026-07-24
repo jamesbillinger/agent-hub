@@ -474,7 +474,10 @@ struct AppSettings {
     remote_pin: Option<String>,
     #[serde(default = "default_true")]
     show_active_sessions_group: bool,
+    /// Show all active sessions as a card grid instead of one at a time
     #[serde(default)]
+    grid_view: bool,
+    #[serde(default = "default_model_default")]
     default_model: Option<String>,
     #[serde(default)]
     claude_config_dir: Option<String>,
@@ -498,6 +501,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_model_default() -> Option<String> {
+    Some("claude-opus-5[1m]".to_string())
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -513,7 +520,8 @@ impl Default for AppSettings {
             renderer: "webgl".to_string(),
             remote_pin: None,
             show_active_sessions_group: true,
-            default_model: None,
+            grid_view: false,
+            default_model: default_model_default(),
             claude_config_dir: None,
             claude_search_dirs: default_claude_search_dirs(),
         }
