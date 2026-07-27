@@ -362,6 +362,7 @@ interface AppSettings {
   show_active_sessions_group: boolean;
   grid_view?: boolean;
   default_model?: string | null;
+  webhook_model?: string | null;
   claude_config_dir?: string | null;
   claude_search_dirs?: string[];
 }
@@ -401,6 +402,7 @@ let appSettings: AppSettings = {
   renderer: "webgl",
   show_active_sessions_group: true,
   default_model: "claude-opus-5[1m]",
+  webhook_model: null,
   claude_config_dir: null,
   claude_search_dirs: ["~/.claude"],
 };
@@ -853,6 +855,7 @@ let settingsThemeSelect: HTMLSelectElement;
 let settingsDefaultWorkingDirInput: HTMLInputElement;
 let settingsDefaultAgentSelect: HTMLSelectElement;
 let settingsDefaultModelSelect: HTMLSelectElement;
+let settingsWebhookModelSelect: HTMLSelectElement;
 let settingsNotificationsCheckbox: HTMLInputElement;
 let settingsBellNotificationsCheckbox: HTMLInputElement;
 let settingsBounceDockCheckbox: HTMLInputElement;
@@ -895,6 +898,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   settingsDefaultWorkingDirInput = document.getElementById("settings-default-working-dir") as HTMLInputElement;
   settingsDefaultAgentSelect = document.getElementById("settings-default-agent") as HTMLSelectElement;
   settingsDefaultModelSelect = document.getElementById("settings-default-model") as HTMLSelectElement;
+  settingsWebhookModelSelect = document.getElementById("settings-webhook-model") as HTMLSelectElement;
   settingsNotificationsCheckbox = document.getElementById("settings-notifications") as HTMLInputElement;
   settingsBellNotificationsCheckbox = document.getElementById("settings-bell-notifications") as HTMLInputElement;
   settingsBounceDockCheckbox = document.getElementById("settings-bounce-dock") as HTMLInputElement;
@@ -3218,6 +3222,41 @@ async function startJsonProcess(session: Session) {
   }
 }
 
+/**
+ * Suspend a session: stop the process but keep the session, its history and
+ * its row in the sidebar. Same semantics as `/exit` in a chat - it drops out
+ * of the Active group (and the grid) and resumes on the next message.
+ *
+ * This is what the × means anywhere a row is listed *because it's running*:
+ * the Active group and grid cards. The × on a stopped session in the main list
+ * still means closeSession() - destructive is the right call there.
+ */
+async function suspendSession(sessionId: string): Promise<void> {
+  const session = sessions.get(sessionId);
+  if (!session || !session.isRunning) return;
+
+  if (isJsonAgent(session.agentType)) {
+    await killJsonProcessIntentionally(sessionId);
+  } else {
+    await invoke("kill_pty", { sessionId });
+  }
+  session.isRunning = false;
+
+  const chatSession = chatSessions.get(sessionId);
+  if (chatSession) {
+    chatSession.statusEl.textContent = "Suspended";
+    chatSession.statusEl.className = "chat-status";
+    addChatMessage(sessionId, {
+      type: "system",
+      subtype: "stopped",
+      result: "Session suspended. Send a message to resume.",
+    });
+  }
+
+  renderSessionList();
+  if (gridViewActive) syncGridCards();
+}
+
 async function closeSession(sessionId: string) {
   const session = sessions.get(sessionId);
   if (!session) {
@@ -3905,6 +3944,7 @@ function renderSessionListImmediate() {
       for (const session of runningSessions) {
         const item = createSessionItem(session, -1);
         item.classList.add("active-sessions-item");
+        item.querySelector(".close-btn")?.setAttribute("title", "Suspend session (stop, keep history)");
         activeSessionsEl.appendChild(item);
       }
     }
@@ -4075,7 +4115,15 @@ function createSessionItem(session: Session, index: number): HTMLElement {
   // Close button
   item.querySelector(".close-btn")!.addEventListener("click", (e) => {
     e.stopPropagation();
-    closeSession(session.id);
+    // In the Active group the row only exists because the session is running,
+    // so × means "stop this run" (same as /exit). In the main list below it
+    // means close the session for good. The class is added by the caller after
+    // createSessionItem returns, which is why this is checked at click time.
+    if (item.classList.contains("active-sessions-item")) {
+      suspendSession(session.id);
+    } else {
+      closeSession(session.id);
+    }
   });
 
   // Mouse-based drag - start on drag handle mousedown
@@ -4617,7 +4665,7 @@ function createGridCard(session: Session): HTMLElement {
       <span class="grid-card-model" title="Active model"></span>
       <span class="grid-card-status"></span>
       ${isChat ? `<button class="grid-card-zoom" title="Zoom (Esc to close)">⤢</button>` : ""}
-      <button class="grid-card-close" title="Remove from grid">×</button>
+      <button class="grid-card-close" title="Suspend session (stop, keep history)">×</button>
     </div>
     <div class="grid-card-body">
       ${isChat ? "" : `<div class="grid-card-terminal-note">Terminal session — open full view to interact.</div>`}
@@ -4630,11 +4678,15 @@ function createGridCard(session: Session): HTMLElement {
     switchToSession(session.id);
   });
 
-  card.querySelector(".grid-card-close")!.addEventListener("click", () => {
+  card.querySelector(".grid-card-close")!.addEventListener("click", async () => {
+    // Same meaning as the × in the sidebar's Active group: stop the run. The
+    // dismiss/unpin still happens so the card goes away even when this is the
+    // selected session (which getGridSessions would otherwise keep showing).
     gridDismissed.add(session.id);
     gridPinned.delete(session.id);
     releaseGridCardDom(card);
     card.remove();
+    await suspendSession(session.id);
     syncGridCards();
   });
 
@@ -5100,19 +5152,7 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
         return true;
       }
 
-      // Kill the process
-      await killJsonProcessIntentionally(sessionId);
-      session.isRunning = false;
-
-      // Update UI
-      chatSession.statusEl.textContent = "Suspended";
-      chatSession.statusEl.className = "chat-status";
-
-      addChatMessage(sessionId, {
-        type: "system",
-        subtype: "stopped",
-        result: "Session suspended. Send a message to resume.",
-      });
+      await suspendSession(sessionId);
       return true;
 
     case "restart":
@@ -7646,6 +7686,7 @@ async function showSettingsModal(): Promise<void> {
   settingsDefaultWorkingDirInput.value = appSettings.default_working_dir;
   settingsDefaultAgentSelect.value = appSettings.default_agent_type;
   settingsDefaultModelSelect.value = appSettings.default_model || "";
+  settingsWebhookModelSelect.value = appSettings.webhook_model || "";
   settingsNotificationsCheckbox.checked = appSettings.notifications_enabled;
   settingsBellNotificationsCheckbox.checked = appSettings.bell_notifications_enabled ?? true;
   settingsBounceDockCheckbox.checked = appSettings.bounce_dock_on_bell ?? true;
@@ -7784,6 +7825,7 @@ async function saveSettings(): Promise<void> {
     default_working_dir: settingsDefaultWorkingDirInput.value || DEFAULT_WORKING_DIR,
     default_agent_type: settingsDefaultAgentSelect.value || "claude",
     default_model: settingsDefaultModelSelect.value || null,
+    webhook_model: settingsWebhookModelSelect.value || null,
     notifications_enabled: settingsNotificationsCheckbox.checked,
     bell_notifications_enabled: settingsBellNotificationsCheckbox.checked,
     bounce_dock_on_bell: settingsBounceDockCheckbox.checked,

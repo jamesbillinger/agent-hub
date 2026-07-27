@@ -479,6 +479,11 @@ struct AppSettings {
     grid_view: bool,
     #[serde(default = "default_model_default")]
     default_model: Option<String>,
+    /// Model for sessions the app launches on its own - the Teams webhook and
+    /// scheduled jobs. Empty/None falls back to `default_model`, so these stop
+    /// silently running on whatever the CLI defaults to.
+    #[serde(default)]
+    webhook_model: Option<String>,
     #[serde(default)]
     claude_config_dir: Option<String>,
     /// Claude home directories to scan for JSONL search indexing. The
@@ -505,6 +510,31 @@ fn default_model_default() -> Option<String> {
     Some("claude-opus-5[1m]".to_string())
 }
 
+/// Launch command for sessions the app starts on its own (Teams webhook,
+/// scheduled jobs). These used to hardcode a bare `claude ...` with no
+/// `--model`, so they silently ran on the CLI's default while every session
+/// created in the UI honoured the app's default model.
+///
+/// Resolution: `webhook_model` if set, else `default_model`, else no flag
+/// (CLI default). The quoting matches what the frontend writes, so the model
+/// switcher's regex still reads and rewrites these commands.
+#[cfg(not(target_os = "ios"))]
+fn self_launched_claude_command() -> String {
+    let settings = load_app_settings().unwrap_or_default();
+    let model = settings
+        .webhook_model
+        .filter(|m| !m.trim().is_empty())
+        .or(settings.default_model)
+        .filter(|m| !m.trim().is_empty() && !m.trim().eq_ignore_ascii_case("default"));
+    let model_flag = model
+        .map(|m| format!("--model '{}' ", m.trim()))
+        .unwrap_or_default();
+    format!(
+        "claude {}--print --verbose --input-format stream-json --output-format stream-json --dangerously-skip-permissions",
+        model_flag
+    )
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -522,6 +552,7 @@ impl Default for AppSettings {
             show_active_sessions_group: true,
             grid_view: false,
             default_model: default_model_default(),
+            webhook_model: None,
             claude_config_dir: None,
             claude_search_dirs: default_claude_search_dirs(),
         }
@@ -3639,7 +3670,7 @@ async fn api_webhook_teams(
     }
 
     const TEAMS_SESSION_NAME: &str = "Teams Issues";
-    let command = "claude --print --verbose --input-format stream-json --output-format stream-json --dangerously-skip-permissions".to_string();
+    let command = self_launched_claude_command();
     let working_dir = std::env::var("AGENT_HUB_WEBHOOK_WORKDIR").unwrap_or_else(|_| "~/dev/pplsi".to_string());
 
     let app = { APP_HANDLE.lock().clone() };
@@ -3788,7 +3819,7 @@ fn fire_job(job: &ScheduledJob) {
     let app = { APP_HANDLE.lock().clone() };
     let Some(app) = app else { return; };
 
-    let command = "claude --print --verbose --input-format stream-json --output-format stream-json --dangerously-skip-permissions".to_string();
+    let command = self_launched_claude_command();
     let working_dir = std::env::var("AGENT_HUB_WEBHOOK_WORKDIR").unwrap_or_else(|_| "~/dev/pplsi".to_string());
     let session_name = format!("[Scheduled] {}", job.name);
 
