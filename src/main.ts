@@ -1656,7 +1656,15 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (session) {
       // Session already exists in our map, just mark as running and switch to it
       session.isRunning = true;
-      if (!session.terminal) {
+      // JSON sessions have no PTY - building a terminal for one both wastes an
+      // xterm instance and forces #terminal-container visible, which in grid
+      // view leaves two flex:1 panes fighting for the window
+      if (isJsonAgent(session.agentType)) {
+        if (!chatSessions.has(sessionId)) await initializeChatView(session);
+      } else if (!session.terminal) {
+        // Terminal sessions can't live in a card, so leave the grid first -
+        // the terminal needs a visible container to size itself against
+        if (gridViewActive) setGridView(false);
         // Create terminal if it doesn't exist
         await initializeTerminalView(session);
       }
@@ -2636,6 +2644,9 @@ async function switchToSession(sessionId: string) {
       gridPinned.add(sessionId);
       syncGridCards();
       focusGridCard(sessionId);
+      // Reassert pane visibility: another path may have shown the terminal or
+      // chat container, which would split the window with the grid
+      updateView();
       renderSessionList();
       return;
     }
@@ -2743,10 +2754,14 @@ async function switchToSession(sessionId: string) {
  * This allows viewing session history without spawning a PTY.
  */
 async function initializeTerminalView(session: Session) {
-  // Ensure terminal container is visible and sized
-  terminalContainerEl.style.display = "block";
+  // Ensure terminal container is visible and sized. In grid view the grid owns
+  // the pane, so leave it hidden - showing it here would give two flex:1
+  // siblings half the window each.
+  if (!gridViewActive) {
+    terminalContainerEl.style.display = "block";
+    emptyStateEl.style.display = "none";
+  }
   terminalContainerEl.style.position = "relative";
-  emptyStateEl.style.display = "none";
 
   // Create wrapper div for this terminal
   const wrapper = document.createElement("div");
