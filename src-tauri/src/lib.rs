@@ -658,6 +658,12 @@ struct ClaudeMessageInner {
     message_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<String>,
+    /// Model that produced this turn. The frontend uses it to confirm which
+    /// model a session is really on - a --resume start emits no init message,
+    /// so this is the only authoritative signal. Unlisted fields are dropped
+    /// when this struct is re-serialized to the frontend, so it must be here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<Vec<ClaudeContentItem>>,
     #[serde(skip_serializing_if = "Option::is_none")]

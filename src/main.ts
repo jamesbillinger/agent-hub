@@ -246,6 +246,9 @@ interface ClaudeJsonMessage {
     id: string;
     type: string;
     role: string;
+    /** Model that actually produced this turn. Present on assistant messages -
+     *  the only authoritative model signal on a --resume run, which emits no init. */
+    model?: string;
     content: Array<{ type: string; text?: string; name?: string; input?: unknown; source?: { type: string; media_type: string; data: string; url?: string } }>;
     stop_reason?: string | null;
     usage?: {
@@ -1428,6 +1431,19 @@ document.addEventListener("DOMContentLoaded", async () => {
   await listen<{ session_id: string; message: ClaudeJsonMessage }>("json-process-message", (event) => {
     const { session_id, message } = event.payload;
 
+    // Confirm the model off the live stream, before buffering - replaying
+    // persisted history must never re-confirm a model the session has since
+    // been switched off. init covers cold starts; assistant messages are the
+    // only signal on a --resume start, which emits no init.
+    // init echoes --model back without validating it (`--model junk` yields
+    // `"model":"junk"`), so it can label the badge but never confirm it. Only a
+    // real assistant turn proves which model is actually answering.
+    if (message.type === "system" && message.subtype === "init") {
+      noteResolvedModel(session_id, message.model, false);
+    } else if (message.type === "assistant") {
+      noteResolvedModel(session_id, message.message?.model, true);
+    }
+
     // Add to buffer
     if (!messageBuffer.has(session_id)) {
       messageBuffer.set(session_id, []);
@@ -1515,6 +1531,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (intentionalKills.delete(event.payload.session_id)) {
       resumeAttemptedSessions.delete(event.payload.session_id);
       sessionReceivedInit.delete(event.payload.session_id);
+      sessionModelConfirmed.delete(event.payload.session_id);
+      sessionModelMismatchWarned.delete(event.payload.session_id);
       renderSessionList();
       updateStartBanner();
       return;
@@ -1532,6 +1550,8 @@ document.addEventListener("DOMContentLoaded", async () => {
         resumeAttemptedSessions.delete(event.payload.session_id);
         const receivedInit = sessionReceivedInit.has(event.payload.session_id);
         sessionReceivedInit.delete(event.payload.session_id);
+        sessionModelConfirmed.delete(event.payload.session_id);
+        sessionModelMismatchWarned.delete(event.payload.session_id);
         if (!receivedInit) {
           const attempts = (resumeRetryCounts.get(event.payload.session_id) || 0) + 1;
           resumeRetryCounts.set(event.payload.session_id, attempts);
@@ -1575,6 +1595,8 @@ document.addEventListener("DOMContentLoaded", async () => {
       }
       resumeAttemptedSessions.delete(event.payload.session_id);
       sessionReceivedInit.delete(event.payload.session_id);
+      sessionModelConfirmed.delete(event.payload.session_id);
+      sessionModelMismatchWarned.delete(event.payload.session_id);
 
       const chatSession = chatSessions.get(event.payload.session_id);
       if (chatSession) {
@@ -3107,6 +3129,13 @@ const resumeAttemptedSessions = new Set<string>();
 // Track sessions that received an init message from Claude during current run
 // (if Claude never sent init, the process failed before actually starting)
 const sessionReceivedInit = new Set<string>();
+// Sessions whose model has been confirmed by the CLI *this run* - from an init
+// message, or from any assistant message (the only signal on a --resume run,
+// which emits no init). Until then chatSession.model may be from an older run.
+const sessionModelConfirmed = new Set<string>();
+// Sessions already warned this run that the CLI is answering as a different
+// model than the launch command requested, so the notice isn't repeated.
+const sessionModelMismatchWarned = new Set<string>();
 // Track pending user messages that need to be re-sent after a retry
 const pendingRetryMessages = new Map<string, string>();
 // Count consecutive failed resume attempts per session, so we can retry the
@@ -4735,19 +4764,102 @@ function createGridCard(session: Session): HTMLElement {
  * Falls back to the --model flag on the launch command when the CLI hasn't
  * reported the resolved model yet (session not started this run).
  */
-function formatModelLabel(sessionId: string): string {
+/** The --model value on a session's launch command, if any. */
+function requestedModelId(sessionId: string): string | undefined {
+  const session = sessions.get(sessionId);
+  return session?.command.match(/--model\s+'([^']*)'/)?.[1]
+    || session?.command.match(/--model\s+(\S+)/)?.[1];
+}
+
+/**
+ * Whether two model ids name the same model, ignoring the two ways the CLI
+ * legitimately reports a different string than was requested:
+ *   - context variant: launched as `claude-opus-5[1m]`, reported `claude-opus-5`
+ *   - dated snapshot:  launched as `claude-sonnet-4-5`,
+ *                      reported `claude-sonnet-4-5-20250929`
+ * Comparing raw strings would report a failed switch on both.
+ */
+function sameModelFamily(a?: string, b?: string): boolean {
+  if (!a || !b) return false;
+  const norm = (m: string) => m.replace("[1m]", "").replace(/-\d{8}$/, "");
+  return norm(a) === norm(b);
+}
+
+/**
+ * Whether a requested --model value can be meaningfully compared to the id the
+ * CLI reports. The CLI also accepts short aliases (`--model sonnet`), which
+ * never string-match the resolved `claude-sonnet-4-7` - comparing those would
+ * report a failed switch on every correctly-honoured one.
+ */
+function isFullModelId(model?: string): boolean {
+  return !!model && model.startsWith("claude-");
+}
+
+/**
+ * What model this session is actually on, and how sure we are.
+ *
+ * chatSession.model is only trustworthy once the CLI has confirmed it *this
+ * run*: a --resume start emits no init message, so a value restored from
+ * persisted history can be days old and name a different model than the launch
+ * command. Until an assistant message arrives we fall back to the requested
+ * model but mark it unconfirmed rather than assert it - a switch the CLI
+ * silently ignored must not look like a successful one.
+ */
+function activeModel(sessionId: string): { id?: string; confirmed: boolean } {
   const cs = chatSessions.get(sessionId);
   const session = sessions.get(sessionId);
-  const requested = session?.command.match(/--model\s+'([^']*)'/)?.[1]
-    || session?.command.match(/--model\s+(\S+)/)?.[1];
-  // While running, the CLI-resolved model is authoritative; otherwise show
-  // what the next start will request (a loaded init may be a stale older run)
-  const model = session?.isRunning ? (cs?.model || requested) : (requested || cs?.model);
-  if (!model) return "";
-  let m = model.replace(/^claude-/, "");
+  const requested = requestedModelId(sessionId);
+  if (sessionModelConfirmed.has(sessionId) && cs?.model) {
+    // The CLI reports the bare id (`claude-opus-5`) even when launched as
+    // `claude-opus-5[1m]`, so prefer the requested spelling when they're the
+    // same model - it carries the context variant the label wants to show.
+    const id = sameModelFamily(requested, cs.model) ? requested : cs.model;
+    return { id, confirmed: true };
+  }
+  // Not running: the label is a statement about the next start, not this one
+  if (!session?.isRunning) return { id: requested || cs?.model, confirmed: true };
+  // Running but unproven. Prefer the requested model - on a resume cs.model is
+  // whatever the last cold start reported and may be stale. cs.model still
+  // covers sessions launched with no --model at all, where init is all we have.
+  return { id: requested || cs?.model, confirmed: false };
+}
+
+function formatModelLabel(sessionId: string): string {
+  const { id, confirmed } = activeModel(sessionId);
+  if (!id) return "";
+  let m = id.replace(/^claude-/, "");
   const oneM = m.includes("[1m]");
   m = m.replace("[1m]", "").replace(/-\d{8}$/, "");
-  return oneM ? `${m} · 1M` : m;
+  const label = oneM ? `${m} · 1M` : m;
+  return confirmed ? label : `${label}?`;
+}
+
+/**
+ * Record the model the CLI reports for the current run, from an init message
+ * or any assistant turn. Warns once if it disagrees with what was requested,
+ * so a model switch the CLI didn't honour is visible instead of silent.
+ */
+function noteResolvedModel(sessionId: string, model: string | undefined, confirms: boolean): void {
+  // `<synthetic>` is the CLI's placeholder on turns it generated itself rather
+  // than getting from a model - notably the "model does not exist" error. It
+  // is not a model and must never be recorded or compared.
+  if (!model || /^<.*>$/.test(model)) return;
+  const cs = chatSessions.get(sessionId);
+  if (!cs) return;
+  const changed = cs.model !== model || (confirms && !sessionModelConfirmed.has(sessionId));
+  cs.model = model;
+  if (confirms) sessionModelConfirmed.add(sessionId);
+  if (changed) updateModelIndicator(sessionId);
+  if (!confirms) return;
+
+  const requested = requestedModelId(sessionId);
+  if (isFullModelId(requested) && !sameModelFamily(requested, model) && !sessionModelMismatchWarned.has(sessionId)) {
+    sessionModelMismatchWarned.add(sessionId);
+    addChatMessage(sessionId, {
+      type: "system",
+      result: `⚠️ This session launched with \`--model ${requested}\`, but the CLI is answering as \`${model}\`. The model switch did not take effect.`,
+    });
+  }
 }
 
 /** Refresh the model label in a session's chat footer (full view and grid cards). */
@@ -5233,21 +5345,24 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
       }
 
       if (!args) {
-        // Show current model and usage.
-        // Prefer the model the CLI actually resolved (from the init JSON message);
-        // fall back to whatever --model is on the launch command.
-        const requestedModel = session.command.match(/--model\s+'([^']*)'/)?.[1] || session.command.match(/--model\s+(\S+)/)?.[1];
-        const activeModel = chatSession.model || requestedModel || "default (from CLI config)";
-        const maxContext = MODEL_MAX_CONTEXT[activeModel] || MODEL_MAX_CONTEXT.default;
-        const contextLine = `**Context window:** ${formatTokens(maxContext)} tokens`;
-        // If the resolved model differs from the requested one, surface that (e.g. Fable 5 fallback to Opus on a refusal)
-        const mismatchLine = chatSession.model && requestedModel && chatSession.model !== requestedModel
-          ? `\n_(requested \`${requestedModel}\`, CLI resolved \`${chatSession.model}\`)_`
+        // Show current model and usage. The CLI-resolved model wins, but only
+        // once confirmed this run - see activeModel().
+        const requestedModel = requestedModelId(sessionId);
+        const resolved = activeModel(sessionId);
+        const activeModelName = resolved.id || "default (from CLI config)";
+        const maxContext = MODEL_MAX_CONTEXT[activeModelName] || MODEL_MAX_CONTEXT.default;
+        const contextLine = `**Context window:** ${formatTokens(maxContext)} tokens`
+          + (resolved.confirmed ? "" : "\n_(not yet confirmed by the CLI this run — shown from the launch command)_");
+        // Surface a genuine disagreement (e.g. Fable 5 falling back to Opus, or
+        // a switch the CLI ignored). [1m] is a context variant, not a different
+        // model, so compare families - otherwise every 1M session looks wrong.
+        const mismatchLine = resolved.confirmed && isFullModelId(requestedModel) && !sameModelFamily(requestedModel, resolved.id)
+          ? `\n_(requested \`${requestedModel}\`, CLI resolved \`${resolved.id}\`)_`
           : "";
         const settingsDefault = appSettings.default_model ? `Settings default: \`${appSettings.default_model}\`` : "No settings default (using CLI config)";
         addChatMessage(sessionId, {
           type: "system",
-          result: `**Current model:** ${activeModel}${mismatchLine}\n${contextLine}\n${settingsDefault}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`opus\` (Opus 5, 1M), \`opus-200k\`, \`fable\` (1M), \`fable-200k\`, \`sonnet\`, \`haiku\`, \`opus-4.8\`, \`opus-4.7\`, \`opus-4.6\`, \`sonnet-4.6\`, \`default\`\n**Full IDs:** \`claude-opus-5[1m]\`, \`claude-opus-5\`, \`claude-fable-5[1m]\`, \`claude-opus-4-8[1m]\`, \`claude-sonnet-4-7\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
+          result: `**Current model:** ${activeModelName}${mismatchLine}\n${contextLine}\n${settingsDefault}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`opus\` (Opus 5, 1M), \`opus-200k\`, \`fable\` (1M), \`fable-200k\`, \`sonnet\`, \`haiku\`, \`opus-4.8\`, \`opus-4.7\`, \`opus-4.6\`, \`sonnet-4.6\`, \`default\`\n**Full IDs:** \`claude-opus-5[1m]\`, \`claude-opus-5\`, \`claude-fable-5[1m]\`, \`claude-opus-4-8[1m]\`, \`claude-sonnet-4-7\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
         });
         return true;
       }
@@ -6538,11 +6653,9 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
     if (message.cwd) {
       chatSession.cwd = message.cwd;
     }
-    // Store the model the CLI actually resolved (authoritative source for /model)
-    if (message.model) {
-      chatSession.model = message.model;
-      updateModelIndicator(sessionId);
-    }
+    // The model is recorded by noteResolvedModel() off the live stream, not
+    // here - addChatMessage also replays persisted history, and an old init
+    // must not re-assert a model the session has since been switched off.
 
     // Insert or update init message at the very beginning
     const existingInit = chatSession.messagesEl.querySelector(".init-details") as HTMLElement;
@@ -6639,6 +6752,9 @@ function processChatOutput(sessionId: string, data: string) {
         chatSession.statusEl.className = "chat-status compacting";
       }
 
+      // Only the live stream can confirm the model for *this* run - replaying
+      // persisted history through addChatMessage() must not, or a restored old
+      // turn would re-confirm a model the session is no longer on.
       addChatMessage(sessionId, message);
 
       // Background-initiated turns must re-light the activity indicator
@@ -6970,8 +7086,10 @@ function updateContextWindowFromResult(chatSession: ChatSession, message: Claude
  */
 function updateContextIndicator(chatSession: ChatSession, model?: string): void {
   // Prefer an explicit model, else the model the CLI resolved for this session.
-  const activeModel = model || chatSession.model || "default";
-  const maxContext = chatSession.contextWindow || MODEL_MAX_CONTEXT[activeModel] || MODEL_MAX_CONTEXT.default;
+  // Named to avoid shadowing activeModel(); this path has no session id, and
+  // contextWindow (reported by the CLI) takes precedence anyway.
+  const modelForContext = model || chatSession.model || "default";
+  const maxContext = chatSession.contextWindow || MODEL_MAX_CONTEXT[modelForContext] || MODEL_MAX_CONTEXT.default;
   const usableContext = maxContext - AUTOCOMPACT_BUFFER;
 
   const totalTokens = chatSession.totalInputTokens;
@@ -7007,8 +7125,8 @@ function showContextDetails(sessionId: string): void {
   const chatSession = chatSessions.get(sessionId);
   if (!session || !chatSession) return;
 
-  const activeModel = chatSession.model || "default";
-  const maxContext = chatSession.contextWindow || MODEL_MAX_CONTEXT[activeModel] || MODEL_MAX_CONTEXT.default;
+  const modelForContext = activeModel(sessionId).id || "default";
+  const maxContext = chatSession.contextWindow || MODEL_MAX_CONTEXT[modelForContext] || MODEL_MAX_CONTEXT.default;
   const usableContext = maxContext - AUTOCOMPACT_BUFFER;
   const totalTokens = chatSession.totalInputTokens;
   const percentage = Math.round((totalTokens / usableContext) * 100);
