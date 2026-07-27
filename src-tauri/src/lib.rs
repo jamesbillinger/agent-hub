@@ -1766,6 +1766,42 @@ struct ClaudeSessionDetected {
     claude_session_id: String,  // Claude's actual session ID
 }
 
+/// Resolve the global CLAUDE_CONFIG_DIR to pass to a spawned agent, or None to
+/// leave it unset.
+///
+/// Setting CLAUDE_CONFIG_DIR *at all* makes Claude Code read credentials from
+/// <dir>/.credentials.json instead of the macOS Keychain. Pointing it at the
+/// default ~/.claude therefore breaks auth for Keychain logins - the CLI fails
+/// with "OAuth session expired and could not be refreshed" even though `claude`
+/// works fine in a terminal. Claude Code already defaults to ~/.claude, so the
+/// var only needs to be set when the user picked a *different* directory.
+#[cfg(not(target_os = "ios"))]
+fn resolve_claude_config_dir(
+    custom_envs: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    if custom_envs.contains_key("CLAUDE_CONFIG_DIR") {
+        return None; // per-session value wins; applied by the caller's loop
+    }
+    let config_dir = load_app_settings().unwrap_or_default().claude_config_dir?;
+    let config_dir = config_dir.trim();
+    if config_dir.is_empty() {
+        return None;
+    }
+    let expanded = shellexpand::tilde(config_dir).to_string();
+    if let Some(default_dir) = dirs::home_dir().map(|h| h.join(".claude")) {
+        if expanded.trim_end_matches('/') == default_dir.to_string_lossy().trim_end_matches('/') {
+            // Not silent: an explicitly-typed setting is being ignored on purpose
+            eprintln!(
+                "[agent-hub] Claude Config Directory is set to the default ({}); leaving \
+                 CLAUDE_CONFIG_DIR unset so the CLI keeps using its Keychain login.",
+                expanded
+            );
+            return None;
+        }
+    }
+    Some(expanded)
+}
+
 #[cfg(not(target_os = "ios"))]
 #[tauri::command]
 fn spawn_pty(
@@ -1866,13 +1902,8 @@ fn spawn_pty(
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
-    if !custom_envs.contains_key("CLAUDE_CONFIG_DIR") {
-        if let Some(ref config_dir) = load_app_settings().unwrap_or_default().claude_config_dir {
-            if !config_dir.is_empty() {
-                let expanded = shellexpand::tilde(config_dir).to_string();
-                cmd.env("CLAUDE_CONFIG_DIR", &expanded);
-            }
-        }
+    if let Some(expanded) = resolve_claude_config_dir(&custom_envs) {
+        cmd.env("CLAUDE_CONFIG_DIR", &expanded);
     }
 
     // Apply custom environment variables (per-session, can override global)
@@ -2143,13 +2174,8 @@ fn spawn_json_process(
                 .stderr(Stdio::piped());
 
             // Apply global CLAUDE_CONFIG_DIR from app settings (if not overridden per-session)
-            if !custom_envs.contains_key("CLAUDE_CONFIG_DIR") {
-                if let Some(ref config_dir) = load_app_settings().unwrap_or_default().claude_config_dir {
-                    if !config_dir.is_empty() {
-                        let expanded = shellexpand::tilde(config_dir).to_string();
-                        cmd.env("CLAUDE_CONFIG_DIR", &expanded);
-                    }
-                }
+            if let Some(expanded) = resolve_claude_config_dir(&custom_envs) {
+                cmd.env("CLAUDE_CONFIG_DIR", &expanded);
             }
 
             // Apply custom environment variables (per-session, can override global)

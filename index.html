@@ -252,7 +252,7 @@
           <div class="form-group">
             <label for="settings-claude-config-dir">Claude Config Directory</label>
             <input type="text" id="settings-claude-config-dir" placeholder="~/.claude (default)" />
-            <p class="form-hint">Set CLAUDE_CONFIG_DIR for all sessions. Use a separate directory (e.g. ~/.claude-work) to use a different Claude account.</p>
+            <p class="form-hint">Set CLAUDE_CONFIG_DIR for all sessions. Use a separate directory (e.g. ~/.claude-work) to use a different Claude account. Leave empty for your normal login &mdash; a directory set here uses its own <code>.credentials.json</code> instead of the Keychain, so it needs its own <code>/login</code>.</p>
           </div>
         </div>
 
