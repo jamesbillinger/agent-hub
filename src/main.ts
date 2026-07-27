@@ -5612,7 +5612,27 @@ async function sendChatMessage(sessionId: string) {
     await invoke("write_to_process", { sessionId, data: jsonMessage });
   } catch (err) {
     console.error("Failed to send message:", err);
-    const errMsg = err instanceof Error ? err.message : String(err);
+    let errMsg = err instanceof Error ? err.message : String(err);
+
+    // "Process not found" means our isRunning is stale - the backend has no
+    // process for this session even though the UI thinks it's live. Correct
+    // the state and start it rather than dead-ending the typed message.
+    // spawn_json_process only returns once the process is registered, so the
+    // retry write is safe as soon as startJsonProcess resolves.
+    if (errMsg.includes("Process not found")) {
+      session.isRunning = false;
+      renderSessionList();
+      try {
+        await startJsonProcess(session);
+        await invoke("write_to_process", { sessionId, data: jsonMessage });
+        chatSession.statusEl.textContent = "Thinking...";
+        chatSession.statusEl.className = "chat-status";
+        return;
+      } catch (retryErr) {
+        errMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+      }
+    }
+
     chatSession.statusEl.textContent = `Send failed: ${errMsg}`;
     chatSession.statusEl.className = "chat-status error";
     chatSession.isProcessing = false;

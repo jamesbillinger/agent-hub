@@ -70,13 +70,31 @@ static PTY_BROADCASTERS: Lazy<Mutex<HashMap<String, broadcast::Sender<Vec<u8>>>>
 #[cfg(not(target_os = "ios"))]
 struct JsonProcess {
     stdin: tokio::sync::mpsc::Sender<String>,
-    #[allow(dead_code)]
+    /// Identifies which spawn owns this entry, so a dying process can tell
+    /// whether the map still holds *its* handle or a replacement's.
     child_id: u32,
 }
 
 #[cfg(not(target_os = "ios"))]
 static JSON_PROCESSES: Lazy<Mutex<HashMap<String, JsonProcess>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// True when the exiting process still owns the session's registered handle.
+///
+/// JSON_PROCESSES is keyed by session id alone, so a restart (model switch,
+/// /reset) that spawns a replacement before the old process's exit thread runs
+/// leaves two children pointing at one key. Without this check the dying one
+/// deletes the live one's entry and every send fails with "Process not found".
+///
+/// An absent entry counts as owned: kill_json_process removes the entry itself,
+/// and the normal teardown after that must still run.
+#[cfg(not(target_os = "ios"))]
+fn owns_session_slot(session_id: &str, child_id: u32) -> bool {
+    let processes = JSON_PROCESSES.lock();
+    processes
+        .get(session_id)
+        .map_or(true, |p| p.child_id == child_id)
+}
 
 // Broadcast channels for JSON process output - used by WebSocket clients
 #[cfg(not(target_os = "ios"))]
@@ -2403,6 +2421,20 @@ fn spawn_json_process(
 
             // Save any remaining messages to DB before cleanup
             save_session_messages_to_db(&session_id_clone);
+
+            // Only tear down if *this* child is still the registered process.
+            //
+            // The maps are keyed by session id alone, so a restart (model
+            // switch, /reset) that spawns a replacement before this thread
+            // notices the old exit would otherwise have the dying process
+            // delete the live one's entries. The UI would still show the
+            // session as running while every send failed with "Process not
+            // found". Draining stdout/stderr and save_session_messages_to_db()
+            // above make that window wide enough to hit in practice on a long
+            // session - exactly when a model switch is most likely.
+            if !owns_session_slot(&session_id_clone, child_id) {
+                return;
+            }
 
             // Clean up
             {
@@ -5131,4 +5163,45 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(all(test, not(target_os = "ios")))]
+mod tests {
+    use super::*;
+
+    fn register(session_id: &str, child_id: u32) {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
+        JSON_PROCESSES
+            .lock()
+            .insert(session_id.to_string(), JsonProcess { stdin: tx, child_id });
+    }
+
+    /// The teardown guard behind "Send failed: Process not found". A restart
+    /// registers the replacement under the same session id, so the old
+    /// process's exit thread must not clean up on its behalf.
+    #[test]
+    fn exiting_process_cleans_up_its_own_slot() {
+        let sid = "sess-owns-own-slot";
+        register(sid, 1234);
+        assert!(owns_session_slot(sid, 1234));
+        JSON_PROCESSES.lock().remove(sid);
+    }
+
+    #[test]
+    fn exiting_process_leaves_a_replacements_slot_alone() {
+        let sid = "sess-replaced";
+        register(sid, 5678); // replacement spawned during the restart
+        assert!(
+            !owns_session_slot(sid, 1234),
+            "old child 1234 must not tear down replacement 5678's handle"
+        );
+        JSON_PROCESSES.lock().remove(sid);
+    }
+
+    /// kill_json_process removes the entry itself, so an absent slot still
+    /// needs the rest of the teardown (broadcasters, buffers, PID, status).
+    #[test]
+    fn absent_slot_still_cleans_up() {
+        assert!(owns_session_slot("sess-never-registered", 1234));
+    }
 }
