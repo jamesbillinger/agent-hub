@@ -1200,6 +1200,11 @@ body.resizing-sidebar {
 .chat-messages {
   flex: 1;
   overflow-y: auto;
+  /* Without this the column would resolve to overflow-x: auto (a scrollable
+     axis forces the other off `visible`), so one long unbreakable token puts a
+     horizontal scrollbar under the whole conversation. Wide children that
+     genuinely need to scroll - code blocks, diffs - carry their own overflow-x. */
+  overflow-x: hidden;
   padding: 16px;
   display: flex;
   flex-direction: column;
@@ -1445,6 +1450,11 @@ body.resizing-sidebar {
   margin-left: 6px;
   font-family: 'Menlo', 'Monaco', monospace;
   font-size: 12px;
+  /* Deep paths have no break opportunity - browsers wrap after "-" but not
+     after "/", so anything like src/core/calculators/... runs off the edge.
+     `anywhere` (not `break-word`) also shrinks the min-content width, which is
+     what keeps it from forcing the flex column wider than the pane. */
+  overflow-wrap: anywhere;
 }
 
 .chat-message.tool-use .tool-path.clickable {
@@ -1490,11 +1500,13 @@ body.resizing-sidebar {
   font-family: 'Menlo', 'Monaco', monospace;
   font-size: 12px;
   margin-left: 6px;
+  overflow-wrap: anywhere;
 }
 
 .chat-message.tool-use .tool-query {
   color: var(--text-secondary);
   margin-left: 6px;
+  overflow-wrap: anywhere;
 }
 
 .chat-message.tool-use .tool-url {
