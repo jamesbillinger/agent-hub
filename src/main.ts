@@ -1497,6 +1497,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (session) {
       session.isRunning = true;
       startingJsonSessions.delete(event.payload.session_id); // Clear starting flag
+      // Closing a card dismissed *that* run. A new one - a webhook, a
+      // scheduled job, a resumed message - is activity worth showing, and the
+      // grid exists to surface running sessions.
+      gridDismissed.delete(event.payload.session_id);
       const chatSession = chatSessions.get(event.payload.session_id);
       if (chatSession) {
         chatSession.statusEl.textContent = "Connected";
@@ -2665,8 +2669,12 @@ async function switchToSession(sessionId: string) {
   if (gridViewActive) {
     const target = sessions.get(sessionId);
     if (target && isJsonAgent(target.agentType)) {
-      // Stay in the grid: make sure the session has a card, then focus it
+      // Stay in the grid: make sure the session has a card, then focus it.
+      // Picking a session is an explicit request to see it, so it undoes an
+      // earlier card close - gridDismissed is filtered in getGridSessions()
+      // and would otherwise beat gridPinned, leaving the click doing nothing.
       activeSessionId = sessionId;
+      gridDismissed.delete(sessionId);
       gridPinned.add(sessionId);
       syncGridCards();
       focusGridCard(sessionId);
