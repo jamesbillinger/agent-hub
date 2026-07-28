@@ -1343,6 +1343,13 @@ body.resizing-sidebar {
   font-family: 'Menlo', 'Monaco', monospace;
 }
 
+/* User bubbles are filled with the accent colour, where the muted grey and the
+   default border are both close to invisible. */
+.chat-message.user .token-usage {
+  color: rgba(255, 255, 255, 0.75);
+  border-top-color: rgba(255, 255, 255, 0.25);
+}
+
 /* Chat images - from Claude screenshots and image blocks */
 .chat-image {
   margin: 12px 0;

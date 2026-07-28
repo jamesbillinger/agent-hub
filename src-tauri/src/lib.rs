@@ -693,6 +693,12 @@ struct ClaudeJsonMessage {
     parent_tool_use_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<ClaudeMessageInner>,
+    // When this line was read off the stream, epoch millis. stream-json carries
+    // no timestamp of its own (the JSONL does, but its uuids only partly match
+    // what the stream emits), so the arrival time is stamped here - the one
+    // choke point feeding the live frontend, the in-memory buffer and the DB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    received_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2319,7 +2325,8 @@ fn spawn_json_process(
                 while let Ok(Some(line)) = reader.next_line().await {
                     // Parse JSON and emit structured message (new event)
                     // This offloads JSON parsing from the frontend
-                    if let Some(parsed) = parse_claude_json(&line) {
+                    if let Some(mut parsed) = parse_claude_json(&line) {
+                        parsed.received_at = Some(chrono::Utc::now().timestamp_millis());
                         // Detect processing state changes
                         let is_result = parsed.msg_type == "result";
                         match parsed.msg_type.as_str() {

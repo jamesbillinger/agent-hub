@@ -262,6 +262,9 @@ interface ClaudeJsonMessage {
   // User message images (for display in chat)
   images?: Array<{ base64Data: string; mediaType: string }>;
   is_error?: boolean;
+  /** Epoch millis when the line was read off the stream. Stamped in Rust;
+   *  absent on messages persisted before this existed. */
+  received_at?: number;
   duration_ms?: number;
   duration_api_ms?: number;
   total_cost_usd?: number;
@@ -4772,6 +4775,25 @@ function createGridCard(session: Session): HTMLElement {
  * Falls back to the --model flag on the launch command when the CLI hasn't
  * reported the resolved model yet (session not started this run).
  */
+/**
+ * Clock time for a message's footer. Arrival time, not the model's own notion
+ * of when it replied - close enough to be useful for "when did this happen"
+ * and the only timestamp stream-json makes available. Empty for messages
+ * persisted before stamping existed, so the footer just omits it.
+ */
+function formatMessageTime(message: ClaudeJsonMessage): string {
+  if (!message.received_at) return "";
+  const d = new Date(message.received_at);
+  if (isNaN(d.getTime())) return "";
+  const time = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  // Disambiguate anything not from today - long sessions span days
+  const today = new Date();
+  const sameDay = d.getFullYear() === today.getFullYear()
+    && d.getMonth() === today.getMonth()
+    && d.getDate() === today.getDate();
+  return sameDay ? time : `${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })} ${time}`;
+}
+
 /** The --model value on a session's launch command, if any. */
 function requestedModelId(sessionId: string): string | undefined {
   const session = sessions.get(sessionId);
@@ -5638,7 +5660,9 @@ async function sendChatMessage(sessionId: string) {
     : undefined;
 
   // Add user message to UI (with images if any)
-  addChatMessage(sessionId, { type: "user", result: message, images: userImages });
+  // Stamped here rather than in Rust: what the user types never passes through
+  // the stdout reader, so this is its only arrival point.
+  addChatMessage(sessionId, { type: "user", result: message, images: userImages, received_at: Date.now() });
 
   // Show thinking indicator and reset stats
   chatSession.isProcessing = true;
@@ -6552,6 +6576,8 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
     if (typeof userContent === "string" && userContent.trim()) {
       userHtml += `<div class="user-text">${escapeHtml(userContent)}</div>`;
     }
+    const userTime = formatMessageTime(message);
+    if (userTime) userHtml += `<div class="token-usage">${userTime}</div>`;
     messageEl.innerHTML = userHtml;
   } else if (message.type === "assistant" && message.message?.content) {
     messageEl.classList.add("assistant");
@@ -6595,17 +6621,20 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
       }
     }
 
-    // Add token usage details if available
+    // Footer: token usage and the time it arrived. Either alone is enough to
+    // render the line, so timestamps still show on turns with no usage data.
     const usage = message.message?.usage;
+    const tokenParts: string[] = [];
     if (usage) {
-      const tokenParts: string[] = [];
       if (usage.input_tokens) tokenParts.push(`in: ${usage.input_tokens}`);
       if (usage.cache_read_input_tokens) tokenParts.push(`cache read: ${usage.cache_read_input_tokens}`);
       if (usage.cache_creation_input_tokens) tokenParts.push(`cache write: ${usage.cache_creation_input_tokens}`);
       if (usage.output_tokens) tokenParts.push(`out: ${usage.output_tokens}`);
-      if (tokenParts.length > 0) {
-        html += `<div class="token-usage">${tokenParts.join(" • ")}</div>`;
-      }
+    }
+    const time = formatMessageTime(message);
+    if (time) tokenParts.push(time);
+    if (tokenParts.length > 0) {
+      html += `<div class="token-usage">${tokenParts.join(" • ")}</div>`;
     }
 
     messageEl.innerHTML = html || "(empty response)";
@@ -7669,6 +7698,8 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
     if (message.result?.trim()) {
       userHtml += `<div class="user-text">${escapeHtml(message.result)}</div>`;
     }
+    const userTime = formatMessageTime(message);
+    if (userTime) userHtml += `<div class="token-usage">${userTime}</div>`;
     messageEl.innerHTML = userHtml;
   } else if (message.type === "assistant" && message.message?.content) {
     messageEl.classList.add("assistant");
@@ -7706,6 +7737,21 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
         const formattedTool = formatToolCall(block.name || "Tool", (block.input || {}) as Record<string, unknown>, chatSession.cwd);
         html += `<div class="tool-call">${formattedTool}</div>`;
       }
+    }
+    // Same footer as the live path, so usage and time survive a reload rather
+    // than disappearing the moment history is restored from the buffer.
+    const usage = message.message?.usage;
+    const tokenParts: string[] = [];
+    if (usage) {
+      if (usage.input_tokens) tokenParts.push(`in: ${usage.input_tokens}`);
+      if (usage.cache_read_input_tokens) tokenParts.push(`cache read: ${usage.cache_read_input_tokens}`);
+      if (usage.cache_creation_input_tokens) tokenParts.push(`cache write: ${usage.cache_creation_input_tokens}`);
+      if (usage.output_tokens) tokenParts.push(`out: ${usage.output_tokens}`);
+    }
+    const time = formatMessageTime(message);
+    if (time) tokenParts.push(time);
+    if (tokenParts.length > 0) {
+      html += `<div class="token-usage">${tokenParts.join(" • ")}</div>`;
     }
     messageEl.innerHTML = html || "(empty response)";
   } else if (message.type === "result") {
