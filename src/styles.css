@@ -4026,6 +4026,28 @@ body.resizing-sidebar {
   }
 }
 
+/* 5 and 6 want three across, so they only kick in once three cards can still
+   clear the 380px the auto-fit track uses as its minimum (3 x 380 + gaps). */
+@media (min-width: 1200px) {
+  /* 5 cards: 3 up top, 2 filling the width below. Six columns is the smallest
+     grid where a row of 3 and a row of 2 both divide evenly, so neither row
+     leaves a gap. */
+  #grid-container[data-count="5"] {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+  }
+  #grid-container[data-count="5"] > .grid-card {
+    grid-column: span 2;
+  }
+  #grid-container[data-count="5"] > .grid-card:nth-child(n + 4) {
+    grid-column: span 3;
+  }
+
+  /* 6 cards: two even rows of three */
+  #grid-container[data-count="6"] {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
 /* Zoomed card: near-fullscreen overlay on the same DOM */
 #grid-container.has-zoom::before {
   content: "";

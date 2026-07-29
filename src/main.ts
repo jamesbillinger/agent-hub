@@ -4630,7 +4630,9 @@ function syncGridCards(): void {
 
   // Adaptive layout: fewer cards get bigger cells (1 fills the pane, 2 split
   // it, 3-4 go 2x2); beyond that the auto-fit packing takes over
-  gridContainerEl.dataset.count = String(Math.min(desired.length, 5));
+  // Capped at 7, meaning "7 or more" - past that the auto-fit packing takes
+  // over and the exact count stops changing the layout.
+  gridContainerEl.dataset.count = String(Math.min(desired.length, 7));
 }
 
 /**
@@ -4726,6 +4728,10 @@ function createGridCard(session: Session): HTMLElement {
     gridPinned.delete(session.id);
     releaseGridCardDom(card);
     card.remove();
+    // Resync before the await so data-count matches the DOM immediately -
+    // otherwise the layout briefly reflows to the stale count's rules while
+    // the process is being stopped.
+    syncGridCards();
     await suspendSession(session.id);
     syncGridCards();
   });
