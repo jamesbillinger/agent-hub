@@ -249,7 +249,7 @@ interface ClaudeJsonMessage {
     /** Model that actually produced this turn. Present on assistant messages -
      *  the only authoritative model signal on a --resume run, which emits no init. */
     model?: string;
-    content: Array<{ type: string; text?: string; name?: string; input?: unknown; source?: { type: string; media_type: string; data: string; url?: string } }>;
+    content: Array<{ type: string; id?: string; text?: string; name?: string; input?: unknown; source?: { type: string; media_type: string; data: string; url?: string } }>;
     stop_reason?: string | null;
     usage?: {
       input_tokens?: number;
@@ -4800,6 +4800,53 @@ function formatMessageTime(message: ClaudeJsonMessage): string {
   return sameDay ? time : `${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })} ${time}`;
 }
 
+/**
+ * Subagent runs seen this session, keyed by the Agent call's tool_use id -
+ * which is exactly what messages from inside that run carry as
+ * parent_tool_use_id. Several subagents can be in flight at once and their
+ * output interleaves in the transcript, so each run gets a stable colour and
+ * short id to tell them apart.
+ *
+ * Type comes from the Agent call's input; model is learned from the first
+ * subagent turn that reports one. Neither is guaranteed - the stream often
+ * carries no model on subagent messages at all - so both are optional and the
+ * chip just shows less when they're missing.
+ */
+const subagentRuns = new Map<string, { type?: string; model?: string; color: number }>();
+const SUBAGENT_COLORS = 6;
+
+function subagentRun(id: string): { type?: string; model?: string; color: number } {
+  let run = subagentRuns.get(id);
+  if (!run) {
+    run = { color: subagentRuns.size % SUBAGENT_COLORS };
+    subagentRuns.set(id, run);
+  }
+  return run;
+}
+
+/** `toolu_01HxGKet…` -> `01HxGK` - enough to distinguish concurrent runs. */
+function shortRunId(id: string): string {
+  return id.replace(/^toolu_/, "").slice(0, 6);
+}
+
+/** The badge shown on the Agent call and on every message from that run. */
+function subagentChipHtml(id: string): string {
+  const run = subagentRun(id);
+  const parts = [run.type || "subagent", `#${shortRunId(id)}`];
+  if (run.model) parts.splice(1, 0, run.model.replace(/^claude-/, "").replace(/-\d{8}$/, ""));
+  return `<span class="subagent-chip c${run.color}">${parts.map(escapeHtml).join(" · ")}</span>`;
+}
+
+/**
+ * Re-render chips for a run after its model is discovered, so messages already
+ * on screen pick it up instead of being stuck on the first-seen label.
+ */
+function refreshSubagentChips(id: string): void {
+  document
+    .querySelectorAll(`[data-agent-run="${CSS.escape(id)}"] .subagent-chip`)
+    .forEach((el) => { el.outerHTML = subagentChipHtml(id); });
+}
+
 /** The --model value on a session's launch command, if any. */
 function requestedModelId(sessionId: string): string | undefined {
   const session = sessions.get(sessionId);
@@ -6106,7 +6153,7 @@ async function pasteImageFromClipboard(sessionId: string) {
  * Format tool call for display based on tool type
  * Makes common tools more readable (Read, Edit, Bash, etc.)
  */
-function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: string): string {
+function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: string, toolUseId?: string): string {
   const escapeForHtml = (str: string) => {
     const div = document.createElement("div");
     div.textContent = str;
@@ -6276,13 +6323,22 @@ function formatToolCall(toolName: string, input: Record<string, unknown>, cwd: s
       return `<span class="tool-name">Search</span><code class="tool-pattern">${escapeForHtml(pattern)}</code>${pathInfo}`;
     }
 
+    // "Agent" is the current name; "Task" is kept for history recorded under
+    // the old one. Without the Agent case this card never rendered and every
+    // subagent launch fell through to the raw-JSON fallback below, prompt and
+    // all.
+    case "Agent":
     case "Task": {
       const description = input.description as string || "";
       const subagentType = input.subagent_type as string || "";
       const prompt = input.prompt as string || "";
-      // Show Task with description as subtitle and truncated prompt preview
-      let html = `<div class="tool-task">`;
-      html += `<div class="tool-task-header"><span class="tool-name">Task</span><span class="tool-task-type">${escapeForHtml(subagentType)}</span></div>`;
+      // Register the run so its messages can be tagged with the same type,
+      // colour and short id as this launch card.
+      if (toolUseId) subagentRun(toolUseId).type = subagentType || undefined;
+      let html = `<div class="tool-task"${toolUseId ? ` data-agent-run="${escapeForHtml(toolUseId)}"` : ""}>`;
+      html += `<div class="tool-task-header"><span class="tool-name">Agent</span>`;
+      html += toolUseId ? subagentChipHtml(toolUseId) : `<span class="tool-task-type">${escapeForHtml(subagentType)}</span>`;
+      html += `</div>`;
       if (description) {
         html += `<div class="tool-task-desc">${escapeForHtml(description)}</div>`;
       }
@@ -6557,6 +6613,20 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
   if (message.uuid) {
     messageEl.dataset.uuid = message.uuid;
   }
+  // Output from inside an Agent run. Concurrent subagents interleave here, so
+  // the run is marked per message rather than grouped - reordering the
+  // transcript to batch them would misrepresent when things actually happened.
+  const agentRun = message.parent_tool_use_id;
+  if (agentRun) {
+    const run = subagentRun(agentRun);
+    const model = message.message?.model;
+    if (model && !/^<.*>$/.test(model) && run.model !== model) {
+      run.model = model;
+      refreshSubagentChips(agentRun);
+    }
+    messageEl.classList.add("subagent", `c${run.color}`);
+    messageEl.dataset.agentRun = agentRun;
+  }
 
   if (message.type === "user") {
     // Extract user content from either desktop format (result) or mobile format (message.content)
@@ -6622,7 +6692,7 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
         }
 
         // Format tool call with special handling for known tools
-        const formattedTool = formatToolCall(block.name || "Tool", (block.input || {}) as Record<string, unknown>, chatSession.cwd);
+        const formattedTool = formatToolCall(block.name || "Tool", (block.input || {}) as Record<string, unknown>, chatSession.cwd, block.id);
         html += `<div class="tool-call">${formattedTool}</div>`;
       }
     }
@@ -6739,6 +6809,9 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
     saveChatMessages(sessionId);
     return;
   }
+
+  // Prepend the run badge once the branch above has written the body.
+  if (agentRun) messageEl.insertAdjacentHTML("afterbegin", subagentChipHtml(agentRun));
 
   // Check if at bottom before appending (for smart scroll)
   const wasAtBottom = isChatAtBottom(chatSession.messagesEl);
@@ -7683,6 +7756,20 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
   if (message.uuid) {
     messageEl.dataset.uuid = message.uuid;
   }
+  // Output from inside an Agent run. Concurrent subagents interleave here, so
+  // the run is marked per message rather than grouped - reordering the
+  // transcript to batch them would misrepresent when things actually happened.
+  const agentRun = message.parent_tool_use_id;
+  if (agentRun) {
+    const run = subagentRun(agentRun);
+    const model = message.message?.model;
+    if (model && !/^<.*>$/.test(model) && run.model !== model) {
+      run.model = model;
+      refreshSubagentChips(agentRun);
+    }
+    messageEl.classList.add("subagent", `c${run.color}`);
+    messageEl.dataset.agentRun = agentRun;
+  }
 
   if (message.type === "user") {
     // Skip user messages with empty content (e.g., tool_result messages)
@@ -7740,7 +7827,7 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
         }
 
         // Format tool call with special handling for known tools
-        const formattedTool = formatToolCall(block.name || "Tool", (block.input || {}) as Record<string, unknown>, chatSession.cwd);
+        const formattedTool = formatToolCall(block.name || "Tool", (block.input || {}) as Record<string, unknown>, chatSession.cwd, block.id);
         html += `<div class="tool-call">${formattedTool}</div>`;
       }
     }
@@ -7806,6 +7893,9 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
   } else {
     return; // Skip other message types
   }
+
+  // Prepend the run badge once the branch above has written the body.
+  if (agentRun) messageEl.insertAdjacentHTML("afterbegin", subagentChipHtml(agentRun));
 
   chatSession.messagesEl.appendChild(messageEl);
   // Note: Caller should handle scrolling (showChatSession scrolls to bottom when opening)

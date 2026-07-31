@@ -1343,6 +1343,37 @@ body.resizing-sidebar {
   font-family: 'Menlo', 'Monaco', monospace;
 }
 
+/* Subagent output. Several Agent runs can be in flight at once and their
+   messages interleave, so each run gets its own rail colour and a badge
+   carrying the run id - the rail alone tells you "not the main thread", the
+   badge tells you which subagent. */
+.chat-message.subagent {
+  border-left: 3px solid var(--run-color);
+  padding-left: 12px;
+  margin-left: 14px;
+}
+
+.subagent-chip {
+  display: inline-block;
+  margin-bottom: 6px;
+  padding: 1px 7px;
+  border-radius: 8px;
+  font-size: 10px;
+  font-family: 'Menlo', 'Monaco', monospace;
+  white-space: nowrap;
+  color: var(--run-color);
+  border: 1px solid var(--run-color);
+}
+
+/* Distinct enough to tell apart, muted enough not to fight the transcript.
+   Assigned round-robin in order of first appearance. */
+.subagent.c0, .subagent-chip.c0 { --run-color: #7aa2f7; }
+.subagent.c1, .subagent-chip.c1 { --run-color: #9ece6a; }
+.subagent.c2, .subagent-chip.c2 { --run-color: #e0af68; }
+.subagent.c3, .subagent-chip.c3 { --run-color: #bb9af7; }
+.subagent.c4, .subagent-chip.c4 { --run-color: #7dcfff; }
+.subagent.c5, .subagent-chip.c5 { --run-color: #f7768e; }
+
 /* User bubbles are filled with the accent colour, where the muted grey and the
    default border are both close to invisible. */
 .chat-message.user .token-usage {
