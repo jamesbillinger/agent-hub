@@ -351,6 +351,8 @@ interface WindowState {
   x?: number;
   y?: number;
   sidebar_width?: number;
+  active_session_id?: string | null;
+  open_session_ids?: string[];
 }
 
 interface AppSettings {
@@ -1898,13 +1900,14 @@ document.addEventListener("DOMContentLoaded", async () => {
       e.preventDefault();
       setGridView(!gridViewActive);
     }
-    // Cmd+F to search in active chat session
+    // Cmd+F to search in the chat session the user is looking at
     if ((e.metaKey || e.ctrlKey) && e.key === "f") {
-      if (activeSessionId) {
-        const chatSession = chatSessions.get(activeSessionId);
+      const targetId = getFocusedSessionId();
+      if (targetId) {
+        const chatSession = chatSessions.get(targetId);
         if (chatSession) {
           e.preventDefault();
-          showChatSearch(activeSessionId);
+          showChatSearch(targetId);
         }
       }
     }
@@ -2176,6 +2179,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   await loadSavedSessions();
   await loadFolders();
   await loadRecentlyClosed();
+
+  // Reopen last session's working set (needs the sessions to exist first)
+  await restoreOpenSessions();
 
   // Initial render
   renderSessionListImmediate();
@@ -3955,6 +3961,10 @@ function renderSessionListImmediate() {
   // always funnel through this render)
   if (gridViewActive) syncGridCards();
 
+  // Same funnel: any change to what's open lands here, so this is where the
+  // working set gets persisted for the next launch
+  saveOpenSessionsIfChanged();
+
   const sortedSessions = getFilteredAndSortedSessions();
 
   // Show "no results" message if search has no matches
@@ -4571,6 +4581,24 @@ function setGridView(active: boolean, persist: boolean = true): void {
     appSettings.grid_view = active;
     saveAppSettings();
   }
+
+  saveOpenSessionsIfChanged();
+}
+
+/**
+ * The session a keyboard shortcut should act on. Normally the selection, but
+ * in grid view several sessions are on screen at once, so whichever card holds
+ * focus wins - that's the one the user is looking at. Falls back to the zoomed
+ * card, then the selection, for when focus is somewhere neutral.
+ */
+function getFocusedSessionId(): string | null {
+  if (gridViewActive) {
+    const focused = document.activeElement as HTMLElement | null;
+    const card = focused?.closest?.(".grid-card") as HTMLElement | null;
+    if (card?.dataset.sessionId) return card.dataset.sessionId;
+    if (gridZoomedSessionId) return gridZoomedSessionId;
+  }
+  return activeSessionId;
 }
 
 /** Sessions that should have a card: running ones, the selection, and any the user opened while in the grid. */
@@ -4633,6 +4661,11 @@ function syncGridCards(): void {
   // Capped at 7, meaning "7 or more" - past that the auto-fit packing takes
   // over and the exact count stops changing the layout.
   gridContainerEl.dataset.count = String(Math.min(desired.length, 7));
+
+  // Card set just changed - persist it. Closing a card on an already-stopped
+  // session reaches here and nowhere else (no render follows), so the render
+  // hook alone would miss it.
+  saveOpenSessionsIfChanged();
 }
 
 /**
@@ -4718,6 +4751,18 @@ function createGridCard(session: Session): HTMLElement {
   card.querySelector(".grid-card-title")!.addEventListener("click", () => {
     setGridView(false);
     switchToSession(session.id);
+  });
+
+  // Typing in a card makes it the selection. Without this the selection stays
+  // wherever it was when the grid opened, so shortcuts keyed on it (Cmd+F,
+  // Cmd+W, Escape) act on a card the user isn't in. Sets the id directly
+  // rather than calling switchToSession, which would re-focus the card and
+  // fight the click that got us here.
+  card.addEventListener("focusin", () => {
+    if (activeSessionId === session.id) return;
+    activeSessionId = session.id;
+    renderSessionList();
+    updateStartBanner();
   });
 
   card.querySelector(".grid-card-close")!.addEventListener("click", async () => {
@@ -7421,6 +7466,12 @@ function showChatSearch(sessionId: string): void {
   const chatSession = chatSessions.get(sessionId);
   if (!chatSession) return;
 
+  // Only one search at a time. In grid view the bar lives inside a card, so
+  // searching a second card would otherwise leave the first card's bar open
+  // with stale highlights, and Escape would only close one of them.
+  const openBar = document.querySelector(".chat-search-bar.visible");
+  if (openBar && !chatSession.containerEl.contains(openBar)) hideChatSearch();
+
   // Check if search bar already exists
   let searchBar = chatSession.containerEl.querySelector(".chat-search-bar") as HTMLElement;
   if (!searchBar) {
@@ -8827,12 +8878,18 @@ async function duplicateSession(sessionId: string): Promise<void> {
 
 // Window state and settings persistence
 
+// The window state read at launch. Held so restoreOpenSessions() can use the
+// session fields later - they can only be applied once the sessions themselves
+// have been loaded from the database.
+let loadedWindowState: WindowState | null = null;
+
 /**
  * Load window state from backend and apply it.
  */
 async function loadWindowState(): Promise<void> {
   try {
     const state: WindowState = await invoke("load_window_state");
+    loadedWindowState = state;
 
     // Apply sidebar width if saved
     if (state.sidebar_width && sidebarEl) {
@@ -8853,6 +8910,79 @@ async function loadWindowState(): Promise<void> {
 }
 
 /**
+ * The sessions currently "open" - the working set worth restoring next launch.
+ * In grid view that's exactly the cards on screen (DOM order, so the restored
+ * grid keeps its arrangement); otherwise it's the running sessions plus the
+ * selection, since single-session view has no other notion of open.
+ */
+function getOpenSessionIds(): string[] {
+  if (gridViewActive) {
+    return Array.from(gridContainerEl.querySelectorAll<HTMLElement>(".grid-card"))
+      .map((card) => card.dataset.sessionId || "")
+      .filter((id) => id && sessions.has(id));
+  }
+  const ids = Array.from(sessions.values())
+    .filter((s) => s.isRunning)
+    .map((s) => s.id);
+  if (activeSessionId && !ids.includes(activeSessionId)) ids.push(activeSessionId);
+  return ids;
+}
+
+function openSessionsSignature(): string {
+  return `${gridViewActive ? "grid" : "single"}|${activeSessionId ?? ""}|${getOpenSessionIds().join(",")}`;
+}
+
+// Signature of the working set as last persisted. Session membership changes
+// funnel through renderSessionListImmediate(), which fires far more often than
+// the set actually changes - this keeps that from writing the file on every render.
+let savedOpenSessionsSignature = "";
+
+// Until the restore has run there is no working set to save, only an empty one
+// that would overwrite what we're about to restore.
+let openSessionsRestored = false;
+
+/**
+ * Persist the working set if it changed since the last save. Cheap enough to
+ * call from render paths.
+ */
+function saveOpenSessionsIfChanged(): void {
+  if (!openSessionsRestored) return;
+  const signature = openSessionsSignature();
+  if (signature === savedOpenSessionsSignature) return;
+  savedOpenSessionsSignature = signature;
+  debouncedSaveWindowState();
+}
+
+/**
+ * Reopen the sessions that were open when the app last quit. Sessions are not
+ * restarted - the cards/selection come back so a stopped session is one click
+ * from resuming. Must run after loadSavedSessions(), and ids that no longer
+ * exist are dropped.
+ */
+async function restoreOpenSessions(): Promise<void> {
+  const state = loadedWindowState;
+  if (!state) return;
+
+  // Only rebuild the card set when the grid was up at quit. Seeding gridPinned
+  // otherwise would leak a stale working set into a manual grid toggle much
+  // later, where entering the grid is meant to start from what's running.
+  if (gridViewActive) {
+    for (const id of state.open_session_ids ?? []) {
+      if (sessions.has(id)) gridPinned.add(id);
+    }
+    syncGridCards();
+  }
+
+  const activeId = state.active_session_id;
+  if (activeId && sessions.has(activeId) && !isMobileLayout) {
+    await switchToSession(activeId);
+  }
+
+  openSessionsRestored = true;
+  savedOpenSessionsSignature = openSessionsSignature();
+}
+
+/**
  * Save the current window state to backend.
  */
 async function saveWindowState(): Promise<void> {
@@ -8868,6 +8998,10 @@ async function saveWindowState(): Promise<void> {
       x: position.x,
       y: position.y,
       sidebar_width: sidebarWidth,
+      // A resize or sidebar drag can land before the restore has run; carry the
+      // stored working set through rather than clobbering it with an empty one
+      active_session_id: openSessionsRestored ? activeSessionId : loadedWindowState?.active_session_id ?? null,
+      open_session_ids: openSessionsRestored ? getOpenSessionIds() : loadedWindowState?.open_session_ids ?? [],
     };
 
     await invoke("save_window_state", { state });

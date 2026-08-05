@@ -470,6 +470,14 @@ struct WindowState {
     x: Option<i32>,
     y: Option<i32>,
     sidebar_width: Option<u32>,
+    /// Session selected when the app last quit, reselected on launch.
+    #[serde(default)]
+    active_session_id: Option<String>,
+    /// The working set: sessions that had a grid card (or were running) at
+    /// quit. Restored as grid cards on launch - the processes are not
+    /// restarted, only re-opened.
+    #[serde(default)]
+    open_session_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
