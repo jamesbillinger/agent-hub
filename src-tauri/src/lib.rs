@@ -1140,6 +1140,19 @@ fn update_session_cache_state(
     Ok(())
 }
 
+/// Forget a session's recorded size and cache expiry — used by /reset, which
+/// mints a new Claude session id and therefore strands the old cache entry.
+#[tauri::command]
+fn clear_session_cache_state(session_id: String) -> Result<(), String> {
+    let conn = DB_CONNECTION.lock();
+    conn.execute(
+        "UPDATE sessions SET context_tokens = NULL, cache_expires_at = NULL, cache_ttl_secs = NULL WHERE id = ?1",
+        params![session_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 fn save_session(session: SessionData) -> Result<(), String> {
     let is_new: bool;
@@ -5188,6 +5201,7 @@ pub fn run() {
             load_sessions,
             save_session,
             update_session_cache_state,
+            clear_session_cache_state,
             delete_session,
             update_session_claude_id,
             get_home_dir,
@@ -5267,6 +5281,7 @@ pub fn run() {
             load_sessions,
             save_session,
             update_session_cache_state,
+            clear_session_cache_state,
             list_scheduled_jobs,
             create_scheduled_job,
             update_scheduled_job,

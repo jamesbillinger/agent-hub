@@ -252,7 +252,11 @@ interface ModelUsageEntry {
 // JSON streaming message types from Claude
 interface ClaudeJsonMessage {
   type: "system" | "user" | "assistant" | "result";
-  subtype?: "init" | "success" | "error" | "resumed" | "stopped" | "status" | "compact_boundary";
+  subtype?: "init" | "success" | "error" | "resumed" | "stopped" | "status" | "compact_boundary" | "local_command";
+  // Top-level text on system messages. Slash commands arrive here wrapped as
+  // <command-name>/clear</command-name>, which is the only signal that the
+  // conversation was cleared - there is no compact_boundary for it.
+  content?: string;
   session_id?: string;
   // JSONL line uuid (present when messages come from on-disk history;
   // may be absent on fresh stream-json envelopes from the CLI).
@@ -5504,6 +5508,17 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
         updateContextIndicator(chatSession);
       }
 
+      // ...and the persisted size/cache state behind the sidebar and card chips.
+      // The old context is gone and its cache entry is unreachable - the new
+      // Claude session id above means the next start can't resume onto it - so
+      // leaving the chip showing the pre-reset size would be actively wrong.
+      session.contextTokens = undefined;
+      session.cacheExpiresAt = undefined;
+      session.cacheTtlSecs = undefined;
+      await invoke("clear_session_cache_state", { sessionId }).catch((err) =>
+        console.error("Failed to clear cache state:", err)
+      );
+
       // Save to database
       await saveSessionToDb(session);
 
@@ -7346,6 +7361,20 @@ function updateContextFromMessage(
     chatSession.totalInputTokens = 0;
     chatSession.totalOutputTokens = 0;
     updateContextIndicator(chatSession);
+    if (live) recordCacheState(sessionId, 0, undefined);
+    return;
+  }
+  // Clearing the conversation emits no compact_boundary - it arrives as a
+  // local_command naming the slash command. Without this the indicator keeps
+  // the pre-clear number until the next assistant turn happens to overwrite it,
+  // which is what made the percentages untrustworthy.
+  if (message.type === "system" && message.subtype === "local_command") {
+    if (/<command-name>\s*\/(clear|reset)\b/i.test(message.content || "")) {
+      chatSession.totalInputTokens = 0;
+      chatSession.totalOutputTokens = 0;
+      updateContextIndicator(chatSession);
+      if (live) recordCacheState(sessionId, 0, undefined);
+    }
     return;
   }
   if (message.type !== "assistant" || message.parent_tool_use_id) return;
@@ -7412,7 +7441,7 @@ function updateContextIndicator(chatSession: ChatSession, model?: string): void 
     chatSession.contextEl.title = "Context usage (no data yet)";
     chatSession.contextEl.className = "chat-context";
   } else {
-    chatSession.contextEl.textContent = `${percentLeft}% left`;
+    chatSession.contextEl.textContent = `${formatTokensCompact(totalTokens)} · ${percentage}%`;
     chatSession.contextEl.title = `Context: ${formatTokens(totalTokens)}/${formatTokens(usableContext)} tokens (${percentage}% used)\nAuto-compact triggers at ~95%`;
 
     // Color coding based on remaining space
