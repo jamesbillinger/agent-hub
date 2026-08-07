@@ -1137,6 +1137,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (e.target === planModal) hidePlanModal();
   });
 
+  setupLinkHandling();
+
   // Event delegation for diff expand buttons and clickable paths (dynamically added)
   // Use chat-container since chat-messages elements are created dynamically per session
   document.getElementById("chat-container")!.addEventListener("click", (e) => {
@@ -1161,29 +1163,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       return;
     }
 
-    // Handle clickable file paths - open in VS Code
-    const pathLink = (e.target as HTMLElement).closest("a[data-vscode-path]") as HTMLAnchorElement;
-    if (pathLink) {
-      e.preventDefault();
-      const vscodePath = pathLink.dataset.vscodePath || "";
-      if (vscodePath) {
-        // VS Code URL scheme: vscode://file/path/to/file:line:column
-        const vscodeUrl = `vscode://file${vscodePath}`;
-        openUrl(vscodeUrl).catch(err => console.error("Failed to open VS Code:", err));
-      }
-      return;
-    }
-
-    // Handle external links - open in default browser instead of navigating webview
-    const externalLink = (e.target as HTMLElement).closest("a[href^='http']") as HTMLAnchorElement;
-    if (externalLink && !externalLink.dataset.vscodePath) {
-      e.preventDefault();
-      const url = externalLink.href;
-      if (url) {
-        openUrl(url).catch(err => console.error("Failed to open external link:", err));
-      }
-      return;
-    }
+    // Link handling lives on document, not here - see setupLinkHandling()
 
     // Handle AskUserQuestion option clicks
     const askOption = (e.target as HTMLElement).closest(".ask-option") as HTMLButtonElement;
@@ -9138,6 +9118,54 @@ window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () 
 /**
  * Set up sidebar resize functionality.
  */
+/**
+ * Route every link click through the OS browser instead of the webview.
+ *
+ * This is bound to document rather than a container on purpose. It used to sit
+ * on #chat-container, but grid view moves each session's chat DOM out of that
+ * container and into its card, so links inside cards were never intercepted -
+ * clicking one navigated the whole app off tauri://localhost, with the session
+ * list, the grid and the running conversations replaced by the target page and
+ * no in-app way back. Links in modals and the sidebar had the same hole.
+ *
+ * Anchors are matched by their resolved .href, so a scheme-less or relative
+ * href ("jira.example.com/X-1") can't slip through the way an [href^='http']
+ * selector let it. Anything that isn't a real external scheme is blocked
+ * outright: nothing in a single-page app should ever navigate the webview.
+ */
+function setupLinkHandling(): void {
+  document.addEventListener("click", (e) => {
+    // An anchor with its own handler (the Settings URL list) has already acted
+    if (e.defaultPrevented) return;
+
+    const anchor = (e.target as HTMLElement).closest?.("a") as HTMLAnchorElement | null;
+    if (!anchor) return;
+
+    // VS Code file links carry a path rather than a usable href
+    const vscodePath = anchor.dataset.vscodePath;
+    if (vscodePath) {
+      e.preventDefault();
+      openUrl(`vscode://file${vscodePath}`).catch((err) =>
+        console.error("Failed to open VS Code:", err)
+      );
+      return;
+    }
+
+    const href = anchor.getAttribute("href");
+    if (!href || href.startsWith("#")) return; // in-page anchor, leave alone
+
+    // Past this point the click must not reach the webview's navigation
+    e.preventDefault();
+
+    const url = anchor.href; // resolved against the page, so always absolute
+    if (/^(https?|mailto):/i.test(url)) {
+      openUrl(url).catch((err) => console.error("Failed to open external link:", url, err));
+    } else {
+      console.warn("Blocked in-app navigation to", url);
+    }
+  });
+}
+
 function setupSidebarResize(): void {
   if (!sidebarResizeHandle || !sidebarEl) {
     console.warn("Sidebar resize elements not found");
