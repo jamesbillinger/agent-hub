@@ -2701,6 +2701,43 @@ fn get_config_path() -> PathBuf {
     data_dir.join("config.json")
 }
 
+/// Durable notes file for a scheduled job. Each firing now runs in a fresh
+/// Claude session, so this file is the only thing that carries between runs.
+/// Plain Markdown on disk on purpose: the job edits it with its normal file
+/// tools, and the user can read or reset it without going through the app.
+fn job_memory_path(job_id: &str) -> PathBuf {
+    let dir = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(get_app_data_dir_name())
+        .join("job_memory");
+    std::fs::create_dir_all(&dir).ok();
+    dir.join(format!("{}.md", job_id))
+}
+
+/// Frame a job's prompt with its carry-over notes. Split out from fire_job so
+/// the wording is testable without spawning a process.
+fn build_scheduled_prompt(prompt: &str, memory_path: &str, memory: &str) -> String {
+    let notes = memory.trim();
+    let notes_block = if notes.is_empty() {
+        "(empty - either this is the first run or the last run saved nothing)"
+    } else {
+        notes
+    };
+    format!(
+        "{prompt}\n\n\
+         ---\n\
+         This is a scheduled run in a fresh session. Nothing from previous runs is in your \
+         context except the notes below.\n\n\
+         Notes from previous runs ({memory_path}):\n\
+         {notes_block}\n\n\
+         Updating those notes is part of the job, not an optional extra - they are the only \
+         thing the next run will have. Finish by writing the full replacement text to \
+         {memory_path}: what the next run needs to compare against, what you already \
+         reported, anything left unfinished. Keep it brief, since it is prepended to every \
+         future run. Skip the write only if the notes above are already accurate."
+    )
+}
+
 fn get_window_state_path() -> PathBuf {
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -3909,25 +3946,33 @@ fn fire_job(job: &ScheduledJob) {
         }
     };
 
-    // Start if not running (will resume previous Claude session if claude_session_id is set)
+    // Every firing gets a fresh Claude session. This used to resume the previous
+    // one, which meant the job's context grew without bound - one job climbed
+    // from 56k to 116k tokens over three weeks and never reset - and pinned it to
+    // whatever model the session was first created with, because --model has no
+    // effect on --resume. Continuity comes from the job's notes file instead.
+    //
+    // A leftover process from the last run is idle, not working: the stream-json
+    // process stays alive waiting on stdin long after its run finished. Killing
+    // it is what makes the next run start clean.
     let is_running = { JSON_BROADCASTERS.lock().contains_key(&session_id) };
-    if !is_running {
-        // Load session to get claude_session_id for resuming
-        let session = load_sessions().ok()
-            .and_then(|sessions| sessions.into_iter().find(|s| s.id == session_id));
-        let claude_session_id = session.as_ref().and_then(|s| s.claude_session_id.clone());
-        let should_resume = claude_session_id.is_some();
-        if spawn_json_process(app.clone(), session_id.clone(), command, Some(working_dir), claude_session_id, Some(should_resume), None).is_err() {
-            return;
-        }
-        let _ = app.emit("remote-session-started", session_id.clone());
-        std::thread::sleep(std::time::Duration::from_secs(2));
+    if is_running {
+        let _ = kill_json_process(session_id.clone());
+        std::thread::sleep(std::time::Duration::from_millis(800));
     }
+    if spawn_json_process(app.clone(), session_id.clone(), command, Some(working_dir), None, Some(false), None).is_err() {
+        return;
+    }
+    let _ = app.emit("remote-session-started", session_id.clone());
+    std::thread::sleep(std::time::Duration::from_secs(2));
 
-    // Send prompt as stream-json
+    // Send prompt as stream-json, framed with whatever the last run chose to keep
+    let memory_path = job_memory_path(&job.id);
+    let memory = std::fs::read_to_string(&memory_path).unwrap_or_default();
+    let prompt = build_scheduled_prompt(&job.prompt, &memory_path.to_string_lossy(), &memory);
     let prompt_json = serde_json::json!({
         "type": "user",
-        "message": { "role": "user", "content": &job.prompt }
+        "message": { "role": "user", "content": prompt }
     }).to_string() + "\n";
 
     if let Err(e) = write_to_process(session_id.clone(), prompt_json) {
@@ -5224,5 +5269,29 @@ mod tests {
     #[test]
     fn absent_slot_still_cleans_up() {
         assert!(owns_session_slot("sess-never-registered", 1234));
+    }
+
+    /// The job's own prompt has to come first and survive intact - the
+    /// carry-over framing is an addition to it, never a replacement.
+    #[test]
+    fn scheduled_prompt_leads_with_the_job_prompt() {
+        let out = build_scheduled_prompt("Scan prod quarantines", "/tmp/j.md", "");
+        assert!(out.starts_with("Scan prod quarantines"), "got: {out}");
+        assert!(out.contains("/tmp/j.md"));
+    }
+
+    /// A first run must say so rather than presenting an empty notes section,
+    /// which reads as "there is nothing to report" instead of "no history yet".
+    #[test]
+    fn scheduled_prompt_marks_an_empty_memory() {
+        let out = build_scheduled_prompt("go", "/tmp/j.md", "   \n  ");
+        assert!(out.contains("first run"), "got: {out}");
+    }
+
+    #[test]
+    fn scheduled_prompt_includes_saved_notes() {
+        let out = build_scheduled_prompt("go", "/tmp/j.md", "last id seen: 4182\n");
+        assert!(out.contains("last id seen: 4182"));
+        assert!(!out.contains("first run"));
     }
 }
