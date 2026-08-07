@@ -167,6 +167,16 @@ marked.setOptions({
 });
 
 // Types
+/**
+ * The per-TTL split of a cache write. The flat cache_creation_input_tokens is
+ * the sum and doesn't say how long the entry lives; this is the only place the
+ * CLI states the TTL, so it decides whether a parked session is still warm.
+ */
+interface CacheCreationDetail {
+  ephemeral_5m_input_tokens?: number;
+  ephemeral_1h_input_tokens?: number;
+}
+
 interface Session {
   id: string;
   name: string;
@@ -185,6 +195,10 @@ interface Session {
   outputByteCount?: number; // Track bytes for periodic texture atlas clearing
   folderId?: string;
   envVars?: string; // JSON string of env var key-value pairs
+  // Cache state, persisted so the list can show it without opening the session
+  contextTokens?: number;   // context on the last top-level assistant turn
+  cacheExpiresAt?: string;  // RFC3339; when the prompt cache goes cold
+  cacheTtlSecs?: number;    // 300 or 3600, whichever the CLI asked for
 }
 
 interface SessionData {
@@ -198,6 +212,9 @@ interface SessionData {
   sort_order: number;
   folder_id: string | null;
   env_vars: string | null;
+  context_tokens?: number | null;
+  cache_expires_at?: string | null;
+  cache_ttl_secs?: number | null;
 }
 
 interface Folder {
@@ -256,6 +273,7 @@ interface ClaudeJsonMessage {
       output_tokens?: number;
       cache_creation_input_tokens?: number;
       cache_read_input_tokens?: number;
+      cache_creation?: CacheCreationDetail;
     };
   };
   result?: string;
@@ -283,6 +301,7 @@ interface ClaudeJsonMessage {
     output_tokens?: number;
     cache_creation_input_tokens?: number;
     cache_read_input_tokens?: number;
+    cache_creation?: CacheCreationDetail;
   };
   // Per-model usage on result messages; cumulative within one process run
   modelUsage?: Record<string, ModelUsageEntry>;
@@ -1344,7 +1363,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           // the activity indicator even though the user didn't send anything
           markSessionProcessingFromStream(sessionId, cs, message);
           // Track live context size from assistant events / compact boundaries
-          updateContextFromMessage(cs, message);
+          updateContextFromMessage(sessionId, cs, message);
         }
         // Handle result message completion
         handleResultMessage(sessionId, message);
@@ -2206,6 +2225,9 @@ async function loadSavedSessions() {
         sortOrder: data.sort_order,
         folderId: data.folder_id || undefined,
         envVars: data.env_vars || undefined,
+        contextTokens: data.context_tokens ?? undefined,
+        cacheExpiresAt: data.cache_expires_at ?? undefined,
+        cacheTtlSecs: data.cache_ttl_secs ?? undefined,
       };
       sessions.set(session.id, session);
     }
@@ -4095,6 +4117,11 @@ function createSessionItem(session: Session, index: number): HTMLElement {
   const isProcessing = chatSession?.isProcessing || false;
   const statusClass = isProcessing ? "processing" : (session.isRunning ? "running" : "");
 
+  const chip = cacheChip(session);
+  const chipHtml = chip
+    ? `<span class="${chip.cls}" title="${escapeHtml(chip.title)}">${escapeHtml(chip.text)}</span>`
+    : "";
+
   item.innerHTML = `
     <div class="drag-handle" title="Drag to reorder">⋮⋮</div>
     <div class="status ${statusClass}"></div>
@@ -4102,6 +4129,7 @@ function createSessionItem(session: Session, index: number): HTMLElement {
       <div class="name">${escapeHtml(session.name)}</div>
       ${agentBadgeHtml}
     </div>
+    ${chipHtml}
     ${shortcutHtml}
     <button class="close-btn" title="Close session">×</button>
   `;
@@ -4356,8 +4384,62 @@ function showSessionContextMenu(x: number, y: number, sessionId: string) {
 
   addMenuDivider(menu);
 
+  // Hand this session's history to a fresh one without carrying its context
+  addMenuItem(menu, "Copy handoff for a fresh session", () => copySessionHandoff(sessionId));
+
+  addMenuDivider(menu);
+
   // Close session
   addMenuItem(menu, "Close Session", () => closeSession(sessionId));
+}
+
+/** Brief confirmation for actions with no visible result of their own. */
+let toastTimer: number | null = null;
+function showToast(message: string): void {
+  let el = document.getElementById("app-toast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "app-toast";
+    document.body.appendChild(el);
+  }
+  el.textContent = message;
+  el.classList.add("visible");
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => el?.classList.remove("visible"), 2600);
+}
+
+/**
+ * Put a paste-ready pointer to this session's transcript on the clipboard, so a
+ * reset session can retrieve the old work on demand instead of carrying it.
+ *
+ * Deliberately tells the reader NOT to open the file: these transcripts run to
+ * several MB, and reading one whole would cost more than the context the reset
+ * was meant to shed. The search index is the cheap way in.
+ */
+async function copySessionHandoff(sessionId: string): Promise<void> {
+  const session = sessions.get(sessionId);
+  if (!session) return;
+  const claudeId = session.claudeSessionId;
+  if (!claudeId) {
+    showToast("No transcript yet — this session hasn't run.");
+    return;
+  }
+  const sizeNote = session.contextTokens
+    ? ` It reached about ${formatTokensCompact(session.contextTokens)} tokens of context, so do not read it whole.`
+    : "";
+  const text =
+    `Earlier work on this task is in a previous session: ${claudeId}` +
+    ` (working directory ${session.workingDir}).${sizeNote}\n\n` +
+    `Before re-deriving anything, search that history with the agent-hub MCP:\n` +
+    `  search_messages(query: "<terms>", session_id: "${claudeId}")\n` +
+    `  get_message_context(message_id: <id>)  — to expand around a hit\n\n` +
+    `Pull back only what you need.`;
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast("Handoff copied — paste it into the fresh session");
+  } catch (err) {
+    console.error("Failed to copy handoff:", err);
+  }
 }
 
 function showFolderContextMenu(x: number, y: number, folderId: string) {
@@ -4718,6 +4800,7 @@ function createGridCard(session: Session): HTMLElement {
       <span class="status-dot"></span>
       <span class="grid-card-title" title="Open full view">${escapeHtml(session.name)}</span>
       <span class="grid-card-model" title="Active model"></span>
+      <span class="grid-card-cache"></span>
       <span class="grid-card-status"></span>
       ${isChat ? `<button class="grid-card-zoom" title="Zoom (Esc to close)">⤢</button>` : ""}
       <button class="grid-card-close" title="Suspend session (stop, keep history)">×</button>
@@ -5010,6 +5093,15 @@ function updateGridCardStatus(sessionId: string): void {
   const statusEl = card.querySelector(".grid-card-status") as HTMLElement;
   const modelEl = card.querySelector(".grid-card-model") as HTMLElement;
   if (modelEl) modelEl.textContent = formatModelLabel(sessionId);
+
+  // Rides the 1s grid ticker, so the warm countdown updates on its own
+  const cacheEl = card.querySelector(".grid-card-cache") as HTMLElement | null;
+  if (cacheEl) {
+    const chip = cacheChip(session);
+    cacheEl.textContent = chip ? chip.text : "";
+    cacheEl.className = chip ? `grid-card-cache ${chip.cls}` : "grid-card-cache";
+    cacheEl.title = chip ? chip.title : "";
+  }
 
   card.classList.toggle("working", !!cs?.isProcessing);
   if (cs?.isProcessing) {
@@ -6901,7 +6993,7 @@ function processChatOutput(sessionId: string, data: string) {
       // Background-initiated turns must re-light the activity indicator
       markSessionProcessingFromStream(sessionId, chatSession, message);
       // Track live context size from assistant events / compact boundaries
-      updateContextFromMessage(chatSession, message);
+      updateContextFromMessage(sessionId, chatSession, message);
 
       // Check if response is complete - only the FINAL result has num_turns or total_cost_usd
       // Intermediate results (from Task subagents) don't have these fields
@@ -7192,7 +7284,64 @@ const AUTOCOMPACT_BUFFER = 45000;
  * synthetic messages (zero usage). A compact boundary clears the value until
  * the next real call reports the post-compact size.
  */
-function updateContextFromMessage(chatSession: ChatSession, message: ClaudeJsonMessage): void {
+/**
+ * Which TTL this turn's cache entry was written with, in seconds.
+ *
+ * Only a turn that actually wrote to the cache states a TTL. Most turns are
+ * pure reads, and a read refreshes the existing entry rather than replacing it -
+ * so on those we carry the session's last known TTL forward instead of
+ * defaulting, which would silently downgrade an hour-long cache to five minutes.
+ */
+function cacheTtlFromUsage(
+  usage: ClaudeJsonMessage["message"] extends infer M ? any : any,
+  previous?: number
+): number {
+  const cc = usage?.cache_creation;
+  const oneHour = cc?.ephemeral_1h_input_tokens || 0;
+  const fiveMin = cc?.ephemeral_5m_input_tokens || 0;
+  if (oneHour > 0) return 3600;
+  if (fiveMin > 0) return 300;
+  return previous || 300;
+}
+
+/** Cache state for the list/card/footer indicators, or null when unknown. */
+function cacheChip(session: Session | undefined): { text: string; cls: string; title: string } | null {
+  if (!session?.contextTokens) return null;
+  const size = formatTokensCompact(session.contextTokens);
+  const expiry = session.cacheExpiresAt ? Date.parse(session.cacheExpiresAt) : NaN;
+  if (!isFinite(expiry)) {
+    return { text: size, cls: "ctx-chip", title: `Context ${session.contextTokens.toLocaleString()} tokens` };
+  }
+  const msLeft = expiry - Date.now();
+  const ttlLabel = session.cacheTtlSecs === 3600 ? "1h" : "5m";
+  if (msLeft > 0) {
+    const mins = Math.max(1, Math.ceil(msLeft / 60000));
+    return {
+      text: `${size} · ${mins}m`,
+      cls: "ctx-chip warm",
+      title:
+        `Context ${session.contextTokens.toLocaleString()} tokens\n` +
+        `Prompt cache warm for ~${mins} more minute${mins === 1 ? "" : "s"} (${ttlLabel} TTL)\n` +
+        `Resuming now costs a cache read; after it lapses, the whole context is rewritten.`,
+    };
+  }
+  return {
+    text: `${size} · cold`,
+    cls: "ctx-chip cold",
+    title:
+      `Context ${session.contextTokens.toLocaleString()} tokens\n` +
+      `Prompt cache lapsed (${ttlLabel} TTL) — resuming rewrites the full context.`,
+  };
+}
+
+function updateContextFromMessage(
+  sessionId: string,
+  chatSession: ChatSession,
+  message: ClaudeJsonMessage,
+  // False when replaying persisted history: those turns already happened, so
+  // stamping a fresh expiry off them would mark every cold session warm on launch.
+  live: boolean = true
+): void {
   if (message.type === "system" && message.subtype === "compact_boundary") {
     chatSession.totalInputTokens = 0;
     chatSession.totalOutputTokens = 0;
@@ -7207,6 +7356,25 @@ function updateContextFromMessage(chatSession: ChatSession, message: ClaudeJsonM
   chatSession.totalInputTokens = ctx;
   chatSession.totalOutputTokens = u.output_tokens || 0;
   updateContextIndicator(chatSession);
+  if (live) recordCacheState(sessionId, ctx, u);
+}
+
+/**
+ * Persist context size and cache expiry so the sidebar can show them for
+ * sessions that aren't open. Every turn refreshes the cache, so the countdown
+ * restarts here rather than being tracked from when the entry was first written.
+ */
+function recordCacheState(sessionId: string, ctx: number, usage: NonNullable<ClaudeJsonMessage["message"]>["usage"]): void {
+  const session = sessions.get(sessionId);
+  if (!session) return;
+  const ttl = cacheTtlFromUsage(usage, session.cacheTtlSecs);
+  session.contextTokens = ctx;
+  session.cacheTtlSecs = ttl;
+  session.cacheExpiresAt = new Date(Date.now() + ttl * 1000).toISOString();
+  renderSessionList();
+  invoke("update_session_cache_state", { sessionId, contextTokens: ctx, ttlSecs: ttl }).catch((err) =>
+    console.error("Failed to persist cache state:", err)
+  );
 }
 
 /**
@@ -7767,7 +7935,7 @@ async function loadChatMessages(sessionId: string, chatSession: ChatSession): Pr
         renderChatMessage(chatSession, msg);
         // Replay context tracking in order so the indicator reflects the
         // latest top-level API call, honoring compact boundaries.
-        updateContextFromMessage(chatSession, msg);
+        updateContextFromMessage(sessionId, chatSession, msg, false);
         updateContextWindowFromResult(chatSession, msg);
       }
     }

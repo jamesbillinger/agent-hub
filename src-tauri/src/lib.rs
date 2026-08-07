@@ -599,6 +599,17 @@ struct SessionData {
     folder_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     env_vars: Option<String>,
+    /// Context size on the last top-level assistant turn. Persisted so the
+    /// sidebar can tell a 600k session from a 60k one without opening it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_tokens: Option<i64>,
+    /// When the prompt cache for this session goes cold (RFC3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_expires_at: Option<String>,
+    /// Which TTL the CLI actually asked for, 300 or 3600. Read from the usage
+    /// object rather than assumed - it varies per session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_ttl_secs: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -644,6 +655,18 @@ struct ClaudeContentItem {
     source: Option<serde_json::Value>,
 }
 
+/// Per-TTL split of the cache write, as the CLI reports it. The flat
+/// `cache_creation_input_tokens` is the sum and says nothing about how long the
+/// entry lives; this nested object is the only place the TTL is stated, so it
+/// has to be declared explicitly or serde drops it on the floor.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CacheCreationDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ephemeral_5m_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ephemeral_1h_input_tokens: Option<u64>,
+}
+
 /// Claude JSON message usage stats
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ClaudeUsage {
@@ -655,6 +678,8 @@ struct ClaudeUsage {
     cache_creation_input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_read_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_creation: Option<CacheCreationDetail>,
 }
 
 /// Claude JSON message inner message structure
@@ -801,6 +826,13 @@ fn run_db_migrations() {
 
     // Migration: Add sort_order column if it doesn't exist
     let _ = conn.execute("ALTER TABLE sessions ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0", []);
+
+    // Migration: cache state, so the session list can show how big a session is
+    // and whether its prompt cache is still warm without opening it. Recorded
+    // from each top-level assistant turn's usage.
+    let _ = conn.execute("ALTER TABLE sessions ADD COLUMN context_tokens INTEGER", []);
+    let _ = conn.execute("ALTER TABLE sessions ADD COLUMN cache_expires_at TEXT", []);
+    let _ = conn.execute("ALTER TABLE sessions ADD COLUMN cache_ttl_secs INTEGER", []);
 
     // Migration: Add running_pid column to track process PIDs across restarts
     let _ = conn.execute("ALTER TABLE sessions ADD COLUMN running_pid INTEGER", []);
@@ -1059,7 +1091,7 @@ fn is_valid_token(token: &str) -> bool {
 fn load_sessions() -> Result<Vec<SessionData>, String> {
     let conn = DB_CONNECTION.lock();
     let mut stmt = conn
-        .prepare("SELECT id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order, folder_id, env_vars FROM sessions ORDER BY sort_order ASC, created_at DESC")
+        .prepare("SELECT id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order, folder_id, env_vars, context_tokens, cache_expires_at, cache_ttl_secs FROM sessions ORDER BY sort_order ASC, created_at DESC")
         .map_err(|e| e.to_string())?;
 
     let sessions = stmt
@@ -1075,6 +1107,9 @@ fn load_sessions() -> Result<Vec<SessionData>, String> {
                 sort_order: row.get(7)?,
                 folder_id: row.get(8)?,
                 env_vars: row.get(9)?,
+                context_tokens: row.get(10).ok().flatten(),
+                cache_expires_at: row.get(11).ok().flatten(),
+                cache_ttl_secs: row.get(12).ok().flatten(),
             })
         })
         .map_err(|e| e.to_string())?
@@ -1082,6 +1117,27 @@ fn load_sessions() -> Result<Vec<SessionData>, String> {
         .collect();
 
     Ok(sessions)
+}
+
+/// Record a session's context size and when its prompt cache goes cold.
+///
+/// Written on every top-level assistant turn, so it's a narrow UPDATE rather
+/// than a full row save - `save_session` broadcasts to mobile and rewrites ten
+/// columns, which is far too heavy for something that fires per turn.
+#[tauri::command]
+fn update_session_cache_state(
+    session_id: String,
+    context_tokens: i64,
+    ttl_secs: i64,
+) -> Result<(), String> {
+    let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(ttl_secs)).to_rfc3339();
+    let conn = DB_CONNECTION.lock();
+    conn.execute(
+        "UPDATE sessions SET context_tokens = ?1, cache_expires_at = ?2, cache_ttl_secs = ?3 WHERE id = ?4",
+        params![context_tokens, expires_at, ttl_secs, session_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1097,9 +1153,23 @@ fn save_session(session: SessionData) -> Result<(), String> {
             |row| row.get::<_, i32>(0)
         ).unwrap_or(0) == 0;
 
+        // Upsert only the columns this call owns. INSERT OR REPLACE rewrites the
+        // whole row, which silently nulls every column added by a later migration
+        // and not listed here - running_pid was already being wiped on every
+        // rename, and the cache-state columns would be too.
         conn.execute(
-            "INSERT OR REPLACE INTO sessions (id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order, folder_id, env_vars)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO sessions (id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order, folder_id, env_vars)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name,
+               agent_type = excluded.agent_type,
+               command = excluded.command,
+               working_dir = excluded.working_dir,
+               created_at = excluded.created_at,
+               claude_session_id = excluded.claude_session_id,
+               sort_order = excluded.sort_order,
+               folder_id = excluded.folder_id,
+               env_vars = excluded.env_vars",
             params![
                 session.id,
                 session.name,
@@ -3572,6 +3642,9 @@ async fn api_create_session(
         sort_order: min_sort_order - 1,
         folder_id,
         env_vars,
+        context_tokens: None,
+        cache_expires_at: None,
+        cache_ttl_secs: None,
     };
 
     // Save to database
@@ -3792,6 +3865,9 @@ async fn api_webhook_teams(
                 sort_order: min_sort_order - 1,
                 folder_id: None,
                 env_vars: None,
+                context_tokens: None,
+                cache_expires_at: None,
+                cache_ttl_secs: None,
             };
             if let Err(e) = save_session(session.clone()) {
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response();
@@ -3937,6 +4013,9 @@ fn fire_job(job: &ScheduledJob) {
                 sort_order: min_sort_order - 1,
                 folder_id: None,
                 env_vars: None,
+                context_tokens: None,
+                cache_expires_at: None,
+                cache_ttl_secs: None,
             };
             if save_session(session.clone()).is_err() { return; }
             let _ = app.emit("remote-session-created", serde_json::json!({
@@ -5108,6 +5187,7 @@ pub fn run() {
             kill_json_process,
             load_sessions,
             save_session,
+            update_session_cache_state,
             delete_session,
             update_session_claude_id,
             get_home_dir,
@@ -5186,6 +5266,7 @@ pub fn run() {
             // spawn_pty, write_pty, resize_pty, kill_pty
             load_sessions,
             save_session,
+            update_session_cache_state,
             list_scheduled_jobs,
             create_scheduled_job,
             update_scheduled_job,
