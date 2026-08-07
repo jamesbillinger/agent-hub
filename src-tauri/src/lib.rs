@@ -610,6 +610,12 @@ struct SessionData {
     /// object rather than assumed - it varies per session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cache_ttl_secs: Option<i64>,
+    /// Keep the prompt cache warm until this instant (RFC3339). Deliberately an
+    /// expiry rather than a boolean: an open-ended toggle left on overnight
+    /// costs more than the cold resume it avoids, so arming is time-bounded and
+    /// disarms itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    keepalive_until: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -833,6 +839,7 @@ fn run_db_migrations() {
     let _ = conn.execute("ALTER TABLE sessions ADD COLUMN context_tokens INTEGER", []);
     let _ = conn.execute("ALTER TABLE sessions ADD COLUMN cache_expires_at TEXT", []);
     let _ = conn.execute("ALTER TABLE sessions ADD COLUMN cache_ttl_secs INTEGER", []);
+    let _ = conn.execute("ALTER TABLE sessions ADD COLUMN keepalive_until TEXT", []);
 
     // Migration: Add running_pid column to track process PIDs across restarts
     let _ = conn.execute("ALTER TABLE sessions ADD COLUMN running_pid INTEGER", []);
@@ -1091,7 +1098,7 @@ fn is_valid_token(token: &str) -> bool {
 fn load_sessions() -> Result<Vec<SessionData>, String> {
     let conn = DB_CONNECTION.lock();
     let mut stmt = conn
-        .prepare("SELECT id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order, folder_id, env_vars, context_tokens, cache_expires_at, cache_ttl_secs FROM sessions ORDER BY sort_order ASC, created_at DESC")
+        .prepare("SELECT id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order, folder_id, env_vars, context_tokens, cache_expires_at, cache_ttl_secs, keepalive_until FROM sessions ORDER BY sort_order ASC, created_at DESC")
         .map_err(|e| e.to_string())?;
 
     let sessions = stmt
@@ -1110,6 +1117,7 @@ fn load_sessions() -> Result<Vec<SessionData>, String> {
                 context_tokens: row.get(10).ok().flatten(),
                 cache_expires_at: row.get(11).ok().flatten(),
                 cache_ttl_secs: row.get(12).ok().flatten(),
+                keepalive_until: row.get(13).ok().flatten(),
             })
         })
         .map_err(|e| e.to_string())?
@@ -1146,8 +1154,20 @@ fn update_session_cache_state(
 fn clear_session_cache_state(session_id: String) -> Result<(), String> {
     let conn = DB_CONNECTION.lock();
     conn.execute(
-        "UPDATE sessions SET context_tokens = NULL, cache_expires_at = NULL, cache_ttl_secs = NULL WHERE id = ?1",
+        "UPDATE sessions SET context_tokens = NULL, cache_expires_at = NULL, cache_ttl_secs = NULL, keepalive_until = NULL WHERE id = ?1",
         params![session_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Arm or disarm cache keepalive. `until` is RFC3339, or None to disarm.
+#[tauri::command]
+fn set_session_keepalive(session_id: String, until: Option<String>) -> Result<(), String> {
+    let conn = DB_CONNECTION.lock();
+    conn.execute(
+        "UPDATE sessions SET keepalive_until = ?1 WHERE id = ?2",
+        params![until, session_id],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -3658,6 +3678,7 @@ async fn api_create_session(
         context_tokens: None,
         cache_expires_at: None,
         cache_ttl_secs: None,
+        keepalive_until: None,
     };
 
     // Save to database
@@ -3881,6 +3902,7 @@ async fn api_webhook_teams(
                 context_tokens: None,
                 cache_expires_at: None,
                 cache_ttl_secs: None,
+                keepalive_until: None,
             };
             if let Err(e) = save_session(session.clone()) {
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response();
@@ -4029,6 +4051,7 @@ fn fire_job(job: &ScheduledJob) {
                 context_tokens: None,
                 cache_expires_at: None,
                 cache_ttl_secs: None,
+                keepalive_until: None,
             };
             if save_session(session.clone()).is_err() { return; }
             let _ = app.emit("remote-session-created", serde_json::json!({
@@ -5202,6 +5225,7 @@ pub fn run() {
             save_session,
             update_session_cache_state,
             clear_session_cache_state,
+            set_session_keepalive,
             delete_session,
             update_session_claude_id,
             get_home_dir,
@@ -5282,6 +5306,7 @@ pub fn run() {
             save_session,
             update_session_cache_state,
             clear_session_cache_state,
+            set_session_keepalive,
             list_scheduled_jobs,
             create_scheduled_job,
             update_scheduled_job,

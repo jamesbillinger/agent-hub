@@ -199,6 +199,7 @@ interface Session {
   contextTokens?: number;   // context on the last top-level assistant turn
   cacheExpiresAt?: string;  // RFC3339; when the prompt cache goes cold
   cacheTtlSecs?: number;    // 300 or 3600, whichever the CLI asked for
+  keepaliveUntil?: string;  // RFC3339; keep the cache warm until this instant
 }
 
 interface SessionData {
@@ -215,6 +216,7 @@ interface SessionData {
   context_tokens?: number | null;
   cache_expires_at?: string | null;
   cache_ttl_secs?: number | null;
+  keepalive_until?: string | null;
 }
 
 interface Folder {
@@ -1161,6 +1163,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   setupLinkHandling();
+
+  // Keepalive sweep. Cheap: it exits immediately unless a session is armed and
+  // genuinely near expiry.
+  window.setInterval(() => { void sweepKeepalive(); }, 60_000);
 
   // Event delegation for diff expand buttons and clickable paths (dynamically added)
   // Use chat-container since chat-messages elements are created dynamically per session
@@ -2232,6 +2238,7 @@ async function loadSavedSessions() {
         contextTokens: data.context_tokens ?? undefined,
         cacheExpiresAt: data.cache_expires_at ?? undefined,
         cacheTtlSecs: data.cache_ttl_secs ?? undefined,
+        keepaliveUntil: data.keepalive_until ?? undefined,
       };
       sessions.set(session.id, session);
     }
@@ -4391,6 +4398,24 @@ function showSessionContextMenu(x: number, y: number, sessionId: string) {
   // Hand this session's history to a fresh one without carrying its context
   addMenuItem(menu, "Copy handoff for a fresh session", () => copySessionHandoff(sessionId));
 
+  // Keepalive is only offered on 1h-TTL sessions. On a 5m TTL it would need a
+  // ping every few minutes — twelve full context reads an hour, which costs
+  // far more than the cold resume it's avoiding.
+  const kaSession = sessions.get(sessionId);
+  if (kaSession?.cacheTtlSecs === 3600 && kaSession.contextTokens) {
+    if (keepaliveArmed(kaSession)) {
+      addMenuItem(
+        menu,
+        `Stop keeping cache warm (until ${new Date(kaSession.keepaliveUntil!).toLocaleTimeString()})`,
+        () => setKeepalive(sessionId, null)
+      );
+    } else {
+      for (const [label, mins] of [["1 hour", 60], ["2 hours", 120], ["4 hours", 240]] as const) {
+        addMenuItem(menu, `Keep cache warm for ${label}`, () => setKeepalive(sessionId, mins));
+      }
+    }
+  }
+
   addMenuDivider(menu);
 
   // Close session
@@ -5515,6 +5540,7 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
       session.contextTokens = undefined;
       session.cacheExpiresAt = undefined;
       session.cacheTtlSecs = undefined;
+      session.keepaliveUntil = undefined;
       await invoke("clear_session_cache_state", { sessionId }).catch((err) =>
         console.error("Failed to clear cache state:", err)
       );
@@ -7319,6 +7345,87 @@ function cacheTtlFromUsage(
   return previous || 300;
 }
 
+// Keepalive: fire a ping when the cache is this close to lapsing. Wide enough to
+// absorb a slow turn and the 60s sweep interval, narrow enough that a session
+// being used normally never pings — a real turn refreshes the cache and pushes
+// the expiry back out of this window on its own.
+const KEEPALIVE_LEAD_MS = 6 * 60 * 1000;
+
+/** True when keepalive is armed and hasn't expired. */
+function keepaliveArmed(session: Session | undefined): boolean {
+  if (!session?.keepaliveUntil) return false;
+  const until = Date.parse(session.keepaliveUntil);
+  return isFinite(until) && until > Date.now();
+}
+
+/**
+ * Keep armed sessions' caches warm.
+ *
+ * A ping is a real turn — Agent Hub talks to the CLI over stream-json and can't
+ * issue the cheap prefill-only request the API offers — so it costs a full
+ * context read. That's the whole reason arming is time-bounded and this only
+ * fires inside KEEPALIVE_LEAD_MS of actual expiry.
+ */
+async function sweepKeepalive(): Promise<void> {
+  for (const session of sessions.values()) {
+    if (!keepaliveArmed(session)) continue;
+
+    // Deliberately not gated on session.isRunning: loadSavedSessions hardcodes
+    // that to false, so after a webview reload the frontend believes nothing is
+    // running even while the backend still holds live processes, and keepalive
+    // would silently never fire. write_to_process is the authority — it errors
+    // if there's no process, and never starts one, so attempting is safe.
+    const cs = chatSessions.get(session.id);
+    if (cs?.isProcessing) continue;
+
+    const expiry = session.cacheExpiresAt ? Date.parse(session.cacheExpiresAt) : NaN;
+    if (!isFinite(expiry)) continue;
+    const msLeft = expiry - Date.now();
+    if (msLeft > KEEPALIVE_LEAD_MS || msLeft < -KEEPALIVE_LEAD_MS) continue;
+
+    const ping =
+      "(Automated keepalive from Agent Hub — no task attached. " +
+      "Reply with exactly OK. Do not use tools or take any action.)";
+    try {
+      await invoke("write_to_process", {
+        sessionId: session.id,
+        data: JSON.stringify({ type: "user", message: { role: "user", content: ping } }) + "\n",
+      });
+      // The ping itself is written straight to the process and never rendered,
+      // so without this the model's "OK" appears out of nowhere with no prompt
+      // above it. Mark it instead of showing the ping, which would be noise.
+      addChatMessage(session.id, {
+        type: "system",
+        result: `--- Cache keepalive ping (${new Date().toLocaleTimeString()}) ---`,
+      });
+    } catch (err) {
+      // No process to write to. Nothing we send can keep this cache warm, so
+      // disarm rather than retry every minute behind an "armed" chip that is
+      // quietly doing nothing.
+      console.error("Keepalive ping failed, disarming:", err);
+      await setKeepalive(session.id, null);
+      showToast(`Keepalive off for "${session.name}" — session isn't running`);
+    }
+  }
+}
+
+/** Arm keepalive for a window, or disarm when minutes is null. */
+async function setKeepalive(sessionId: string, minutes: number | null): Promise<void> {
+  const session = sessions.get(sessionId);
+  if (!session) return;
+  const until = minutes === null ? undefined : new Date(Date.now() + minutes * 60_000).toISOString();
+  session.keepaliveUntil = until;
+  renderSessionList();
+  await invoke("set_session_keepalive", { sessionId, until: until ?? null }).catch((err) =>
+    console.error("Failed to set keepalive:", err)
+  );
+  showToast(
+    until
+      ? `Keeping cache warm until ${new Date(until).toLocaleTimeString()}`
+      : "Keepalive off"
+  );
+}
+
 /** Cache state for the list/card/footer indicators, or null when unknown. */
 function cacheChip(session: Session | undefined): { text: string; cls: string; title: string } | null {
   if (!session?.contextTokens) return null;
@@ -7329,15 +7436,23 @@ function cacheChip(session: Session | undefined): { text: string; cls: string; t
   }
   const msLeft = expiry - Date.now();
   const ttlLabel = session.cacheTtlSecs === 3600 ? "1h" : "5m";
+  // The armed marker matters as much as the countdown: arming keepalive trades
+  // one worry ("has it gone cold?") for another ("did I remember to arm it?"),
+  // so the answer has to be on screen rather than in the user's head.
+  const armed = keepaliveArmed(session);
+  const armedNote = armed
+    ? `\nKeepalive on until ${new Date(session.keepaliveUntil!).toLocaleTimeString()}`
+    : "";
   if (msLeft > 0) {
     const mins = Math.max(1, Math.ceil(msLeft / 60000));
     return {
-      text: `${size} · ${mins}m`,
-      cls: "ctx-chip warm",
+      text: `${armed ? "↻ " : ""}${size} · ${mins}m`,
+      cls: `ctx-chip warm${armed ? " armed" : ""}`,
       title:
         `Context ${session.contextTokens.toLocaleString()} tokens\n` +
         `Prompt cache warm for ~${mins} more minute${mins === 1 ? "" : "s"} (${ttlLabel} TTL)\n` +
-        `Resuming now costs a cache read; after it lapses, the whole context is rewritten.`,
+        `Resuming now costs a cache read; after it lapses, the whole context is rewritten.` +
+        armedNote,
     };
   }
   return {
