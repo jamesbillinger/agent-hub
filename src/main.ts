@@ -368,6 +368,19 @@ interface ChatSession {
   totalOutputTokens: number;
   contextWindow?: number; // Real context window reported by the CLI's modelUsage
   dirty: boolean; // Track if messages changed since last save
+  // Work launched with run_in_background, keyed by the launching tool_use id.
+  // Its tool_result returns immediately ("running in background..."), so nothing
+  // else in the UI reflects that the work is still outstanding.
+  backgroundTasks: Map<string, BackgroundTask>;
+}
+
+interface BackgroundTask {
+  toolUseId: string;
+  taskId?: string;       // the short id the result hands back
+  description: string;
+  startedAt: number;
+  status?: string;       // set once a task-notification arrives
+  summary?: string;
 }
 
 interface WindowState {
@@ -1377,6 +1390,8 @@ document.addEventListener("DOMContentLoaded", async () => {
           markSessionProcessingFromStream(sessionId, cs, message);
           // Track live context size from assistant events / compact boundaries
           updateContextFromMessage(sessionId, cs, message);
+          trackBackgroundTasks(cs, message);
+          updateBackgroundIndicator(cs);
         }
         // Handle result message completion
         handleResultMessage(sessionId, message);
@@ -1399,6 +1414,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     updateSessionActivityIndicator(sessionId, false);
     const thinkingEl = chatSession.containerEl.querySelector(".chat-thinking") as HTMLElement;
     if (thinkingEl) thinkingEl.style.display = "none";
+
+    // End of turn: the transcript may now record background tasks finishing.
+    // No-ops unless something is actually outstanding.
+    void reconcileBackgroundTasks(sessionId, chatSession);
 
     // Update status with detailed usage info
     const parts: string[] = ["Done"];
@@ -5231,6 +5250,7 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
       <div class="chat-status">Ready</div>
       <div class="chat-model" title="Active model"></div>
       <div class="chat-context" title="Context usage">—</div>
+      <div class="chat-background" title="Background tasks"></div>
     </div>
   `;
 
@@ -5268,6 +5288,7 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
     startTime: null,
     totalInputTokens: 0,
     totalOutputTokens: 0,
+    backgroundTasks: new Map(),
     dirty: false,
   };
 
@@ -5421,6 +5442,7 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
   // Always try to load existing messages - buffer may exist even if claudeSessionId is missing
   // (e.g., session was used but claudeSessionId wasn't saved properly)
   await loadChatMessages(session.id, chatSession);
+  updateBackgroundIndicator(chatSession);
 
   // If we loaded messages, mark the session as having been started
   if (chatSession.messages.length > 0 && !session.hasBeenStarted) {
@@ -7031,6 +7053,8 @@ function processChatOutput(sessionId: string, data: string) {
       markSessionProcessingFromStream(sessionId, chatSession, message);
       // Track live context size from assistant events / compact boundaries
       updateContextFromMessage(sessionId, chatSession, message);
+      trackBackgroundTasks(chatSession, message);
+      updateBackgroundIndicator(chatSession);
 
       // Check if response is complete - only the FINAL result has num_turns or total_cost_usd
       // Intermediate results (from Task subagents) don't have these fields
@@ -7441,6 +7465,158 @@ function contextResetNotice(oldId: string | undefined, newId: string): string {
     `"Copy handoff for a fresh session" in this session's right-click menu puts ` +
     `a paste-ready pointer to it on the clipboard.`
   );
+}
+
+// A background task still listed after this long is almost certainly finished —
+// its completion notification arrived while the app was closed and replay can't
+// recover it. Better to under-report than to leave a phantom running forever.
+const BACKGROUND_TASK_MAX_AGE_MS = 4 * 60 * 60 * 1000;
+
+/**
+ * Track work launched with run_in_background.
+ *
+ * Unlike a normal tool call, the launching tool_result comes back immediately
+ * ("Command running in background with ID: …") while the work carries on, so
+ * nothing already in the UI reflects that anything is outstanding. Completion
+ * arrives later as a <task-notification> carrying the launching tool_use id,
+ * which makes launch → completion an exact join rather than a guess.
+ *
+ * Runs on replayed history too: launches and notifications are both in the
+ * transcript, so replaying them reconstructs the correct end state.
+ */
+function trackBackgroundTasks(chatSession: ChatSession, message: ClaudeJsonMessage): void {
+  // Replayed history must use the message's own timestamp, not now, or a task
+  // launched hours ago looks brand new and never ages out of the running list.
+  // received_at is an epoch ms number, not a string
+  const startedAt = typeof message.received_at === "number" && isFinite(message.received_at)
+    ? message.received_at
+    : Date.now();
+  const blocks = message.message?.content;
+  if (!Array.isArray(blocks)) {
+    // Notifications can also arrive as a plain string user message
+    if (typeof message.message?.content === "string") {
+      applyTaskNotifications(chatSession, message.message.content);
+    }
+    return;
+  }
+
+  for (const b of blocks as any[]) {
+    if (b?.type === "tool_use" && b.name === "TaskStop") {
+      // A stopped task never sends a completion notification, so without this it
+      // sits in the running list until it ages out hours later.
+      const stopId = b.input?.task_id || b.input?.shell_id;
+      const victim = Array.from(chatSession.backgroundTasks.values()).find(
+        (t) => t.taskId === stopId || t.toolUseId === stopId
+      );
+      if (victim) {
+        victim.status = "stopped";
+        victim.summary = "Stopped before completion";
+      }
+    } else if (b?.type === "tool_use" && b.input?.run_in_background === true) {
+      chatSession.backgroundTasks.set(b.id, {
+        toolUseId: b.id,
+        description: String(b.input.description || b.input.command || "background task").slice(0, 120),
+        startedAt,
+      });
+    } else if (b?.type === "tool_result") {
+      const text = typeof b.content === "string" ? b.content : JSON.stringify(b.content ?? "");
+      // The launching result carries the short task id
+      // Not \S+ — the sentence continues "with ID: btnialu2e. Output is..." and
+      // a greedy match swallows the full stop into the id.
+      const started = /running in background with ID:\s*([A-Za-z0-9_-]+)/i.exec(text);
+      if (started && b.tool_use_id) {
+        const task = chatSession.backgroundTasks.get(b.tool_use_id);
+        if (task) task.taskId = started[1];
+      }
+      applyTaskNotifications(chatSession, text);
+    }
+  }
+}
+
+/** Mark tasks finished from any <task-notification> blocks in a payload. */
+function applyTaskNotifications(chatSession: ChatSession, text: string): void {
+  if (!text.includes("<task-notification>")) return;
+  const re = /<task-notification>([\s\S]*?)<\/task-notification>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const body = m[1];
+    const toolUseId = /<tool-use-id>\s*([^<\s]+)\s*<\/tool-use-id>/.exec(body)?.[1];
+    const taskId = /<task-id>\s*([^<\s]+)\s*<\/task-id>/.exec(body)?.[1];
+    const status = /<status>\s*([^<]*?)\s*<\/status>/.exec(body)?.[1];
+    const summary = /<summary>\s*([\s\S]*?)\s*<\/summary>/.exec(body)?.[1];
+
+    // Prefer the tool_use id; fall back to the short task id for older payloads
+    let task = toolUseId ? chatSession.backgroundTasks.get(toolUseId) : undefined;
+    if (!task && taskId) {
+      task = Array.from(chatSession.backgroundTasks.values()).find((t) => t.taskId === taskId);
+    }
+    if (task) {
+      task.status = status || "completed";
+      task.summary = summary;
+    }
+  }
+}
+
+/**
+ * Reconcile outstanding tasks against the transcript.
+ *
+ * Completion notices are harness-injected user messages: they exist in the JSONL
+ * but never appear in stream-json, so the live stream cannot tell us a task
+ * finished. Called at end of turn, and only when something is actually
+ * outstanding, so a session with no background work never touches the disk.
+ */
+async function reconcileBackgroundTasks(sessionId: string, chatSession: ChatSession): Promise<void> {
+  if (runningBackgroundTasks(chatSession).length === 0) return;
+  const session = sessions.get(sessionId);
+  if (!session?.claudeSessionId || !session.workingDir) return;
+  try {
+    const notes = await invoke<any[]>("scan_task_notifications", {
+      sessionId: session.claudeSessionId,
+      project: session.workingDir,
+    });
+    for (const n of notes || []) {
+      let task = n.tool_use_id ? chatSession.backgroundTasks.get(n.tool_use_id) : undefined;
+      if (!task && n.task_id) {
+        task = Array.from(chatSession.backgroundTasks.values()).find((t) => t.taskId === n.task_id);
+      }
+      if (task && !task.status) {
+        task.status = n.status || "completed";
+        task.summary = n.summary || undefined;
+      }
+    }
+    updateBackgroundIndicator(chatSession);
+  } catch (err) {
+    console.error("Failed to reconcile background tasks:", err);
+  }
+}
+
+/** Background tasks still believed to be running, newest first. */
+function runningBackgroundTasks(chatSession: ChatSession | undefined): BackgroundTask[] {
+  if (!chatSession) return [];
+  const now = Date.now();
+  return Array.from(chatSession.backgroundTasks.values())
+    .filter((t) => !t.status && now - t.startedAt < BACKGROUND_TASK_MAX_AGE_MS)
+    .sort((a, b) => b.startedAt - a.startedAt);
+}
+
+/** Refresh the footer's background-task indicator. */
+function updateBackgroundIndicator(chatSession: ChatSession): void {
+  const el = chatSession.containerEl.querySelector(".chat-background") as HTMLElement | null;
+  if (!el) return;
+  const running = runningBackgroundTasks(chatSession);
+  if (running.length === 0) {
+    el.textContent = "";
+    el.className = "chat-background";
+    el.title = "";
+    return;
+  }
+  el.textContent = `⚙ ${running.length} running`;
+  el.className = "chat-background active";
+  el.title =
+    `${running.length} background task${running.length === 1 ? "" : "s"} still running:\n` +
+    running
+      .map((t) => `• ${t.description} — ${formatGridElapsed(Date.now() - t.startedAt)}`)
+      .join("\n");
 }
 
 /** Arm keepalive for a window, or disarm when minutes is null. */
@@ -8114,6 +8290,7 @@ async function loadChatMessages(sessionId: string, chatSession: ChatSession): Pr
         // Replay context tracking in order so the indicator reflects the
         // latest top-level API call, honoring compact boundaries.
         updateContextFromMessage(sessionId, chatSession, msg, false);
+        trackBackgroundTasks(chatSession, msg);
         updateContextWindowFromResult(chatSession, msg);
       }
     }

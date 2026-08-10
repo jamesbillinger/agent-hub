@@ -4373,3 +4373,15 @@ body.resizing-sidebar {
 .grid-card-cache.armed {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-yellow) 45%, transparent);
 }
+
+/* Background-task indicator — work launched with run_in_background, whose
+   launching tool_result returns immediately while the work carries on */
+.chat-background {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.chat-background.active {
+  color: var(--accent-blue);
+  font-variant-numeric: tabular-nums;
+}

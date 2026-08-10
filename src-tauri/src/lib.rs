@@ -1763,6 +1763,52 @@ fn list_claude_sessions(_working_dir: Option<String>) -> Result<Vec<ClaudeSessio
 }
 
 /// Load the full message history from a Claude session file
+/// Completion notices for background tasks, scanned out of the session's JSONL.
+///
+/// These arrive as harness-injected `user` messages and are absent from the
+/// stream-json the CLI writes to stdout, so the live stream never carries them —
+/// the transcript is the only place they exist. Without this, a finished task
+/// stays on the running list until the next reload replays history.
+#[cfg(not(target_os = "ios"))]
+#[tauri::command]
+fn scan_task_notifications(session_id: String, project: String) -> Result<Vec<serde_json::Value>, String> {
+    let messages = load_claude_session_history(session_id, project)?;
+    let mut out = Vec::new();
+    for msg in messages {
+        let content = msg
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        if !content.contains("<task-notification>") {
+            continue;
+        }
+        for chunk in content.split("<task-notification>").skip(1) {
+            let body = chunk.split("</task-notification>").next().unwrap_or("");
+            let field = |tag: &str| -> Option<String> {
+                let open = format!("<{}>", tag);
+                let close = format!("</{}>", tag);
+                let start = body.find(&open)? + open.len();
+                let end = body[start..].find(&close)? + start;
+                Some(body[start..end].trim().to_string())
+            };
+            out.push(serde_json::json!({
+                "task_id": field("task-id"),
+                "tool_use_id": field("tool-use-id"),
+                "status": field("status"),
+                "summary": field("summary"),
+            }));
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(target_os = "ios")]
+#[tauri::command]
+fn scan_task_notifications(_session_id: String, _project: String) -> Result<Vec<serde_json::Value>, String> {
+    Ok(vec![])
+}
+
 #[cfg(not(target_os = "ios"))]
 #[tauri::command]
 fn load_claude_session_history(session_id: String, project: String) -> Result<Vec<serde_json::Value>, String> {
@@ -1780,6 +1826,21 @@ fn load_claude_session_history(session_id: String, project: String) -> Result<Ve
     // pick the first one that has the file. Falls back to ~/.claude.
     let settings = load_app_settings().unwrap_or_default();
     let mut search_homes: Vec<String> = settings.claude_search_dirs.clone();
+    // The home this app's own sessions write to must be searched first, even if
+    // the user never added it to claude_search_dirs. Those two settings are
+    // independent, and when they disagree every JSONL lookup fails and
+    // loadChatMessages falls back to the legacy terminal_buffer blob - which
+    // carries no uuid, silently breaking search jump-to-message.
+    if let Some(dir) = settings
+        .claude_config_dir
+        .as_ref()
+        .map(|d| d.trim())
+        .filter(|d| !d.is_empty())
+    {
+        if !search_homes.iter().any(|h| h == dir) {
+            search_homes.insert(0, dir.to_string());
+        }
+    }
     if !search_homes.iter().any(|h| h == "~/.claude") {
         search_homes.push("~/.claude".to_string());
     }
@@ -5231,6 +5292,7 @@ pub fn run() {
             get_home_dir,
             list_claude_sessions,
             load_claude_session_history,
+            scan_task_notifications,
             update_session_orders,
             save_recently_closed,
             get_recently_closed,
@@ -5315,6 +5377,7 @@ pub fn run() {
             update_session_claude_id,
             list_claude_sessions,
             load_claude_session_history,
+            scan_task_notifications,
             update_session_orders,
             save_recently_closed,
             get_recently_closed,
