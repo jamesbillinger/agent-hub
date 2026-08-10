@@ -831,13 +831,16 @@ async function resetClaudeSessionId(sessionId: string): Promise<void> {
     chatSession.statusEl.className = "chat-status";
 
     // Add visual indicator
-    const timestamp = new Date().toLocaleTimeString();
     addChatMessage(sessionId, {
       type: "system",
       subtype: "stopped",
-      result: `--- Context reset at ${timestamp} ---\n**Claude's memory of this conversation is now cleared.** The next message starts a brand-new session — Claude will not remember anything above. The chat log is kept for display only.\n(previous Claude session: ${oldSessionId?.substring(0, 8) || "none"}… → new: ${session.claudeSessionId.substring(0, 8)}…)`,
+      result: contextResetNotice(oldSessionId, session.claudeSessionId),
     });
   }
+
+  // This path was missing the cache-state clear the /reset command does, so a
+  // reset from here left the sidebar chip advertising the pre-reset size.
+  await clearSessionCacheState(session);
 
   // Save to database
   await saveSessionToDb(session);
@@ -5537,23 +5540,16 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
       // The old context is gone and its cache entry is unreachable - the new
       // Claude session id above means the next start can't resume onto it - so
       // leaving the chip showing the pre-reset size would be actively wrong.
-      session.contextTokens = undefined;
-      session.cacheExpiresAt = undefined;
-      session.cacheTtlSecs = undefined;
-      session.keepaliveUntil = undefined;
-      await invoke("clear_session_cache_state", { sessionId }).catch((err) =>
-        console.error("Failed to clear cache state:", err)
-      );
+      await clearSessionCacheState(session);
 
       // Save to database
       await saveSessionToDb(session);
 
       // Add visual indicator
-      const timestamp = new Date().toLocaleTimeString();
       addChatMessage(sessionId, {
         type: "system",
         subtype: "stopped",
-        result: `--- Context reset at ${timestamp} ---\n**Claude's memory of this conversation is now cleared.** The next message starts a brand-new session — Claude will not remember anything above. The chat log is kept for display only.\n(previous Claude session: ${oldSessionId?.substring(0, 8)}… → new: ${session.claudeSessionId.substring(0, 8)}…)`,
+        result: contextResetNotice(oldSessionId, session.claudeSessionId),
       });
 
       // Update status
@@ -7407,6 +7403,44 @@ async function sweepKeepalive(): Promise<void> {
       showToast(`Keepalive off for "${session.name}" — session isn't running`);
     }
   }
+}
+
+/**
+ * Forget a session's recorded size and cache state. Both reset paths need this:
+ * a reset mints a new Claude session id, so the old cache entry can never be
+ * resumed onto and a chip still showing the pre-reset size is just wrong.
+ */
+async function clearSessionCacheState(session: Session): Promise<void> {
+  session.contextTokens = undefined;
+  session.cacheExpiresAt = undefined;
+  session.cacheTtlSecs = undefined;
+  session.keepaliveUntil = undefined;
+  renderSessionList();
+  await invoke("clear_session_cache_state", { sessionId: session.id }).catch((err) =>
+    console.error("Failed to clear cache state:", err)
+  );
+}
+
+/**
+ * The notice shown in the transcript after a context reset.
+ *
+ * Session ids are printed in full, on their own lines. They used to be cut to
+ * eight characters, which is enough to recognise one and not enough to do
+ * anything with it — you can't locate a transcript or hand it to a fresh session
+ * from a prefix, and that is the entire reason anyone reads this notice.
+ */
+function contextResetNotice(oldId: string | undefined, newId: string): string {
+  return (
+    `--- Context reset at ${new Date().toLocaleTimeString()} ---\n` +
+    `**Claude's memory of this conversation is now cleared.** The next message ` +
+    `starts a brand-new session — Claude will not remember anything above. ` +
+    `The chat log is kept for display only.\n\n` +
+    `Previous Claude session:\n${oldId || "(none)"}\n\n` +
+    `New Claude session:\n${newId}\n\n` +
+    `The previous session's history is still on disk and searchable — ` +
+    `"Copy handoff for a fresh session" in this session's right-click menu puts ` +
+    `a paste-ready pointer to it on the clipboard.`
+  );
 }
 
 /** Arm keepalive for a window, or disarm when minutes is null. */
