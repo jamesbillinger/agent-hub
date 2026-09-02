@@ -1402,6 +1402,17 @@ body.resizing-sidebar {
   transform: scale(1.02);
 }
 
+/* Server-side refusal fallback marker inside an assistant turn */
+.fallback-notice {
+  display: inline-block;
+  margin: 4px 0 8px;
+  padding: 2px 8px;
+  font-size: 0.8em;
+  color: var(--text-muted);
+  border: 1px dashed var(--border-color);
+  border-radius: 6px;
+}
+
 .chat-image.loading {
   background: var(--sidebar-bg);
   padding: 20px;

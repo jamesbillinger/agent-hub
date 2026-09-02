@@ -272,7 +272,9 @@ interface ClaudeJsonMessage {
     /** Model that actually produced this turn. Present on assistant messages -
      *  the only authoritative model signal on a --resume run, which emits no init. */
     model?: string;
-    content: Array<{ type: string; id?: string; text?: string; name?: string; input?: unknown; source?: { type: string; media_type: string; data: string; url?: string } }>;
+    /** `fallback` blocks mark a server-side refusal fallback: `from.model`
+     *  declined the turn and `to.model` produced the rest of it. */
+    content: Array<{ type: string; id?: string; text?: string; name?: string; input?: unknown; source?: { type: string; media_type: string; data: string; url?: string }; from?: { model: string }; to?: { model: string } }>;
     stop_reason?: string | null;
     usage?: {
       input_tokens?: number;
@@ -1477,7 +1479,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (message.type === "system" && message.subtype === "init") {
       noteResolvedModel(session_id, message.model, false);
     } else if (message.type === "assistant") {
-      noteResolvedModel(session_id, message.message?.model, true);
+      noteResolvedModel(session_id, message.message?.model, true, refusalFallbackOf(message));
     }
 
     // Add to buffer
@@ -1573,6 +1575,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       sessionReceivedInit.delete(event.payload.session_id);
       sessionModelConfirmed.delete(event.payload.session_id);
       sessionModelMismatchWarned.delete(event.payload.session_id);
+      clearFallbackNotices(event.payload.session_id);
       renderSessionList();
       updateStartBanner();
       return;
@@ -1592,6 +1595,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         sessionReceivedInit.delete(event.payload.session_id);
         sessionModelConfirmed.delete(event.payload.session_id);
         sessionModelMismatchWarned.delete(event.payload.session_id);
+        clearFallbackNotices(event.payload.session_id);
         if (!receivedInit) {
           const attempts = (resumeRetryCounts.get(event.payload.session_id) || 0) + 1;
           resumeRetryCounts.set(event.payload.session_id, attempts);
@@ -1637,6 +1641,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       sessionReceivedInit.delete(event.payload.session_id);
       sessionModelConfirmed.delete(event.payload.session_id);
       sessionModelMismatchWarned.delete(event.payload.session_id);
+      clearFallbackNotices(event.payload.session_id);
 
       const chatSession = chatSessions.get(event.payload.session_id);
       if (chatSession) {
@@ -3188,6 +3193,9 @@ const sessionModelConfirmed = new Set<string>();
 // Sessions already warned this run that the CLI is answering as a different
 // model than the launch command requested, so the notice isn't repeated.
 const sessionModelMismatchWarned = new Set<string>();
+// Refusal fallbacks already announced this run, keyed "sessionId:from>to", so
+// a session that keeps falling back on every turn gets one notice, not one per turn.
+const sessionFallbackNoticed = new Set<string>();
 // Track pending user messages that need to be re-sent after a retry
 const pendingRetryMessages = new Map<string, string>();
 // Count consecutive failed resume attempts per session, so we can retry the
@@ -5081,7 +5089,36 @@ function formatModelLabel(sessionId: string): string {
  * or any assistant turn. Warns once if it disagrees with what was requested,
  * so a model switch the CLI didn't honour is visible instead of silent.
  */
-function noteResolvedModel(sessionId: string, model: string | undefined, confirms: boolean): void {
+/**
+ * The refusal fallback recorded on an assistant message, if any. The API marks
+ * each switch point with a `fallback` content block; the CLI (which opts into
+ * server-side fallbacks for Fable/Mythos-tier models) passes it through in the
+ * assistant message's content. The last block wins when several models
+ * declined in one turn.
+ */
+function refusalFallbackOf(message: ClaudeJsonMessage): { from: string; to: string } | undefined {
+  const blocks = message.message?.content;
+  if (!Array.isArray(blocks)) return undefined;
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const b = blocks[i];
+    if (b.type === "fallback" && b.from?.model && b.to?.model) return { from: b.from.model, to: b.to.model };
+  }
+  return undefined;
+}
+
+function clearFallbackNotices(sessionId: string): void {
+  for (const key of sessionFallbackNoticed) {
+    if (key.startsWith(`${sessionId}:`)) sessionFallbackNoticed.delete(key);
+  }
+}
+
+/** Models whose safety classifiers can decline a request, causing the CLI to
+ *  re-run the turn on a fallback model. */
+function canRefusalFallback(model?: string): boolean {
+  return !!model && /^claude-(fable|mythos|opus-5)/.test(model);
+}
+
+function noteResolvedModel(sessionId: string, model: string | undefined, confirms: boolean, fallback?: { from: string; to: string }): void {
   // `<synthetic>` is the CLI's placeholder on turns it generated itself rather
   // than getting from a model - notably the "model does not exist" error. It
   // is not a model and must never be recorded or compared.
@@ -5095,11 +5132,29 @@ function noteResolvedModel(sessionId: string, model: string | undefined, confirm
   if (!confirms) return;
 
   const requested = requestedModelId(sessionId);
+  if (fallback) {
+    // A fallback explains the model disagreement: it is not a failed switch.
+    // Later turns may be served straight by the fallback model (sticky routing,
+    // ~1 hour) with no fallback block, so suppress the mismatch warning too.
+    sessionModelMismatchWarned.add(sessionId);
+    const key = `${sessionId}:${fallback.from}>${fallback.to}`;
+    if (!sessionFallbackNoticed.has(key)) {
+      sessionFallbackNoticed.add(key);
+      addChatMessage(sessionId, {
+        type: "system",
+        result: `↩️ **Refusal fallback:** \`${fallback.from}\` declined this turn (safety classifier), so the CLI re-ran it on \`${fallback.to}\`. Later turns may stay on the fallback model for up to an hour.`,
+      });
+    }
+    return;
+  }
   if (isFullModelId(requested) && !sameModelFamily(requested, model) && !sessionModelMismatchWarned.has(sessionId)) {
     sessionModelMismatchWarned.add(sessionId);
+    const hint = canRefusalFallback(requested)
+      ? " Either the switch did not take effect, or an earlier turn fell back after a refusal and the conversation is still routed to the fallback model."
+      : " The model switch did not take effect.";
     addChatMessage(sessionId, {
       type: "system",
-      result: `⚠️ This session launched with \`--model ${requested}\`, but the CLI is answering as \`${model}\`. The model switch did not take effect.`,
+      result: `⚠️ This session launched with \`--model ${requested}\`, but the CLI is answering as \`${model}\`.${hint}`,
     });
   }
 }
@@ -5615,13 +5670,14 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
         // Surface a genuine disagreement (e.g. Fable 5 falling back to Opus, or
         // a switch the CLI ignored). [1m] is a context variant, not a different
         // model, so compare families - otherwise every 1M session looks wrong.
+        const fellBack = [...sessionFallbackNoticed].some((k) => k.startsWith(`${sessionId}:`));
         const mismatchLine = resolved.confirmed && isFullModelId(requestedModel) && !sameModelFamily(requestedModel, resolved.id)
-          ? `\n_(requested \`${requestedModel}\`, CLI resolved \`${resolved.id}\`)_`
+          ? `\n_(requested \`${requestedModel}\`, CLI resolved \`${resolved.id}\`${fellBack ? " after a refusal fallback this run" : ""})_`
           : "";
         const settingsDefault = appSettings.default_model ? `Settings default: \`${appSettings.default_model}\`` : "No settings default (using CLI config)";
         addChatMessage(sessionId, {
           type: "system",
-          result: `**Current model:** ${activeModelName}${mismatchLine}\n${contextLine}\n${settingsDefault}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`opus\` (Opus 5, 1M), \`opus-200k\`, \`fable\` (1M), \`fable-200k\`, \`sonnet\`, \`haiku\`, \`opus-4.8\`, \`opus-4.7\`, \`opus-4.6\`, \`sonnet-4.6\`, \`default\`\n**Full IDs:** \`claude-opus-5[1m]\`, \`claude-opus-5\`, \`claude-fable-5[1m]\`, \`claude-opus-4-8[1m]\`, \`claude-sonnet-4-7\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
+          result: `**Current model:** ${activeModelName}${mismatchLine}\n${contextLine}\n${settingsDefault}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`opus\` (Opus 5, 1M), \`opus-200k\`, \`fable\` (Fable 5.1, 1M), \`fable-200k\`, \`fable-5\`, \`sonnet\`, \`haiku\`, \`opus-4.8\`, \`opus-4.7\`, \`opus-4.6\`, \`sonnet-4.6\`, \`default\`\n**Full IDs:** \`claude-opus-5[1m]\`, \`claude-opus-5\`, \`claude-fable-5-1[1m]\`, \`claude-fable-5[1m]\`, \`claude-opus-4-8[1m]\`, \`claude-sonnet-4-7\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
         });
         return true;
       }
@@ -5657,11 +5713,13 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
 
       // Map shorthand names to model IDs
       const MODEL_ALIASES: Record<string, string> = {
-        fable: "claude-fable-5[1m]",
-        "fable-1m": "claude-fable-5[1m]",
-        "fable-200k": "claude-fable-5",
+        fable: "claude-fable-5-1[1m]",
+        "fable-1m": "claude-fable-5-1[1m]",
+        "fable-200k": "claude-fable-5-1",
+        "fable-5.1": "claude-fable-5-1[1m]",
         "fable-5": "claude-fable-5[1m]",
-        mythos: "claude-mythos-5",
+        mythos: "claude-mythos-5-1",
+        "mythos-5.1": "claude-mythos-5-1",
         "mythos-5": "claude-mythos-5",
         opus: "claude-opus-5[1m]",
         "opus-1m": "claude-opus-5[1m]",
@@ -6850,6 +6908,10 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
           ? `data:${block.source.media_type};base64,${block.source.data}`
           : block.source.url || "";
         html += `<div class="chat-image"><img src="${src}" alt="Image" loading="lazy" /></div>`;
+      } else if (block.type === "fallback" && block.from?.model && block.to?.model) {
+        // Server-side refusal fallback marker: everything after this point in
+        // the turn came from `to`, not the model the session asked for.
+        html += `<div class="fallback-notice" title="Safety classifier declined this turn on ${escapeHtml(block.from.model)}; the CLI re-ran it on ${escapeHtml(block.to.model)}">↩️ fell back from ${escapeHtml(block.from.model)} to ${escapeHtml(block.to.model)}</div>`;
       } else if (block.type === "tool_use") {
         hasToolUse = true;
         chatSession.toolUseCount++;
@@ -7313,8 +7375,11 @@ function buildUsageBar(percent: number, width = 25): string {
 const MODEL_MAX_CONTEXT: Record<string, number> = {
   "claude-opus-5[1m]": 1000000,
   "claude-opus-5": 200000,
+  "claude-fable-5-1[1m]": 1000000,
+  "claude-fable-5-1": 200000,
   "claude-fable-5[1m]": 1000000,
   "claude-fable-5": 200000,
+  "claude-mythos-5-1": 1000000,
   "claude-mythos-5": 1000000,
   "claude-opus-4-8[1m]": 1000000,
   "claude-opus-4-8": 200000,
@@ -8365,6 +8430,10 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
           ? `data:${block.source.media_type};base64,${block.source.data}`
           : block.source.url || "";
         html += `<div class="chat-image"><img src="${src}" alt="Image" loading="lazy" /></div>`;
+      } else if (block.type === "fallback" && block.from?.model && block.to?.model) {
+        // Server-side refusal fallback marker: everything after this point in
+        // the turn came from `to`, not the model the session asked for.
+        html += `<div class="fallback-notice" title="Safety classifier declined this turn on ${escapeHtml(block.from.model)}; the CLI re-ran it on ${escapeHtml(block.to.model)}">↩️ fell back from ${escapeHtml(block.from.model)} to ${escapeHtml(block.to.model)}</div>`;
       } else if (block.type === "tool_use") {
         messageEl.classList.remove("assistant");
         messageEl.classList.add("tool-use");
