@@ -101,6 +101,18 @@ curl -s http://localhost:3847/api/auth/check
 2. Verify it's on port 3857: `lsof -i :3857`
 3. Use MCP tools - they will interact with the dev app
 
+## Remote Access & Teams Webhook
+
+`agent.billinger.me` and the Power Automate → Teams issue pipeline share one
+network path: DNS → FortiGate → haproxy on `10.30.90.202` → this Mac at
+`10.30.90.201:3847`. **If both break at once, it's the shared path, not two
+bugs** — most likely this Mac lost its `.201` DHCP reservation because macOS
+Private Wi-Fi Address randomized the MAC the reservation is keyed to.
+
+See [REMOTE_ACCESS.md](REMOTE_ACCESS.md) for the full topology, the FortiGate
+reservations, an ordered diagnostic script, and the webhook auth gotcha (the
+shipped handler skips auth entirely when the secret env var is unset).
+
 ## Debugging
 
 ### Performance Debugging

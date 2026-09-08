@@ -5,9 +5,35 @@
 
 const http = require('http');
 const readline = require('readline');
+const fs = require('fs');
+const os = require('os');
+const nodePath = require('path');
 
 const AGENT_HUB_PORT = process.env.AGENT_HUB_PORT || 3857;
 const PROTOCOL_VERSION = '2024-11-05';
+
+// Local API token. The app writes this 0600 file on startup; holding it is what
+// marks a caller as same-machine tooling. We deliberately don't rely on the
+// request coming from 127.0.0.1 — the server sends permissive CORS, so any web
+// page the user visits could otherwise reach these endpoints.
+const IS_DEV = String(AGENT_HUB_PORT) !== '3847';
+const LOCAL_TOKEN_PATH = nodePath.join(
+  os.homedir(),
+  'Library',
+  'Application Support',
+  IS_DEV ? 'agent-hub-dev' : 'agent-hub',
+  'local-token'
+);
+
+function authHeaders() {
+  try {
+    const token = fs.readFileSync(LOCAL_TOKEN_PATH, 'utf8').trim();
+    if (token) return { Authorization: `Bearer ${token}` };
+  } catch {
+    // Fall through — the request will 401/404 and the error surfaces to the caller.
+  }
+  return {};
+}
 
 // Tool definitions
 const TOOLS = [
@@ -116,7 +142,14 @@ const TOOLS = [
 function httpJson(method, path) {
   return new Promise((resolve, reject) => {
     const req = http.request(
-      { hostname: 'localhost', port: AGENT_HUB_PORT, path, method, timeout: 30000 },
+      {
+        hostname: 'localhost',
+        port: AGENT_HUB_PORT,
+        path,
+        method,
+        headers: authHeaders(),
+        timeout: 30000
+      },
       (res) => {
         let body = '';
         res.on('data', (c) => (body += c));
@@ -150,7 +183,8 @@ function executeJs(code, timeoutMs = 5000) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(data)
+        'Content-Length': Buffer.byteLength(data),
+        ...authHeaders()
       },
       timeout: timeoutMs + 1000
     }, (res) => {

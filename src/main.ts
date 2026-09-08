@@ -407,6 +407,8 @@ interface AppSettings {
   read_aloud_enabled: boolean;
   renderer: "webgl" | "dom";
   remote_pin?: string | null;
+  webhook_secret?: string | null;
+  teams_reply_url?: string | null;
   show_active_sessions_group: boolean;
   grid_view?: boolean;
   default_model?: string | null;
@@ -914,6 +916,8 @@ let settingsReadAloudCheckbox: HTMLInputElement;
 let settingsActiveSessionsGroupCheckbox: HTMLInputElement;
 let settingsRendererSelect: HTMLSelectElement;
 let settingsRemotePinInput: HTMLInputElement;
+let settingsWebhookSecretInput: HTMLInputElement;
+let settingsTeamsReplyUrlInput: HTMLInputElement;
 
 // Initialize app
 document.addEventListener("DOMContentLoaded", async () => {
@@ -957,6 +961,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   settingsActiveSessionsGroupCheckbox = document.getElementById("settings-active-sessions-group") as HTMLInputElement;
   settingsRendererSelect = document.getElementById("settings-renderer") as HTMLSelectElement;
   settingsRemotePinInput = document.getElementById("settings-remote-pin") as HTMLInputElement;
+  settingsWebhookSecretInput = document.getElementById("settings-webhook-secret") as HTMLInputElement;
+  settingsTeamsReplyUrlInput = document.getElementById("settings-teams-reply-url") as HTMLInputElement;
 
   // Load window state and app settings
   await loadWindowState();
@@ -1845,9 +1851,15 @@ document.addEventListener("DOMContentLoaded", async () => {
     // Send result back via HTTP
     try {
       const port = await invoke<number | null>("get_web_server_port") || 3857;
+      // /api/mcp/result requires the local API token. We get it over Tauri IPC,
+      // which an ordinary browser page has no access to.
+      const localToken = await invoke<string>("get_local_api_token");
       await fetch(`http://localhost:${port}/api/mcp/result`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${localToken}`,
+        },
         body: JSON.stringify({
           request_id,
           result: typeof result === "string" ? result : JSON.stringify(result),
@@ -8605,6 +8617,8 @@ async function showSettingsModal(): Promise<void> {
   settingsActiveSessionsGroupCheckbox.checked = appSettings.show_active_sessions_group ?? true;
   settingsRendererSelect.value = appSettings.renderer || "webgl";
   settingsRemotePinInput.value = appSettings.remote_pin || "";
+  settingsWebhookSecretInput.value = appSettings.webhook_secret || "";
+  settingsTeamsReplyUrlInput.value = appSettings.teams_reply_url || "";
   (document.getElementById("settings-claude-config-dir") as HTMLInputElement).value = appSettings.claude_config_dir || "";
   (document.getElementById("settings-claude-search-dirs") as HTMLTextAreaElement).value =
     (appSettings.claude_search_dirs || ["~/.claude"]).join("\n");
@@ -8743,6 +8757,8 @@ async function saveSettings(): Promise<void> {
     read_aloud_enabled: settingsReadAloudCheckbox.checked,
     renderer: settingsRendererSelect.value as "webgl" | "dom",
     remote_pin: settingsRemotePinInput.value || null,
+    webhook_secret: settingsWebhookSecretInput.value || null,
+    teams_reply_url: settingsTeamsReplyUrlInput.value || null,
     show_active_sessions_group: settingsActiveSessionsGroupCheckbox.checked,
     grid_view: appSettings.grid_view ?? false,
     claude_config_dir: (document.getElementById("settings-claude-config-dir") as HTMLInputElement).value || null,

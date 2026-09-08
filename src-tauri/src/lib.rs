@@ -142,6 +142,21 @@ static MCP_HTTP_RESULTS: Lazy<Mutex<HashMap<String, Option<String>>>> =
 static PIN_RATE_LIMIT: Lazy<Mutex<HashMap<String, (u32, std::time::Instant)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+// Pairing: Rate limiting (IP -> (attempts, last_attempt_time)). The pairing code
+// is only six digits, so without this an attacker holding a pairing_id can walk
+// the whole keyspace inside the code's five-minute lifetime.
+static PAIR_RATE_LIMIT: Lazy<Mutex<HashMap<String, (u32, std::time::Instant)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+// Token for same-machine tooling (the MCP bridge, scripts). Written to a 0600
+// file at startup so local callers can authenticate without pairing.
+//
+// Deliberately NOT an "allow anything from 127.0.0.1" rule: the server sends
+// permissive CORS, so trusting loopback would let any web page the user visits
+// POST to http://127.0.0.1:<port>/api/mcp/execute and run JS in the webview.
+// A file the browser cannot read is the thing that makes local callers local.
+static LOCAL_TOKEN: Lazy<String> = Lazy::new(load_or_create_local_token);
+
 // Mobile WebSocket: Channel for sending messages to mobile clients
 // Each mobile client gets a sender that the server can use to push messages
 #[cfg(not(target_os = "ios"))]
@@ -498,6 +513,11 @@ struct AppSettings {
     renderer: String,
     #[serde(default)]
     remote_pin: Option<String>,
+    /// Shared secret the Teams webhook must send as X-Webhook-Secret. Kept here
+    /// rather than in the environment because a GUI-launched app sees no shell
+    /// environment. Unset means the webhook is closed.
+    #[serde(default)]
+    webhook_secret: Option<String>,
     #[serde(default = "default_true")]
     show_active_sessions_group: bool,
     /// Show all active sessions as a card grid instead of one at a time
@@ -510,6 +530,13 @@ struct AppSettings {
     /// silently running on whatever the CLI defaults to.
     #[serde(default)]
     webhook_model: Option<String>,
+    /// Power Automate "When an HTTP request is received" URL that posts a
+    /// threaded reply back into the originating Teams channel. Held here rather
+    /// than handed to the session because the URL carries its own SAS token in
+    /// the query string — putting it in a prompt would persist it to the message
+    /// DB. Unset means sessions research silently and never reply.
+    #[serde(default)]
+    teams_reply_url: Option<String>,
     #[serde(default)]
     claude_config_dir: Option<String>,
     /// Claude home directories to scan for JSONL search indexing. The
@@ -575,10 +602,12 @@ impl Default for AppSettings {
             read_aloud_enabled: false,
             renderer: "webgl".to_string(),
             remote_pin: None,
+            webhook_secret: None,
             show_active_sessions_group: true,
             grid_view: false,
             default_model: default_model_default(),
             webhook_model: None,
+            teams_reply_url: None,
             claude_config_dir: None,
             claude_search_dirs: default_claude_search_dirs(),
         }
@@ -1053,24 +1082,61 @@ fn cleanup_orphaned_processes() {
     }
 }
 
-// Generate a random 6-digit pairing code
+// Generate a random 6-digit pairing code.
+//
+// Drawn from the OS CSPRNG (via uuid v4), not the clock. A nanosecond timestamp
+// looks random but is guessable by anyone who knows roughly when pairing started.
 fn generate_pairing_code() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{:06}", (seed % 1_000_000) as u32)
+    let bytes = *uuid::Uuid::new_v4().as_bytes();
+    let n = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    format!("{:06}", n % 1_000_000)
 }
 
-// Generate a random token for device auth
+// Generate a random token for device auth.
+//
+// Two v4 UUIDs' worth of CSPRNG output (~244 bits). The previous version derived
+// both halves from one nanosecond timestamp, so the real entropy was a single
+// guessable clock reading and the second half was a pure function of the first.
 fn generate_token() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{:x}{:x}", seed, seed.wrapping_mul(0x5DEECE66D))
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+// Path to the local API token file.
+fn local_token_path() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(get_app_data_dir_name())
+        .join("local-token")
+}
+
+// Read the local API token, creating it on first run. Mode 0600 so that only
+// this user can read it; that file permission is the security boundary.
+fn load_or_create_local_token() -> String {
+    let path = local_token_path();
+
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() {
+            return existing;
+        }
+    }
+
+    let token = generate_token();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::write(&path, &token).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    token
 }
 
 fn next_run_for_expr(expr: &str) -> Result<String, String> {
@@ -1086,6 +1152,14 @@ fn next_run_for_expr(expr: &str) -> Result<String, String> {
     schedule.upcoming(chrono::Utc).next()
         .map(|t| t.to_rfc3339())
         .ok_or_else(|| "No upcoming run time".to_string())
+}
+
+// Compare two secrets without leaking their contents through timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 // Check if a token is valid
@@ -2817,6 +2891,16 @@ fn get_web_server_port() -> Result<Option<u16>, String> {
     Ok(*port)
 }
 
+/// Hand the local API token to our own webview.
+///
+/// The webview posts JS execution results back over HTTP to /api/mcp/result,
+/// which is gated on this token. It reaches us over Tauri IPC, so a web page in
+/// an ordinary browser cannot call it.
+#[tauri::command]
+fn get_local_api_token() -> String {
+    LOCAL_TOKEN.clone()
+}
+
 /// Get local IP addresses for remote access URL display
 #[tauri::command]
 fn get_local_ips() -> Vec<String> {
@@ -3265,21 +3349,61 @@ fn extract_token(headers: &axum::http::HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-// Check auth and return error response if not authorized
-fn check_auth(headers: &axum::http::HeaderMap) -> Option<impl IntoResponse> {
-    let devices = PAIRED_DEVICES.lock();
-    if devices.is_empty() {
-        // No devices paired yet - allow access (first-time setup)
-        return None;
-    }
-    drop(devices);
+// Pull a bearer token out of a request, falling back to a `?token=` query
+// parameter. The query form exists for WebSocket clients, which cannot set
+// headers from a browser. Query strings land in proxy access logs, so prefer
+// the header wherever the client can send one.
+fn token_from_request(headers: &axum::http::HeaderMap, uri: &axum::http::Uri) -> Option<String> {
+    extract_token(headers).or_else(|| {
+        uri.query()?
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("token=").map(|v| v.to_string()))
+    })
+}
 
-    match extract_token(headers) {
-        Some(token) if is_valid_token(&token) => None,
-        _ => Some((StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "unauthorized",
-            "message": "Device not paired. Request pairing first."
-        })))),
+// Is this a token we accept? Either a paired device or same-machine tooling.
+fn token_is_authorized(token: &str) -> bool {
+    is_valid_token(token) || token == LOCAL_TOKEN.as_str()
+}
+
+// Auth gate for every non-public route.
+//
+// This is a middleware layer rather than a per-handler call on purpose. The
+// previous design required each handler to remember to check, and three of them
+// didn't: /api/mcp/execute, /api/ws/:session_id and all of /api/search/* shipped
+// reachable without credentials. Enforcing it at the router means a new route is
+// protected by default and you have to opt out deliberately.
+async fn require_auth(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let token = token_from_request(req.headers(), req.uri());
+
+    match token {
+        Some(t) if token_is_authorized(&t) => next.run(req).await,
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "unauthorized",
+                "message": "Device not paired. Request pairing first."
+            })),
+        )
+            .into_response(),
+    }
+}
+
+// Stricter gate for /api/mcp/*, which executes arbitrary JS in the desktop
+// webview. Requires the local token specifically — a paired phone has no reason
+// to drive the desktop UI, so a stolen device token shouldn't unlock this.
+#[cfg(not(target_os = "ios"))]
+async fn require_local_token(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    match token_from_request(req.headers(), req.uri()) {
+        Some(t) if t == LOCAL_TOKEN.as_str() => next.run(req).await,
+        // 404 rather than 401: no reason to advertise that this route exists.
+        _ => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
 
@@ -3322,8 +3446,30 @@ async fn api_request_pairing(
 
 // POST /api/auth/pair - Complete pairing with code
 async fn api_pair(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // Same 5-per-15-minutes budget as PIN login. The code is six digits and
+    // lives for five minutes, so an unthrottled caller holding a pairing_id can
+    // simply enumerate it.
+    let client_ip = addr.ip().to_string();
+    {
+        let mut rate_limits = PAIR_RATE_LIMIT.lock();
+        if let Some((attempts, last_time)) = rate_limits.get(&client_ip) {
+            let elapsed = last_time.elapsed();
+            if elapsed < std::time::Duration::from_secs(900) && *attempts >= 5 {
+                let remaining = 900 - elapsed.as_secs();
+                return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+                    "error": "rate_limited",
+                    "message": format!("Too many attempts. Try again in {} minutes.", remaining / 60 + 1)
+                }))).into_response();
+            }
+            if elapsed >= std::time::Duration::from_secs(900) {
+                rate_limits.remove(&client_ip);
+            }
+        }
+    }
+
     let pairing_id = body.get("pairing_id").and_then(|v| v.as_str());
     let code = body.get("code").and_then(|v| v.as_str());
     let device_name = body.get("device_name").and_then(|v| v.as_str()).unwrap_or("Mobile Device");
@@ -3349,6 +3495,12 @@ async fn api_pair(
     };
 
     if !valid {
+        let mut rate_limits = PAIR_RATE_LIMIT.lock();
+        let entry = rate_limits.entry(client_ip.clone()).or_insert((0, std::time::Instant::now()));
+        entry.0 += 1;
+        entry.1 = std::time::Instant::now();
+        drop(rate_limits);
+
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
             "error": "invalid_code",
             "message": "Invalid or expired pairing code"
@@ -3359,6 +3511,10 @@ async fn api_pair(
     {
         let mut requests = PAIRING_REQUESTS.lock();
         requests.remove(pairing_id);
+    }
+    {
+        let mut rate_limits = PAIR_RATE_LIMIT.lock();
+        rate_limits.remove(&client_ip);
     }
 
     // Generate token and store device
@@ -3507,18 +3663,12 @@ async fn api_pin_login(
 async fn api_auth_check(
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let devices = PAIRED_DEVICES.lock();
-    if devices.is_empty() {
-        // No devices paired - no auth required
-        return Json(serde_json::json!({
-            "authenticated": true,
-            "reason": "no_devices_paired"
-        })).into_response();
-    }
-    drop(devices);
-
+    // Reports only what `require_auth` would actually decide. This used to
+    // answer `authenticated: true` whenever no devices were paired, which now
+    // would be a lie: the auth layer has no such bypass, so a client told it was
+    // authenticated would 401 on its very next request.
     match extract_token(&headers) {
-        Some(token) if is_valid_token(&token) => {
+        Some(token) if token_is_authorized(&token) => {
             Json(serde_json::json!({ "authenticated": true })).into_response()
         }
         _ => {
@@ -3600,10 +3750,7 @@ async fn api_search_rebuild(_headers: axum::http::HeaderMap) -> impl IntoRespons
 
 // GET /api/sessions - List all sessions with running status
 #[cfg(not(target_os = "ios"))]
-async fn api_list_sessions(headers: axum::http::HeaderMap) -> impl IntoResponse {
-    if let Some(err) = check_auth(&headers) {
-        return err.into_response();
-    }
+async fn api_list_sessions(_headers: axum::http::HeaderMap) -> impl IntoResponse {
     match load_sessions() {
         Ok(sessions) => {
             // Check both PTY (shell) and JSON (chat) broadcasters for running status
@@ -3641,10 +3788,7 @@ async fn api_list_sessions(headers: axum::http::HeaderMap) -> impl IntoResponse 
 
 // iOS version - no PTY running status
 #[cfg(target_os = "ios")]
-async fn api_list_sessions(headers: axum::http::HeaderMap) -> impl IntoResponse {
-    if let Some(err) = check_auth(&headers) {
-        return err.into_response();
-    }
+async fn api_list_sessions(_headers: axum::http::HeaderMap) -> impl IntoResponse {
     match load_sessions() {
         Ok(sessions) => {
             // On iOS, sessions are never running locally
@@ -3671,12 +3815,9 @@ async fn api_list_sessions(headers: axum::http::HeaderMap) -> impl IntoResponse 
 
 // POST /api/sessions - Create a new session
 async fn api_create_session(
-    headers: axum::http::HeaderMap,
+    _headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    if let Some(err) = check_auth(&headers) {
-        return err.into_response();
-    }
 
     let name = body.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
     let agent_type = body.get("agent_type").and_then(|v| v.as_str()).unwrap_or("claude");
@@ -3774,12 +3915,9 @@ async fn api_create_session(
 
 // GET /api/sessions/{id}/buffer - Get saved terminal buffer for a session
 async fn api_get_buffer(
-    headers: axum::http::HeaderMap,
+    _headers: axum::http::HeaderMap,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
-    if let Some(err) = check_auth(&headers) {
-        return err.into_response();
-    }
     match load_terminal_buffer(session_id) {
         Ok(Some(buffer)) => Json(serde_json::json!({ "buffer": buffer })).into_response(),
         Ok(None) => Json(serde_json::json!({ "buffer": null })).into_response(),
@@ -3790,12 +3928,9 @@ async fn api_get_buffer(
 // POST /api/sessions/{id}/start - Start a session remotely
 #[cfg(not(target_os = "ios"))]
 async fn api_start_session(
-    headers: axum::http::HeaderMap,
+    _headers: axum::http::HeaderMap,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
-    if let Some(err) = check_auth(&headers) {
-        return err.into_response();
-    }
     // Check if already running (PTY or JSON)
     {
         let pty_broadcasters = PTY_BROADCASTERS.lock();
@@ -3886,12 +4021,9 @@ async fn api_start_session(
 // iOS version - cannot start PTY sessions locally
 #[cfg(target_os = "ios")]
 async fn api_start_session(
-    headers: axum::http::HeaderMap,
+    _headers: axum::http::HeaderMap,
     Path(_session_id): Path<String>,
 ) -> impl IntoResponse {
-    if let Some(err) = check_auth(&headers) {
-        return err.into_response();
-    }
     (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
         "error": "not_supported",
         "message": "PTY sessions cannot be started on iOS. Connect to a desktop Agent Hub instance."
@@ -3901,27 +4033,74 @@ async fn api_start_session(
 // POST /api/webhook/teams - Receive a Teams issue and create a claude-json session
 //
 // Payload: { "from": "...", "message": "...", "link": "..." }
-// Auth:    X-Webhook-Secret header checked against AGENT_HUB_WEBHOOK_SECRET env var (if set)
+// Auth:    X-Webhook-Secret header, checked against the `webhook_secret` app
+//          setting (falling back to AGENT_HUB_WEBHOOK_SECRET). Fails closed.
 #[cfg(not(target_os = "ios"))]
 async fn api_webhook_teams(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let secret = std::env::var("AGENT_HUB_WEBHOOK_SECRET").unwrap_or_default();
-    if !secret.is_empty() {
-        let provided = headers
-            .get("x-webhook-secret")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if provided != secret {
-            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid secret"}))).into_response();
-        }
+    // Prefer the app setting over the environment variable. A Tauri app launched
+    // from Finder or the Dock inherits no shell environment, so the env-var-only
+    // version of this check could never fire in a normal install — the secret
+    // read as empty and the endpoint accepted anonymous posts. This endpoint
+    // spawns a session running with --dangerously-skip-permissions, so it now
+    // fails closed when no secret is configured.
+    let secret = load_app_settings()
+        .ok()
+        .and_then(|s| s.webhook_secret)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let env = std::env::var("AGENT_HUB_WEBHOOK_SECRET").unwrap_or_default();
+            (!env.is_empty()).then_some(env)
+        });
+
+    let Some(secret) = secret else {
+        println!("[webhook] Rejected: no webhook secret configured (Settings > Teams Webhook)");
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "error": "not_configured",
+            "message": "Webhook secret is not configured on the server."
+        }))).into_response();
+    };
+
+    let provided = headers
+        .get("x-webhook-secret")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !constant_time_eq(provided.as_bytes(), secret.as_bytes()) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid secret"}))).into_response();
     }
 
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
     let from_name = payload.get("from").and_then(|v| v.as_str()).unwrap_or("Unknown");
     let message = payload.get("message").and_then(|v| v.as_str()).unwrap_or("").trim();
     let link = payload.get("link").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Thread anchor. Power Automate has to send all three for a threaded reply
+    // to be addressable; if any is missing we run the triage and stay silent
+    // rather than posting a stray top-level message into the channel.
+    //
+    // Accepts either flat ids or the `channelIdentity` object passed straight
+    // through from the Teams trigger, because which of the two the connector
+    // emits depends on the trigger and is easy to get wrong when wiring the
+    // flow — and a wrong path here fails silently.
+    let nested = |key: &str| -> String {
+        payload
+            .get("channelIdentity")
+            .and_then(|c| c.get(key))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let first_of = |keys: &[&str], fallback: String| -> String {
+        keys.iter()
+            .find_map(|k| payload.get(*k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
+            .map(|s| s.to_string())
+            .unwrap_or(fallback)
+    };
+    let team_id = first_of(&["teamId"], nested("teamId"));
+    let channel_id = first_of(&["channelId"], nested("channelId"));
+    let message_id = first_of(&["messageId", "id"], String::new());
 
     if message.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "empty message"}))).into_response();
@@ -3991,9 +4170,36 @@ async fn api_webhook_teams(
     }
 
     let link_line = if link.is_empty() { String::new() } else { format!("\nLink: {}", link) };
+
+    // Tell the session how to reply, but only when a reply is actually
+    // deliverable: all three ids present and a flow URL configured. The block
+    // carries no credential — /api/teams/reply is gated on the local token,
+    // which the session reads from its 0600 file, and the flow URL never
+    // leaves this process.
+    let reply_configured = load_app_settings()
+        .ok()
+        .and_then(|s| s.teams_reply_url)
+        .is_some_and(|u| !u.is_empty());
+    let have_thread = !team_id.is_empty() && !channel_id.is_empty() && !message_id.is_empty();
+    let reply_block = if reply_configured && have_thread {
+        let port = { (*WEB_SERVER_PORT.lock()).unwrap_or(WEB_PORT_BASE) };
+        format!(
+            "\n\nReply-To-Teams: POST http://127.0.0.1:{}/api/teams/reply\n\
+             Reply-Auth: Bearer token in {}\n\
+             Reply-Body: {{\"teamId\":\"{}\",\"channelId\":\"{}\",\"messageId\":\"{}\",\"text\":\"<your summary>\"}}",
+            port,
+            local_token_path().display(),
+            team_id,
+            channel_id,
+            message_id
+        )
+    } else {
+        String::new()
+    };
+
     let text = format!(
-        "/process-teams-issue\n\nFrom: {}{}\n---\n{}",
-        from_name, link_line, message
+        "/process-teams-issue\n\nFrom: {}{}{}\n---\n{}",
+        from_name, link_line, reply_block, message
     );
     let prompt = serde_json::json!({
         "type": "user",
@@ -4007,15 +4213,85 @@ async fn api_webhook_teams(
     Json(serde_json::json!({"status": "ok", "session_id": session_id})).into_response()
 }
 
+// POST /api/teams/reply - Post a threaded reply back into a Teams channel
+//
+// Payload: { "teamId": "...", "channelId": "...", "messageId": "...", "text": "..." }
+// Auth:    the local token (require_local_token layer), same gate as /api/mcp/*.
+//
+// Forwards to the Power Automate "When an HTTP request is received" flow held in
+// the `teams_reply_url` setting. The session calling this never sees that URL —
+// it carries a SAS token, and anything handed to a session is persisted to the
+// message DB and rendered in the UI.
+#[cfg(not(target_os = "ios"))]
+async fn api_teams_reply(body: axum::body::Bytes) -> impl IntoResponse {
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+    let field = |k: &str| payload.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let (team_id, channel_id, message_id, text) =
+        (field("teamId"), field("channelId"), field("messageId"), field("text"));
+
+    if team_id.is_empty() || channel_id.is_empty() || message_id.is_empty() || text.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "missing_fields",
+            "message": "teamId, channelId, messageId and text are all required."
+        }))).into_response();
+    }
+
+    let flow_url = load_app_settings()
+        .ok()
+        .and_then(|s| s.teams_reply_url)
+        .filter(|u| !u.is_empty());
+
+    let Some(flow_url) = flow_url else {
+        println!("[teams-reply] Rejected: no reply URL configured (Settings > Teams Webhook)");
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "error": "not_configured",
+            "message": "Teams reply URL is not configured on the server."
+        }))).into_response();
+    };
+
+    let resp = reqwest::Client::new()
+        .post(&flow_url)
+        .json(&serde_json::json!({
+            "teamId": team_id,
+            "channelId": channel_id,
+            "messageId": message_id,
+            "text": text,
+        }))
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            Json(serde_json::json!({"status": "ok"})).into_response()
+        }
+        // Surface the flow's own status so a misconfigured Flow B is
+        // debuggable from the session transcript rather than failing silently.
+        Ok(r) => {
+            let status = r.status();
+            let detail = r.text().await.unwrap_or_default();
+            eprintln!("[teams-reply] flow returned {}: {}", status, detail);
+            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "error": "flow_error",
+                "status": status.as_u16(),
+                "detail": detail,
+            }))).into_response()
+        }
+        Err(e) => {
+            eprintln!("[teams-reply] request failed: {}", e);
+            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "error": "request_failed",
+                "message": e.to_string(),
+            }))).into_response()
+        }
+    }
+}
+
 // POST /api/sessions/{id}/interrupt - Interrupt a running session
 #[cfg(not(target_os = "ios"))]
 async fn api_interrupt_session(
-    headers: axum::http::HeaderMap,
+    _headers: axum::http::HeaderMap,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
-    if let Some(err) = check_auth(&headers) {
-        return err.into_response();
-    }
 
     // Check if it's a JSON session
     let is_json = {
@@ -4062,12 +4338,9 @@ async fn api_interrupt_session(
 // iOS version
 #[cfg(target_os = "ios")]
 async fn api_interrupt_session(
-    headers: axum::http::HeaderMap,
+    _headers: axum::http::HeaderMap,
     Path(_session_id): Path<String>,
 ) -> impl IntoResponse {
-    if let Some(err) = check_auth(&headers) {
-        return err.into_response();
-    }
     (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
         "error": "not_supported",
         "message": "Cannot interrupt sessions on iOS."
@@ -4193,16 +4466,14 @@ fn start_scheduler() {
 // Schedule HTTP API handlers
 // ============================================
 
-async fn api_list_schedules(headers: axum::http::HeaderMap) -> impl IntoResponse {
-    if let Some(err) = check_auth(&headers) { return err.into_response(); }
+async fn api_list_schedules(_headers: axum::http::HeaderMap) -> impl IntoResponse {
     match load_scheduled_jobs() {
         Ok(jobs) => Json(serde_json::json!(jobs)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response(),
     }
 }
 
-async fn api_create_schedule(headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>) -> impl IntoResponse {
-    if let Some(err) = check_auth(&headers) { return err.into_response(); }
+async fn api_create_schedule(_headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>) -> impl IntoResponse {
     let name = match body.get("name").and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
         None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "name required"}))).into_response(),
@@ -4226,8 +4497,7 @@ async fn api_create_schedule(headers: axum::http::HeaderMap, Json(body): Json<se
     }
 }
 
-async fn api_update_schedule(headers: axum::http::HeaderMap, Path(id): Path<String>, Json(body): Json<serde_json::Value>) -> impl IntoResponse {
-    if let Some(err) = check_auth(&headers) { return err.into_response(); }
+async fn api_update_schedule(_headers: axum::http::HeaderMap, Path(id): Path<String>, Json(body): Json<serde_json::Value>) -> impl IntoResponse {
     let name = body.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
     let cron_expr = body.get("cron_expr").and_then(|v| v.as_str()).map(|s| s.to_string());
     let prompt = body.get("prompt").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -4238,8 +4508,7 @@ async fn api_update_schedule(headers: axum::http::HeaderMap, Path(id): Path<Stri
     }
 }
 
-async fn api_delete_schedule(headers: axum::http::HeaderMap, Path(id): Path<String>) -> impl IntoResponse {
-    if let Some(err) = check_auth(&headers) { return err.into_response(); }
+async fn api_delete_schedule(_headers: axum::http::HeaderMap, Path(id): Path<String>) -> impl IntoResponse {
     match delete_scheduled_job(id) {
         Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response(),
@@ -4922,6 +5191,11 @@ fn start_web_server() {
     // Load paired devices from database
     load_paired_devices();
 
+    // Create the local API token file now rather than on the first authenticated
+    // request, so same-machine tooling can read it before it needs to call us.
+    Lazy::force(&LOCAL_TOKEN);
+    println!("Local API token: {}", local_token_path().display());
+
     // Spawn web server in a dedicated thread with its own tokio runtime
     // This avoids issues with Tauri's runtime not being ready during setup
     thread::spawn(|| {
@@ -4942,35 +5216,60 @@ fn start_web_server() {
             .find(|p| p.exists())
             .unwrap_or_else(|| std::path::PathBuf::from("mobile-web-dist"));
 
-            let app = Router::new()
+            // Routes reachable without a device token. Everything here either
+            // needs to be open to bootstrap pairing, or carries its own
+            // credential check. Adding to this list is the only way to expose a
+            // route publicly, which is the point — see `require_auth`.
+            let public = Router::new()
                 .route("/", get(web_index))
                 // Serve static assets from mobile-web-dist
                 .nest_service("/assets", ServeDir::new(mobile_web_dir.join("assets")))
-                // Auth endpoints (no auth required)
+                // Auth endpoints: these mint tokens, so they cannot require one
                 .route("/api/auth/check", get(api_auth_check))
                 .route("/api/auth/request-pairing", axum::routing::post(api_request_pairing))
                 .route("/api/auth/pair", axum::routing::post(api_pair))
                 .route("/api/auth/pin-status", get(api_pin_status))
                 .route("/api/auth/pin-login", axum::routing::post(api_pin_login))
-                // Protected endpoints
+                // Authenticates with its own shared secret (X-Webhook-Secret)
+                .route("/api/webhook/teams", axum::routing::post(api_webhook_teams))
+                // Authenticates in-band: the client's first frame must be `auth`
+                .route("/api/ws/mobile", get(ws_mobile_handler));
+
+            // Executes arbitrary JS in the desktop webview. Same-machine callers
+            // only, and they must hold the local token.
+            let local_only = Router::new()
+                .route("/api/mcp/execute", axum::routing::post(api_mcp_execute))
+                .route("/api/mcp/result", axum::routing::post(api_mcp_result))
+                // Holds the Power Automate reply URL on this side of the
+                // boundary, so a webhook session can post into a Teams thread
+                // without ever being handed that credential.
+                .route("/api/teams/reply", axum::routing::post(api_teams_reply))
+                .layer(axum::middleware::from_fn(require_local_token));
+
+            // Everything else. The auth layer applies to the whole sub-router,
+            // so a route added here is protected without the author doing
+            // anything. /api/ws/:session_id in particular writes straight to a
+            // session's stdin, which for a PTY session is a shell.
+            let protected = Router::new()
                 .route("/api/sessions", get(api_list_sessions).post(api_create_session))
                 .route("/api/sessions/:session_id/buffer", get(api_get_buffer))
                 .route("/api/sessions/:session_id/start", axum::routing::post(api_start_session))
                 .route("/api/sessions/:session_id/interrupt", axum::routing::post(api_interrupt_session))
-                .route("/api/webhook/teams", axum::routing::post(api_webhook_teams))
                 .route("/api/ws/:session_id", get(ws_handler))
                 .route("/api/ws/status", get(ws_status_handler))
-                .route("/api/ws/mobile", get(ws_mobile_handler))
-                // MCP HTTP endpoints for external control
-                .route("/api/mcp/execute", axum::routing::post(api_mcp_execute))
-                .route("/api/mcp/result", axum::routing::post(api_mcp_result))
-                // Search
+                // Search reads indexed transcript content — every prompt and
+                // response ever run through this app.
                 .route("/api/search/messages", get(api_search_messages))
                 .route("/api/search/context", get(api_search_context))
                 .route("/api/search/stats", get(api_search_stats))
                 .route("/api/search/rebuild", axum::routing::post(api_search_rebuild))
                 .route("/api/schedules", get(api_list_schedules).post(api_create_schedule))
                 .route("/api/schedules/:id", axum::routing::patch(api_update_schedule).delete(api_delete_schedule))
+                .layer(axum::middleware::from_fn(require_auth));
+
+            let app = public
+                .merge(local_only)
+                .merge(protected)
                 .layer(CorsLayer::permissive());
 
             // Try ports starting from WEB_PORT_BASE until we find one available
@@ -5026,6 +5325,11 @@ fn start_web_server() {
     // Load paired devices from database
     load_paired_devices();
 
+    // Create the local API token file now rather than on the first authenticated
+    // request, so same-machine tooling can read it before it needs to call us.
+    Lazy::force(&LOCAL_TOKEN);
+    println!("Local API token: {}", local_token_path().display());
+
     // Spawn web server in a dedicated thread with its own tokio runtime
     thread::spawn(|| {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime for web server");
@@ -5045,32 +5349,38 @@ fn start_web_server() {
             .find(|p| p.exists())
             .unwrap_or_else(|| std::path::PathBuf::from("mobile-web-dist"));
 
-            let app = Router::new()
+            // See the desktop router for why this is split: public routes are an
+            // explicit opt-out list, everything else is authenticated by layer.
+            let public = Router::new()
                 .route("/", get(web_index))
                 // Serve static assets from mobile-web-dist
                 .nest_service("/assets", tower_http::services::ServeDir::new(mobile_web_dir.join("assets")))
-                // Auth endpoints (no auth required)
+                // Auth endpoints: these mint tokens, so they cannot require one
                 .route("/api/auth/check", get(api_auth_check))
                 .route("/api/auth/request-pairing", axum::routing::post(api_request_pairing))
                 .route("/api/auth/pair", axum::routing::post(api_pair))
                 .route("/api/auth/pin-status", get(api_pin_status))
                 .route("/api/auth/pin-login", axum::routing::post(api_pin_login))
-                // Protected endpoints - PTY start and WebSocket will return errors on iOS
+                // Authenticates in-band: the client's first frame must be `auth`
+                .route("/api/ws/mobile", get(ws_mobile_handler));
+
+            // Protected endpoints - PTY start and WebSocket will return errors on iOS
+            let protected = Router::new()
                 .route("/api/sessions", get(api_list_sessions).post(api_create_session))
                 .route("/api/sessions/:session_id/buffer", get(api_get_buffer))
                 .route("/api/sessions/:session_id/start", axum::routing::post(api_start_session))
                 .route("/api/sessions/:session_id/interrupt", axum::routing::post(api_interrupt_session))
                 .route("/api/ws/:session_id", get(ws_handler))
                 .route("/api/ws/status", get(ws_status_handler))
-                .route("/api/ws/mobile", get(ws_mobile_handler))
-                // Search
                 .route("/api/search/messages", get(api_search_messages))
                 .route("/api/search/context", get(api_search_context))
                 .route("/api/search/stats", get(api_search_stats))
                 .route("/api/search/rebuild", axum::routing::post(api_search_rebuild))
                 .route("/api/schedules", get(api_list_schedules).post(api_create_schedule))
                 .route("/api/schedules/:id", axum::routing::patch(api_update_schedule).delete(api_delete_schedule))
-                .layer(CorsLayer::permissive());
+                .layer(axum::middleware::from_fn(require_auth));
+
+            let app = public.merge(protected).layer(CorsLayer::permissive());
 
             // Try ports starting from WEB_PORT_BASE until we find one available
             let mut listener = None;
@@ -5309,6 +5619,7 @@ pub fn run() {
             read_text_file,
             find_latest_plan_file,
             get_web_server_port,
+            get_local_api_token,
             get_local_ips,
             mcp_callback,
             load_folders,
@@ -5394,6 +5705,7 @@ pub fn run() {
             read_text_file,
             find_latest_plan_file,
             get_web_server_port,
+            get_local_api_token,
             get_local_ips,
             load_folders,
             save_folder,

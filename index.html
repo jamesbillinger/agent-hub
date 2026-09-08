@@ -344,6 +344,16 @@
             <input type="password" id="settings-remote-pin" placeholder="Leave empty to disable" autocomplete="off" />
             <p class="form-hint">Set a PIN to access Agent Hub remotely without being at your computer. Leave empty to require pairing codes only.</p>
           </div>
+          <div class="form-group">
+            <label for="settings-webhook-secret">Teams Webhook Secret</label>
+            <input type="password" id="settings-webhook-secret" placeholder="Leave empty to disable the webhook" autocomplete="off" />
+            <p class="form-hint">Callers of <code>/api/webhook/teams</code> must send this as the <code>X-Webhook-Secret</code> header. That endpoint starts a session with permissions skipped, so it stays closed until a secret is set.</p>
+          </div>
+          <div class="form-group">
+            <label for="settings-teams-reply-url">Teams Reply Flow URL</label>
+            <input type="password" id="settings-teams-reply-url" placeholder="Leave empty to disable replies" autocomplete="off" />
+            <p class="form-hint">Power Automate "When an HTTP request is received" URL used by <code>/api/teams/reply</code> to post a threaded reply back into the originating Teams channel. Never shown to sessions.</p>
+          </div>
         </div>
 
         <div class="settings-section">
