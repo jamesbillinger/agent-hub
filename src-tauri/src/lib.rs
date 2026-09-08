@@ -4197,6 +4197,24 @@ async fn api_webhook_teams(
         String::new()
     };
 
+    // Immediate receipt ack, so the thread doesn't sit silent for the minutes
+    // the research actually takes. Spawned rather than awaited: Flow A's HTTP
+    // action gets its 200 back without waiting on Power Automate round-tripping.
+    if reply_configured && have_thread {
+        let (t, c, m) = (team_id.clone(), channel_id.clone(), message_id.clone());
+        tokio::spawn(async move {
+            let ack = "Got it — looking into this now. I'll reply here with what I find.";
+            if let Err(e) = forward_teams_reply(&t, &c, &m, ack).await {
+                let why = match e {
+                    TeamsReplyError::NotConfigured => "no reply URL configured".to_string(),
+                    TeamsReplyError::Flow { status, detail } => format!("flow {}: {}", status, detail),
+                    TeamsReplyError::Request(msg) => msg,
+                };
+                eprintln!("[webhook] receipt ack failed for message {}: {}", m, why);
+            }
+        });
+    }
+
     let text = format!(
         "/process-teams-issue\n\nFrom: {}{}{}\n---\n{}",
         from_name, link_line, reply_block, message
@@ -4236,18 +4254,59 @@ async fn api_teams_reply(body: axum::body::Bytes) -> impl IntoResponse {
         }))).into_response();
     }
 
+    match forward_teams_reply(&team_id, &channel_id, &message_id, &text).await {
+        Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
+        Err(TeamsReplyError::NotConfigured) => {
+            println!("[teams-reply] Rejected: no reply URL configured (Settings > Teams Webhook)");
+            (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                "error": "not_configured",
+                "message": "Teams reply URL is not configured on the server."
+            }))).into_response()
+        }
+        // Surface the flow's own status so a misconfigured Flow B is
+        // debuggable from the session transcript rather than failing silently.
+        Err(TeamsReplyError::Flow { status, detail }) => {
+            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "error": "flow_error",
+                "status": status,
+                "detail": detail,
+            }))).into_response()
+        }
+        Err(TeamsReplyError::Request(message)) => {
+            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "error": "request_failed",
+                "message": message,
+            }))).into_response()
+        }
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+enum TeamsReplyError {
+    NotConfigured,
+    Flow { status: u16, detail: String },
+    Request(String),
+}
+
+/// POST a threaded reply to the configured Power Automate flow.
+///
+/// Shared by /api/teams/reply (the session's own summary at the end of triage)
+/// and the webhook handler's immediate receipt acknowledgement. The ack is sent
+/// from here rather than from the skill on purpose: it fires before the session
+/// process has even spawned, costs no tokens, and cannot be skipped or reordered
+/// by the model the way a prompt instruction can.
+#[cfg(not(target_os = "ios"))]
+async fn forward_teams_reply(
+    team_id: &str,
+    channel_id: &str,
+    message_id: &str,
+    text: &str,
+) -> Result<(), TeamsReplyError> {
     let flow_url = load_app_settings()
         .ok()
         .and_then(|s| s.teams_reply_url)
-        .filter(|u| !u.is_empty());
-
-    let Some(flow_url) = flow_url else {
-        println!("[teams-reply] Rejected: no reply URL configured (Settings > Teams Webhook)");
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "not_configured",
-            "message": "Teams reply URL is not configured on the server."
-        }))).into_response();
-    };
+        .filter(|u| !u.is_empty())
+        .ok_or(TeamsReplyError::NotConfigured)?;
 
     let resp = reqwest::Client::new()
         .post(&flow_url)
@@ -4261,27 +4320,16 @@ async fn api_teams_reply(body: axum::body::Bytes) -> impl IntoResponse {
         .await;
 
     match resp {
-        Ok(r) if r.status().is_success() => {
-            Json(serde_json::json!({"status": "ok"})).into_response()
-        }
-        // Surface the flow's own status so a misconfigured Flow B is
-        // debuggable from the session transcript rather than failing silently.
+        Ok(r) if r.status().is_success() => Ok(()),
         Ok(r) => {
-            let status = r.status();
+            let status = r.status().as_u16();
             let detail = r.text().await.unwrap_or_default();
             eprintln!("[teams-reply] flow returned {}: {}", status, detail);
-            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
-                "error": "flow_error",
-                "status": status.as_u16(),
-                "detail": detail,
-            }))).into_response()
+            Err(TeamsReplyError::Flow { status, detail })
         }
         Err(e) => {
             eprintln!("[teams-reply] request failed: {}", e);
-            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
-                "error": "request_failed",
-                "message": e.to_string(),
-            }))).into_response()
+            Err(TeamsReplyError::Request(e.to_string()))
         }
     }
 }
