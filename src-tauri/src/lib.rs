@@ -178,6 +178,11 @@ static SESSION_MESSAGES: Lazy<Mutex<HashMap<String, Vec<serde_json::Value>>>> =
 static SESSION_MESSAGES_LOADED: Lazy<Mutex<std::collections::HashSet<String>>> =
     Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
 
+// Sessions whose SESSION_MESSAGES have grown since the last DB write
+#[cfg(not(target_os = "ios"))]
+static SESSION_MESSAGES_DIRTY: Lazy<Mutex<std::collections::HashSet<String>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
+
 #[cfg(not(target_os = "ios"))]
 struct MobileClient {
     sender: MobileSender,
@@ -388,14 +393,20 @@ fn parse_buffer_to_messages(buffer: &str) -> Vec<serde_json::Value> {
 #[cfg(not(target_os = "ios"))]
 fn append_session_message(session_id: &str, message: serde_json::Value) {
     ensure_session_messages_loaded(session_id);
-    let mut messages = SESSION_MESSAGES.lock();
-    messages.entry(session_id.to_string()).or_default().push(message);
+    {
+        let mut messages = SESSION_MESSAGES.lock();
+        messages.entry(session_id.to_string()).or_default().push(message);
+    }
+    SESSION_MESSAGES_DIRTY.lock().insert(session_id.to_string());
 }
 
-/// Save the in-memory SESSION_MESSAGES buffer for a session to the database.
-/// Uses save_terminal_buffer_to_db directly to avoid re-updating SESSION_MESSAGES.
+/// Write one session's in-memory messages to the DB. A full rewrite (gzip of
+/// the whole history, tens of MB on a long session), so never call this on the
+/// main thread or per message.
 #[cfg(not(target_os = "ios"))]
-fn save_session_messages_to_db(session_id: &str) {
+fn persist_session_messages(session_id: &str) {
+    // Clear first: an append that lands mid-write re-marks the session
+    SESSION_MESSAGES_DIRTY.lock().remove(session_id);
     let messages = {
         let msgs = SESSION_MESSAGES.lock();
         match msgs.get(session_id) {
@@ -403,9 +414,15 @@ fn save_session_messages_to_db(session_id: &str) {
             _ => return,
         }
     };
-
     let buffer_content = serde_json::to_string(&messages).unwrap_or_default();
     let _ = save_terminal_buffer_to_db(session_id, &buffer_content);
+}
+
+/// Save the in-memory SESSION_MESSAGES buffer for a session to the database.
+/// Uses save_terminal_buffer_to_db directly to avoid re-updating SESSION_MESSAGES.
+#[cfg(not(target_os = "ios"))]
+fn save_session_messages_to_db(session_id: &str) {
+    persist_session_messages(session_id);
 
     // End-of-turn: re-scan this session's JSONL file(s) and ingest any new
     // bytes into the search index. Idempotent (resumes from last_offset).
@@ -2406,6 +2423,78 @@ fn kill_pty(session_id: String) -> Result<(), String> {
 // JSON Process Commands (for claude-json sessions)
 // ============================================
 
+/// Who a session is and who it works alongside, for injection at launch.
+///
+/// Returns the session's sidebar name and, when it sits in a folder with other
+/// chat sessions, a roster of those siblings. The name becomes the CLI's `-n`,
+/// which is the address peers use in ListAgents/SendMessage - without it they
+/// see `<dirname>-<hex>` and can't tell a track from the director.
+///
+/// The roster goes in the system prompt, so it must stay byte-stable between
+/// launches or every resume misses the prompt cache: sorted, and no volatile
+/// state like running/idle (agents get that live from ListAgents).
+#[cfg(not(target_os = "ios"))]
+fn session_identity(session_id: &str) -> Option<(String, Option<String>)> {
+    let conn = DB_CONNECTION.lock();
+    let (name, working_dir, folder_id): (String, String, Option<String>) = conn
+        .query_row(
+            "SELECT name, working_dir, folder_id FROM sessions WHERE id = ?1",
+            [session_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok()?;
+
+    let Some(folder_id) = folder_id else {
+        return Some((name, None));
+    };
+    let folder_name: String = conn
+        .query_row("SELECT name FROM folders WHERE id = ?1", [&folder_id], |r| r.get(0))
+        .unwrap_or_default();
+
+    let siblings: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT name, working_dir FROM sessions
+             WHERE folder_id = ?1 AND id != ?2 AND agent_type = 'claude-json'
+             ORDER BY name, id",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(params![folder_id, session_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .unwrap_or_default();
+    if siblings.is_empty() {
+        return Some((name, None));
+    }
+
+    let mut roster = format!(
+        "# Agent Hub\nYou are the Agent Hub session \"{}\" in the folder \"{}\". Other agents address you by that name.\n\nSibling sessions in this folder - message one by name with SendMessage; ListAgents shows which are running right now:\n",
+        name, folder_name
+    );
+    // Imported sessions are named after their first prompt, newlines and all
+    let one_line = |s: &str| -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(80).collect()
+    };
+    const MAX_LISTED: usize = 40;
+    let mut shared = false;
+    for (sib_name, sib_dir) in siblings.iter().take(MAX_LISTED) {
+        let same = sib_dir == &working_dir;
+        shared |= same;
+        roster.push_str(&format!(
+            "- \"{}\" - {}{}\n",
+            one_line(sib_name),
+            sib_dir,
+            if same { " (shares your working directory)" } else { "" }
+        ));
+    }
+    if siblings.len() > MAX_LISTED {
+        roster.push_str(&format!("- ...and {} more (see ListAgents)\n", siblings.len() - MAX_LISTED));
+    }
+    if shared {
+        roster.push_str("\nSome siblings share your working directory: their uncommitted changes and commits land in the same checkout, so check with them before you push, rebase, or switch branches.\n");
+    }
+    Some((name, Some(roster)))
+}
+
 /// Spawn a JSON streaming process (non-PTY)
 #[cfg(not(target_os = "ios"))]
 #[tauri::command]
@@ -2430,6 +2519,27 @@ fn spawn_json_process(
             // Add --resume flag for existing sessions
             if !cmd_str.contains("--resume") {
                 cmd_str = cmd_str.replace("claude ", &format!("claude --resume {} ", claude_id));
+            }
+        }
+    }
+
+    // Name the session after its sidebar entry and tell it about its folder
+    // siblings. Values travel as env vars so names with quotes or spaces can't
+    // break the shell command.
+    let mut identity_envs: Vec<(&str, String)> = Vec::new();
+    if cmd_str.starts_with("claude ") {
+        if let Some((name, roster)) = session_identity(&session_id) {
+            if !cmd_str.contains(" -n ") && !cmd_str.contains("--name") {
+                cmd_str = cmd_str.replacen("claude ", "claude -n \"$AGENT_HUB_SESSION_NAME\" ", 1);
+                // Single line: imported sessions carry their whole first prompt as a name
+                let address: String = name.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(80).collect();
+                identity_envs.push(("AGENT_HUB_SESSION_NAME", address));
+            }
+            if let Some(roster) = roster {
+                if !cmd_str.contains("--append-system-prompt") {
+                    cmd_str = cmd_str.replacen("claude ", "claude --append-system-prompt \"$AGENT_HUB_ROSTER\" ", 1);
+                    identity_envs.push(("AGENT_HUB_ROSTER", roster));
+                }
             }
         }
     }
@@ -2479,6 +2589,10 @@ fn spawn_json_process(
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+
+            for (key, value) in &identity_envs {
+                cmd.env(key, value);
+            }
 
             // Apply global CLAUDE_CONFIG_DIR from app settings (if not overridden per-session)
             if let Some(expanded) = resolve_claude_config_dir(&custom_envs) {
@@ -2822,7 +2936,8 @@ fn save_terminal_buffer_to_db(session_id: &str, buffer_content: &str) -> Result<
 /// Compress and save terminal buffer content to the database
 /// Called from the desktop frontend. Also updates in-memory SESSION_MESSAGES
 /// to stay in sync (desktop has the most complete view of messages).
-#[tauri::command]
+/// `async` keeps the parse + gzip of a large buffer off the main thread.
+#[tauri::command(async)]
 fn save_terminal_buffer(session_id: String, buffer_content: String) -> Result<(), String> {
     // Update in-memory SESSION_MESSAGES when desktop saves (desktop has the most complete view)
     #[cfg(not(target_os = "ios"))]
@@ -2837,6 +2952,38 @@ fn save_terminal_buffer(session_id: String, buffer_content: String) -> Result<()
     }
 
     save_terminal_buffer_to_db(&session_id, &buffer_content)
+}
+
+/// Record a chat message that originated in the desktop UI (typed user
+/// messages, local system notes). Stream output is already tracked by the
+/// stdout reader, so the frontend only reports what the backend can't see -
+/// it used to re-send the session's entire history on every message instead.
+#[tauri::command]
+fn append_chat_message(session_id: String, message: serde_json::Value) -> Result<(), String> {
+    #[cfg(not(target_os = "ios"))]
+    append_session_message(&session_id, message);
+    #[cfg(target_os = "ios")]
+    let _ = (session_id, message);
+    Ok(())
+}
+
+/// Persist every session with unsaved messages. Turn end and process exit
+/// already save; this covers local notes and quitting mid-turn. The write
+/// happens on a worker thread so the command returns immediately.
+#[tauri::command]
+fn flush_chat_messages() {
+    #[cfg(not(target_os = "ios"))]
+    {
+        let dirty: Vec<String> = SESSION_MESSAGES_DIRTY.lock().iter().cloned().collect();
+        if dirty.is_empty() {
+            return;
+        }
+        std::thread::spawn(move || {
+            for session_id in dirty {
+                persist_session_messages(&session_id);
+            }
+        });
+    }
 }
 
 /// Load and decompress terminal buffer content from the database
@@ -5657,6 +5804,8 @@ pub fn run() {
             delete_recently_closed,
             update_history_menu,
             save_terminal_buffer,
+            append_chat_message,
+            flush_chat_messages,
             load_terminal_buffer,
             delete_terminal_buffer,
             save_window_state,
@@ -5743,6 +5892,8 @@ pub fn run() {
             delete_recently_closed,
             update_history_menu,
             save_terminal_buffer,
+            append_chat_message,
+            flush_chat_messages,
             load_terminal_buffer,
             delete_terminal_buffer,
             save_window_state,

@@ -1391,7 +1391,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     for (const [sessionId, messages] of messageBuffer) {
       const cs = chatSessions.get(sessionId);
       for (const message of messages) {
-        addChatMessage(sessionId, message);
+        addChatMessage(sessionId, message, false);
         if (cs) {
           // Background-initiated turns (task notifications etc.) must re-light
           // the activity indicator even though the user didn't send anything
@@ -1468,8 +1468,6 @@ document.addEventListener("DOMContentLoaded", async () => {
     chatSession.statusEl.textContent = parts.join(" · ");
     chatSession.statusEl.className = "chat-status connected";
     chatSession.startTime = null;
-
-    saveChatMessages(sessionId);
   }
 
   await listen<{ session_id: string; message: ClaudeJsonMessage }>("json-process-message", (event) => {
@@ -6811,14 +6809,13 @@ function addSessionEvent(sessionId: string, eventType: "resumed" | "stopped") {
   eventEl.textContent = `--- ${eventText} (${timestamp}) ---`;
   chatSession.messagesEl.appendChild(eventEl);
 
-  // Save messages
-  saveChatMessages(sessionId);
+  persistLocalChatMessage(sessionId, eventMessage);
 }
 
 /**
  * Add a message to the chat UI
  */
-function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
+function addChatMessage(sessionId: string, message: ClaudeJsonMessage, persist = true) {
   perfStart(`addChatMessage:${message.type}`);
   const chatSession = chatSessions.get(sessionId);
   if (!chatSession) {
@@ -6850,7 +6847,10 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
   } else {
     chatSession.messages.push(message);
   }
-  chatSession.dirty = true;
+  // Stream output is persisted by the backend as it reads it; only messages
+  // born in this window need reporting. Callers replaying the stream or bulk
+  // loading history pass persist = false.
+  if (persist) persistLocalChatMessage(sessionId, message);
 
   const messageEl = document.createElement("div");
   messageEl.className = "chat-message";
@@ -6881,7 +6881,6 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
     // but still save them to preserve history
     const hasImages = message.images && message.images.length > 0;
     if (!hasImages && (typeof userContent !== "string" || !userContent.trim())) {
-      saveChatMessages(sessionId);
       return;
     }
     messageEl.classList.add("user");
@@ -6982,7 +6981,6 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
       messageEl.innerHTML = `<pre><code>${escapeHtml(message.result)}</code></pre>`;
     } else {
       // Skip rendering non-error results (they just duplicate assistant content) but still save
-      saveChatMessages(sessionId);
       return;
     }
   } else if (message.type === "system" && message.subtype === "init") {
@@ -7035,7 +7033,6 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
       }
     }
     // Save init message so it persists across restarts
-    saveChatMessages(sessionId);
     return;
   } else if (message.type === "system" && message.subtype === "compact_boundary") {
     // Compaction boundary - render a visual divider
@@ -7046,7 +7043,6 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
     messageEl.innerHTML = `<div class="compact-divider"><span>Context compacted${tokenInfo} — ${trigger}</span></div>`;
   } else if (message.type === "system" && message.subtype === "status") {
     // Status messages (e.g., compacting) - don't render, just save
-    saveChatMessages(sessionId);
     return;
   } else if (message.type === "system" && message.result) {
     // Plain system messages (e.g., from slash commands)
@@ -7056,7 +7052,6 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
     messageEl.innerHTML = renderedMarkdown;
   } else {
     // Skip rendering other message types but still save
-    saveChatMessages(sessionId);
     return;
   }
 
@@ -7076,8 +7071,6 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage) {
     });
   }
 
-  // Save messages after every message for safety
-  saveChatMessages(sessionId);
   perfEnd(`addChatMessage:${message.type}`);
 }
 
@@ -7121,7 +7114,7 @@ function processChatOutput(sessionId: string, data: string) {
       // Only the live stream can confirm the model for *this* run - replaying
       // persisted history through addChatMessage() must not, or a restored old
       // turn would re-confirm a model the session is no longer on.
-      addChatMessage(sessionId, message);
+      addChatMessage(sessionId, message, false);
 
       // Background-initiated turns must re-light the activity indicator
       markSessionProcessingFromStream(sessionId, chatSession, message);
@@ -7185,8 +7178,6 @@ function processChatOutput(sessionId: string, data: string) {
         chatSession.statusEl.className = "chat-status connected";
         chatSession.startTime = null;
 
-        // Save all messages when response is complete
-        saveChatMessages(sessionId);
       }
     } catch (err) {
       console.warn("Failed to parse JSON line:", line, err);
@@ -8201,6 +8192,17 @@ const savePendingTimers = new Map<string, number>();
 const saveInProgress = new Map<string, boolean>();
 
 /**
+ * Report one desktop-originated message to the backend, which owns the
+ * persisted history. O(message), unlike saveChatMessages() which re-serializes
+ * the whole session - 30MB+ on a long one, and it used to run per message.
+ */
+function persistLocalChatMessage(sessionId: string, message: ClaudeJsonMessage): void {
+  invoke("append_chat_message", { sessionId, message }).catch((err) => {
+    console.error("Failed to persist chat message:", err);
+  });
+}
+
+/**
  * Save chat messages to the database (debounced to prevent race conditions)
  * Uses terminal_buffer table for storage.
  *
@@ -8589,12 +8591,8 @@ async function saveAllTerminalBuffers(): Promise<void> {
     }
   }
 
-  // Save chat session messages that have changed (use immediate save to bypass debounce on app close)
-  for (const [sessionId, chatSession] of chatSessions.entries()) {
-    if (chatSession.messages.length > 0 && chatSession.dirty) {
-      savePromises.push(saveChatMessagesImmediate(sessionId));
-    }
-  }
+  // Chat history lives in the backend; have it write out anything unsaved
+  savePromises.push(invoke<void>("flush_chat_messages").catch(() => {}));
 
   await Promise.all(savePromises);
 }
@@ -9233,7 +9231,7 @@ async function resumeClaudeSession(claudeSessionId: string, project: string): Pr
               type: "user",
               result: content,
             };
-            addChatMessage(newSession.id, claudeMsg);
+            addChatMessage(newSession.id, claudeMsg, false);
           }
         } else if (msgType === "assistant") {
           // Assistant messages have full message structure
@@ -9243,7 +9241,7 @@ async function resumeClaudeSession(claudeSessionId: string, project: string): Pr
               type: "assistant",
               message: message,
             };
-            addChatMessage(newSession.id, claudeMsg);
+            addChatMessage(newSession.id, claudeMsg, false);
           }
         }
       }
