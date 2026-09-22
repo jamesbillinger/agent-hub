@@ -577,7 +577,7 @@ fn default_true() -> bool {
 }
 
 fn default_model_default() -> Option<String> {
-    Some("claude-opus-5[1m]".to_string())
+    Some("claude-opus-5-5[1m]".to_string())
 }
 
 /// Launch command for sessions the app starts on its own (Teams webhook,

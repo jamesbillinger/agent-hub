@@ -479,7 +479,7 @@ let appSettings: AppSettings = {
   read_aloud_enabled: false,
   renderer: "webgl",
   show_active_sessions_group: true,
-  default_model: "claude-opus-5[1m]",
+  default_model: "claude-opus-5-5[1m]",
   webhook_model: null,
   claude_config_dir: null,
   claude_search_dirs: ["~/.claude"],
@@ -5077,7 +5077,7 @@ function sameModelFamily(a?: string, b?: string): boolean {
 /**
  * Whether a requested --model value can be meaningfully compared to the id the
  * CLI reports. The CLI also accepts short aliases (`--model sonnet`), which
- * never string-match the resolved `claude-sonnet-4-7` - comparing those would
+ * never string-match the resolved `claude-sonnet-5` - comparing those would
  * report a failed switch on every correctly-honoured one.
  */
 function isFullModelId(model?: string): boolean {
@@ -5729,7 +5729,7 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
         const settingsDefault = appSettings.default_model ? `Settings default: \`${appSettings.default_model}\`` : "No settings default (using CLI config)";
         addChatMessage(sessionId, {
           type: "system",
-          result: `**Current model:** ${activeModelName}${mismatchLine}\n${contextLine}\n${settingsDefault}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`opus\` (Opus 5, 1M), \`opus-200k\`, \`fable\` (Fable 5.1, 1M), \`fable-200k\`, \`fable-5\`, \`sonnet\`, \`haiku\`, \`opus-4.8\`, \`opus-4.7\`, \`opus-4.6\`, \`sonnet-4.6\`, \`default\`\n**Full IDs:** \`claude-opus-5[1m]\`, \`claude-opus-5\`, \`claude-fable-5-1[1m]\`, \`claude-fable-5[1m]\`, \`claude-opus-4-8[1m]\`, \`claude-sonnet-4-7\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
+          result: `**Current model:** ${activeModelName}${mismatchLine}\n${contextLine}\n${settingsDefault}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`opus\` (Opus 5.5, 1M), \`opus-200k\`, \`opus-5\`, \`fable\` (Fable 5.1, 1M), \`fable-200k\`, \`fable-5\`, \`sonnet\` (Sonnet 5), \`haiku\`, \`opus-4.8\`, \`opus-4.7\`, \`opus-4.6\`, \`sonnet-4.6\`, \`default\`\n**Full IDs:** \`claude-opus-5-5[1m]\`, \`claude-opus-5-5\`, \`claude-opus-5[1m]\`, \`claude-fable-5-1[1m]\`, \`claude-fable-5[1m]\`, \`claude-opus-4-8[1m]\`, \`claude-sonnet-5\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
         });
         return true;
       }
@@ -5773,12 +5773,14 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
         mythos: "claude-mythos-5-1",
         "mythos-5.1": "claude-mythos-5-1",
         "mythos-5": "claude-mythos-5",
-        opus: "claude-opus-5[1m]",
-        "opus-1m": "claude-opus-5[1m]",
-        "opus-200k": "claude-opus-5",
+        opus: "claude-opus-5-5[1m]",
+        "opus-1m": "claude-opus-5-5[1m]",
+        "opus-200k": "claude-opus-5-5",
+        "opus-5.5": "claude-opus-5-5[1m]",
         "opus-5": "claude-opus-5[1m]",
         "opus-4.8": "claude-opus-4-8[1m]",
-        sonnet: "claude-sonnet-4-7",
+        sonnet: "claude-sonnet-5",
+        "sonnet-5": "claude-sonnet-5",
         "opus-4.7": "claude-opus-4-7[1m]",
         "opus-4.6": "claude-opus-4-6[1m]",
         "sonnet-4.6": "claude-sonnet-4-6",
@@ -7418,8 +7420,11 @@ function buildUsageBar(percent: number, width = 25): string {
 
 // Max context by model (conservative estimates for display)
 const MODEL_MAX_CONTEXT: Record<string, number> = {
+  "claude-opus-5-5[1m]": 1000000,
+  "claude-opus-5-5": 200000,
   "claude-opus-5[1m]": 1000000,
   "claude-opus-5": 200000,
+  "claude-sonnet-5": 1000000,
   "claude-fable-5-1[1m]": 1000000,
   "claude-fable-5-1": 200000,
   "claude-fable-5[1m]": 1000000,
@@ -7430,7 +7435,6 @@ const MODEL_MAX_CONTEXT: Record<string, number> = {
   "claude-opus-4-8": 200000,
   "claude-opus-4-7[1m]": 1000000,
   "claude-opus-4-7": 200000,
-  "claude-sonnet-4-7": 200000,
   "claude-opus-4-6[1m]": 1000000,
   "claude-opus-4-6": 200000,
   "claude-sonnet-4-6": 200000,
