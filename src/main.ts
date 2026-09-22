@@ -374,6 +374,34 @@ interface ChatSession {
   // Its tool_result returns immediately ("running in background..."), so nothing
   // else in the UI reflects that the work is still outstanding.
   backgroundTasks: Map<string, BackgroundTask>;
+  // The activity group still accepting messages (the live tail), if any.
+  activityGroup: ActivityGroup | null;
+  activityGroups: ActivityGroup[];
+  // "Show all activity" toggle for this session: groups render open and stay open.
+  activityExpanded: boolean;
+}
+
+/**
+ * A run of low-altitude messages - tool calls, subagent output, thinking-only
+ * turns - between two things the user actually reads. Rolls up to one line
+ * once something readable lands after it; the newest group stays open so the
+ * live tail is always visible.
+ */
+interface ActivityGroup {
+  el: HTMLElement;
+  headerEl: HTMLElement;
+  bodyEl: HTMLElement;
+  open: boolean;
+  // History behind a collapsed group isn't built into DOM until expanded -
+  // most of a long session's nodes were tool calls nobody scrolls back to.
+  pending: ClaudeJsonMessage[];
+  count: number;
+  toolCounts: Map<string, number>;
+  subagents: Set<string>;
+  edits: Set<string>;
+  errors: number;
+  firstAt: number | null;
+  lastAt: number | null;
 }
 
 interface BackgroundTask {
@@ -3968,6 +3996,7 @@ function reopenSearchOverlayFromSnapshot() {
 function scrollToPendingTarget() {
   if (!pendingScrollTargetUuid) return;
   const uuid = pendingScrollTargetUuid;
+  revealActivityMessage(uuid);
   const tryFind = (attemptsLeft: number) => {
     const el = document.querySelector(
       `.chat-message[data-uuid="${CSS.escape(uuid)}"]`
@@ -5316,6 +5345,7 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
       <div class="chat-model" title="Active model"></div>
       <div class="chat-context" title="Context usage">—</div>
       <div class="chat-background" title="Background tasks"></div>
+      <button class="chat-activity-toggle" title="Show all tool calls and subagent output instead of rolling them up">⊞ activity</button>
     </div>
   `;
 
@@ -5355,10 +5385,20 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
     totalOutputTokens: 0,
     backgroundTasks: new Map(),
     dirty: false,
+    activityGroup: null,
+    activityGroups: [],
+    activityExpanded: false,
   };
 
   // File attachment button click opens file picker
   attachBtn.addEventListener("click", () => fileInput.click());
+
+  const activityToggle = containerEl.querySelector(".chat-activity-toggle") as HTMLButtonElement;
+  activityToggle.addEventListener("click", () => {
+    setActivityExpanded(chatSession, !chatSession.activityExpanded);
+    activityToggle.textContent = chatSession.activityExpanded ? "⊟ activity" : "⊞ activity";
+    activityToggle.classList.toggle("active", chatSession.activityExpanded);
+  });
 
   // File selection handler
   fileInput.addEventListener("change", () => {
@@ -5565,6 +5605,8 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
       // Clear the chat display (but not Claude's context)
       chatSession.messagesEl.innerHTML = "";
       chatSession.messages = [];
+      chatSession.activityGroup = null;
+      chatSession.activityGroups = [];
       addChatMessage(sessionId, {
         type: "system",
         result: "Chat display cleared. Claude still remembers the conversation.",
@@ -7061,7 +7103,7 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage, persist =
   // Check if at bottom before appending (for smart scroll)
   const wasAtBottom = isChatAtBottom(chatSession.messagesEl);
 
-  chatSession.messagesEl.appendChild(messageEl);
+  placeMessageEl(chatSession, messageEl, message);
 
   // Only auto-scroll if was already at bottom (or user message)
   if (wasAtBottom || message.type === "user") {
@@ -8299,6 +8341,7 @@ async function loadChatMessages(sessionId: string, chatSession: ChatSession): Pr
             chatSession.messages.push(msg);
             renderChatMessage(chatSession, msg);
           }
+          if (chatSession.activityGroup) flushPendingActivity(chatSession, chatSession.activityGroup);
           return;
         }
       } catch {
@@ -8372,6 +8415,8 @@ async function loadChatMessages(sessionId: string, chatSession: ChatSession): Pr
         trackBackgroundTasks(chatSession, msg);
         updateContextWindowFromResult(chatSession, msg);
       }
+      // The last group is the live tail - it stays open, so build it now
+      if (chatSession.activityGroup) flushPendingActivity(chatSession, chatSession.activityGroup);
     }
   } catch (err) {
     console.error("Failed to load chat messages:", err);
@@ -8379,9 +8424,44 @@ async function loadChatMessages(sessionId: string, chatSession: ChatSession): Pr
 }
 
 /**
- * Render a single chat message to the UI (without adding to messages array)
+ * Render a single chat message from history (without adding to messages array).
+ * Activity behind a readable message is queued on its group rather than built,
+ * so a 19k-message session doesn't cost 19k DOM nodes up front.
  */
 function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage): void {
+  const altitude = messageAltitude(message);
+  if (altitude === "hidden") return;
+  if (altitude === "activity" && !chatSession.activityExpanded) {
+    // Side effects that must run even when the DOM is deferred
+    applyTodoWrite(chatSession, message);
+    const group = chatSession.activityGroup ?? openActivityGroup(chatSession);
+    tallyActivity(group, message);
+    group.pending.push(message);
+    return;
+  }
+  const messageEl = buildMessageEl(chatSession, message);
+  if (messageEl) placeMessageEl(chatSession, messageEl, message);
+}
+
+/** TodoWrite drives the todo panel, not the transcript. */
+function applyTodoWrite(chatSession: ChatSession, message: ClaudeJsonMessage): void {
+  if (message.type !== "assistant" || message.parent_tool_use_id) return;
+  for (const block of message.message?.content ?? []) {
+    if (block.type !== "tool_use" || block.name !== "TodoWrite") continue;
+    const input = block.input as { todos?: TodoItem[] };
+    if (input?.todos && Array.isArray(input.todos)) {
+      chatSession.todos = input.todos;
+      renderTodosPanel(chatSession);
+    }
+  }
+}
+
+/**
+ * Build the element for one message, or null when the message has nothing to
+ * show. Doesn't touch the transcript (init messages are the exception - they
+ * always slot in at the top and return null).
+ */
+function buildMessageEl(chatSession: ChatSession, message: ClaudeJsonMessage): HTMLElement | null {
   const messageEl = document.createElement("div");
   messageEl.className = "chat-message";
   // Search hits jump to a specific message via data-uuid; the JSONL
@@ -8408,7 +8488,7 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
     // Skip user messages with empty content (e.g., tool_result messages)
     const hasImages = message.images && message.images.length > 0;
     if (!hasImages && !message.result?.trim()) {
-      return;
+      return null;
     }
     messageEl.classList.add("user");
 
@@ -8489,7 +8569,7 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
       messageEl.classList.add("tool-result", "error");
       messageEl.innerHTML = `<pre><code>${escapeHtml(message.result)}</code></pre>`;
     } else {
-      return; // Skip non-error results
+      return null; // Skip non-error results
     }
   } else if (message.type === "system" && message.subtype === "init") {
     messageEl.classList.add("system", "init-details");
@@ -8513,7 +8593,7 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
     const existingInit = chatSession.messagesEl.querySelector(".init-details") as HTMLElement;
     if (existingInit) {
       existingInit.innerHTML = messageEl.innerHTML;
-      return;
+      return null;
     } else {
       const firstChild = chatSession.messagesEl.firstChild;
       if (firstChild) {
@@ -8521,21 +8601,232 @@ function renderChatMessage(chatSession: ChatSession, message: ClaudeJsonMessage)
       } else {
         chatSession.messagesEl.appendChild(messageEl);
       }
-      return;
+      return null;
     }
   } else if (message.type === "system" && (message.subtype === "resumed" || message.subtype === "stopped")) {
     // Session event (resumed/stopped) - use saved result which includes timestamp
     messageEl.classList.add("system", "session-event");
     messageEl.textContent = message.result || `--- Session ${message.subtype} ---`;
   } else {
-    return; // Skip other message types
+    return null; // Skip other message types
   }
 
   // Prepend the run badge once the branch above has written the body.
   if (agentRun) messageEl.insertAdjacentHTML("afterbegin", subagentChipHtml(agentRun));
 
+  return messageEl;
+}
+
+// ---- Activity groups -------------------------------------------------------
+
+type Altitude = "readable" | "activity" | "hidden";
+
+/**
+ * Where a message sits relative to the conversation. "readable" is what the
+ * user came to read (and anything that needs their action); "activity" is
+ * how the agent got there; "hidden" never renders.
+ */
+function messageAltitude(message: ClaudeJsonMessage): Altitude {
+  if (message.type === "user") {
+    const content = message.result ?? message.message?.content;
+    const hasText = typeof content === "string" && content.trim().length > 0;
+    return hasText || (message.images?.length ?? 0) > 0 ? "readable" : "hidden";
+  }
+  if (message.type === "assistant") {
+    const content = message.message?.content;
+    if (!content) return "hidden";
+    // Subagent output is a level below even the main agent's tool calls
+    if (message.parent_tool_use_id) return "activity";
+    let hasText = false;
+    let hasTool = false;
+    for (const block of content) {
+      if ((block.type === "text" && block.text?.trim()) || block.type === "image") hasText = true;
+      else if (block.type === "tool_use") {
+        if (block.name === "AskUserQuestion" || block.name === "ExitPlanMode") return "readable";
+        if (block.name !== "TodoWrite") hasTool = true;
+      }
+    }
+    if (hasText) return "readable";
+    // Thinking-only turns used to render as a bare usage footer - pure noise
+    return hasTool ? "activity" : "hidden";
+  }
+  if (message.type === "result") return message.is_error && message.result ? "readable" : "hidden";
+  if (message.type === "system") {
+    if (message.subtype === "init") return "readable"; // slots in at the top itself
+    if (message.subtype === "resumed" || message.subtype === "stopped" || message.subtype === "compact_boundary") return "readable";
+    if (message.subtype === "status") return "hidden";
+    return message.result ? "readable" : "hidden";
+  }
+  return "hidden";
+}
+
+function messageAt(message: ClaudeJsonMessage): number | null {
+  if (typeof message.received_at === "number") return message.received_at;
+  // Raw JSONL records carry an ISO timestamp instead
+  const ts = (message as { timestamp?: unknown }).timestamp;
+  if (typeof ts === "string") {
+    const t = Date.parse(ts);
+    if (!isNaN(t)) return t;
+  }
+  return null;
+}
+
+/**
+ * Put a built element in the transcript. Activity lands in the open group
+ * (creating one if needed); anything readable first rolls up whatever
+ * activity came before it, then goes in at top level.
+ */
+function placeMessageEl(chatSession: ChatSession, messageEl: HTMLElement, message: ClaudeJsonMessage): void {
+  const altitude = messageAltitude(message);
+  if (altitude === "hidden") return;
+  if (altitude === "activity" && !chatSession.activityExpanded) {
+    const group = chatSession.activityGroup ?? openActivityGroup(chatSession);
+    tallyActivity(group, message);
+    appendToGroup(group, messageEl, message);
+    renderGroupHeader(group);
+    return;
+  }
+  closeActivityGroup(chatSession);
   chatSession.messagesEl.appendChild(messageEl);
-  // Note: Caller should handle scrolling (showChatSession scrolls to bottom when opening)
+}
+
+function openActivityGroup(chatSession: ChatSession): ActivityGroup {
+  const el = document.createElement("div");
+  el.className = "activity-group open";
+  const headerEl = document.createElement("div");
+  headerEl.className = "activity-header";
+  const bodyEl = document.createElement("div");
+  bodyEl.className = "activity-body";
+  el.append(headerEl, bodyEl);
+  const group: ActivityGroup = {
+    el, headerEl, bodyEl, open: true, pending: [], count: 0,
+    toolCounts: new Map(), subagents: new Set(), edits: new Set(), errors: 0,
+    firstAt: null, lastAt: null,
+  };
+  headerEl.addEventListener("click", () => toggleActivityGroup(chatSession, group));
+  chatSession.messagesEl.appendChild(el);
+  chatSession.activityGroup = group;
+  chatSession.activityGroups.push(group);
+  return group;
+}
+
+/** Something readable landed after this group: fold it to a summary line. */
+function closeActivityGroup(chatSession: ChatSession): void {
+  const group = chatSession.activityGroup;
+  if (!group) return;
+  chatSession.activityGroup = null;
+  if (chatSession.activityExpanded) return;
+  group.open = false;
+  group.el.classList.remove("open");
+  renderGroupHeader(group);
+}
+
+function toggleActivityGroup(chatSession: ChatSession, group: ActivityGroup): void {
+  group.open = !group.open;
+  if (group.open) flushPendingActivity(chatSession, group);
+  group.el.classList.toggle("open", group.open);
+  renderGroupHeader(group);
+}
+
+/** Build the DOM for history that was deferred while the group was collapsed. */
+function flushPendingActivity(chatSession: ChatSession, group: ActivityGroup): void {
+  if (group.pending.length === 0) return;
+  const pending = group.pending;
+  group.pending = [];
+  for (const message of pending) {
+    const el = buildMessageEl(chatSession, message);
+    if (el) appendToGroup(group, el, message);
+  }
+}
+
+/** Subagent output nests one level further, under a collapsed row per run. */
+function appendToGroup(group: ActivityGroup, messageEl: HTMLElement, message: ClaudeJsonMessage): void {
+  const run = message.parent_tool_use_id;
+  if (!run) {
+    group.bodyEl.appendChild(messageEl);
+    return;
+  }
+  let runEl = group.bodyEl.querySelector<HTMLDetailsElement>(`details.subagent-run[data-run="${CSS.escape(run)}"]`);
+  if (!runEl) {
+    runEl = document.createElement("details");
+    runEl.className = `subagent-run c${subagentRun(run).color}`;
+    runEl.dataset.run = run;
+    const summary = document.createElement("summary");
+    summary.dataset.agentRun = run; // so refreshSubagentChips() reaches it
+    summary.innerHTML = `${subagentChipHtml(run)} <span class="subagent-run-count"></span>`;
+    runEl.appendChild(summary);
+    group.bodyEl.appendChild(runEl);
+  }
+  runEl.appendChild(messageEl);
+  const n = runEl.querySelectorAll(":scope > .chat-message").length;
+  runEl.querySelector(".subagent-run-count")!.textContent = `${n} message${n === 1 ? "" : "s"}`;
+}
+
+function tallyActivity(group: ActivityGroup, message: ClaudeJsonMessage): void {
+  group.count++;
+  const at = messageAt(message);
+  if (at !== null) {
+    if (group.firstAt === null) group.firstAt = at;
+    group.lastAt = at;
+  }
+  if (message.parent_tool_use_id) group.subagents.add(message.parent_tool_use_id);
+  if (message.type === "assistant") {
+    for (const block of message.message?.content ?? []) {
+      if (block.type !== "tool_use" || !block.name) continue;
+      group.toolCounts.set(block.name, (group.toolCounts.get(block.name) ?? 0) + 1);
+      if ((block.name === "Edit" || block.name === "Write" || block.name === "NotebookEdit") && !message.parent_tool_use_id) {
+        const path = (block.input as { file_path?: string; notebook_path?: string })?.file_path
+          ?? (block.input as { notebook_path?: string })?.notebook_path;
+        if (path) group.edits.add(path);
+      }
+    }
+  } else if (message.type === "result" && message.is_error) {
+    group.errors++;
+  }
+}
+
+function renderGroupHeader(group: ActivityGroup): void {
+  let tools = 0;
+  for (const n of group.toolCounts.values()) tools += n;
+  const parts: string[] = [];
+  parts.push(`${tools} tool call${tools === 1 ? "" : "s"}`);
+  if (group.subagents.size) parts.push(`${group.subagents.size} subagent${group.subagents.size === 1 ? "" : "s"}`);
+  if (group.edits.size) parts.push(`✎ ${group.edits.size} file${group.edits.size === 1 ? "" : "s"}`);
+  if (group.errors) parts.push(`<span class="activity-errors">⚠ ${group.errors} error${group.errors === 1 ? "" : "s"}</span>`);
+  if (group.firstAt !== null && group.lastAt !== null && group.lastAt > group.firstAt) {
+    parts.push(formatGridElapsed(group.lastAt - group.firstAt));
+  }
+  const top = [...group.toolCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4)
+    .map(([name, n]) => (n > 1 ? `${escapeHtml(name)} ×${n}` : escapeHtml(name)));
+  group.headerEl.innerHTML =
+    `<span class="activity-toggle">${group.open ? "▾" : "▸"}</span> ${parts.join(" · ")}` +
+    (top.length ? ` <span class="activity-tools">${top.join(", ")}</span>` : "");
+}
+
+/** Open whichever collapsed group holds this message, so a search jump can reach it. */
+function revealActivityMessage(uuid: string): void {
+  for (const cs of chatSessions.values()) {
+    for (const group of cs.activityGroups) {
+      if (group.open) continue;
+      const held = group.pending.some((m) => m.uuid === uuid)
+        || !!group.bodyEl.querySelector(`.chat-message[data-uuid="${CSS.escape(uuid)}"]`);
+      if (held) {
+        toggleActivityGroup(cs, group);
+        return;
+      }
+    }
+  }
+}
+
+/** Session-wide "show all activity": opens every group and stops new ones folding. */
+function setActivityExpanded(chatSession: ChatSession, expanded: boolean): void {
+  chatSession.activityExpanded = expanded;
+  chatSession.containerEl.classList.toggle("activity-expanded", expanded);
+  // Turning it off folds everything back except the live tail
+  for (const group of chatSession.activityGroups) {
+    const wantOpen = expanded || group === chatSession.activityGroup;
+    if (group.open !== wantOpen) toggleActivityGroup(chatSession, group);
+  }
 }
 
 // Terminal buffer persistence functions

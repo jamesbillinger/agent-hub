@@ -1374,6 +1374,117 @@ body.resizing-sidebar {
 .subagent.c4, .subagent-chip.c4 { --run-color: #7dcfff; }
 .subagent.c5, .subagent-chip.c5 { --run-color: #f7768e; }
 
+/* Activity groups: the tool calls and subagent output between two readable
+   messages, rolled up to one line once something readable follows. The open
+   group is the live tail. History behind a collapsed header isn't in the DOM
+   until it's expanded. */
+.activity-group {
+  align-self: stretch;
+  width: 100%;
+  max-width: 100%;
+  border-left: 2px solid var(--border-color);
+  padding-left: 10px;
+}
+
+.activity-header {
+  cursor: pointer;
+  user-select: none;
+  font-size: 11px;
+  font-family: 'Menlo', 'Monaco', monospace;
+  color: var(--text-muted);
+  padding: 4px 0;
+}
+
+.activity-header:hover {
+  color: var(--text-primary);
+}
+
+.activity-toggle {
+  display: inline-block;
+  width: 12px;
+}
+
+.activity-tools {
+  opacity: 0.7;
+}
+
+.activity-errors {
+  color: var(--error-color, #f7768e);
+}
+
+.activity-body {
+  display: none;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 8px;
+}
+
+.activity-group.open > .activity-body {
+  display: flex;
+}
+
+.activity-group.open {
+  border-left-color: var(--accent-primary);
+}
+
+/* One collapsed row per subagent run inside a group; its messages keep
+   their rail colour when opened. */
+details.subagent-run {
+  border-left: 3px solid var(--run-color);
+  margin-left: 14px;
+  padding-left: 12px;
+}
+
+details.subagent-run > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: 11px;
+  font-family: 'Menlo', 'Monaco', monospace;
+  color: var(--text-muted);
+}
+
+details.subagent-run > summary::-webkit-details-marker {
+  display: none;
+}
+
+details.subagent-run > summary::before {
+  content: "▸ ";
+}
+
+details.subagent-run[open] > summary::before {
+  content: "▾ ";
+}
+
+details.subagent-run > .chat-message.subagent {
+  border-left: none;
+  margin-left: 0;
+  padding-left: 0;
+  margin-top: 12px;
+}
+
+details.subagent-run.c0 { --run-color: #7aa2f7; }
+details.subagent-run.c1 { --run-color: #9ece6a; }
+details.subagent-run.c2 { --run-color: #e0af68; }
+details.subagent-run.c3 { --run-color: #bb9af7; }
+details.subagent-run.c4 { --run-color: #7dcfff; }
+details.subagent-run.c5 { --run-color: #f7768e; }
+
+.chat-activity-toggle {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 1px 6px;
+  cursor: pointer;
+}
+
+.chat-activity-toggle:hover,
+.chat-activity-toggle.active {
+  color: var(--text-primary);
+  border-color: var(--accent-primary);
+}
+
 /* User bubbles are filled with the accent colour, where the muted grey and the
    default border are both close to invisible. */
 .chat-message.user .token-usage {
