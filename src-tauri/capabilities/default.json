@@ -1,8 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
-  "windows": ["main"],
+  "description": "Capability for the main window and pop-out session windows",
+  "windows": [
+    "main",
+    "session-*"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-set-size",
@@ -11,13 +14,23 @@
     "core:window:allow-inner-size",
     "core:window:allow-outer-position",
     "core:window:allow-is-focused",
+    "core:window:allow-scale-factor",
+    "core:window:allow-set-focus",
+    "core:window:allow-close",
+    "core:window:allow-set-title",
     "opener:default",
     {
       "identifier": "opener:allow-open-url",
       "allow": [
-        { "url": "vscode://**" },
-        { "url": "https://**" },
-        { "url": "http://**" }
+        {
+          "url": "vscode://**"
+        },
+        {
+          "url": "https://**"
+        },
+        {
+          "url": "http://**"
+        }
       ]
     },
     "notification:default",

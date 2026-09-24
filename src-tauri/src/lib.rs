@@ -320,6 +320,7 @@ fn broadcast_session_list_to_mobile() {
             "agent_type": s.agent_type,
             "working_dir": s.working_dir,
             "folder_id": s.folder_id,
+            "ai_title": s.ai_title,
             "running": running,
         })
     }).collect();
@@ -510,6 +511,19 @@ struct WindowState {
     /// restarted, only re-opened.
     #[serde(default)]
     open_session_ids: Vec<String>,
+    /// Sessions popped out into their own windows at quit, with where each
+    /// window sat. Reopened on launch so a multi-monitor layout survives.
+    #[serde(default)]
+    popouts: Vec<PopoutState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PopoutState {
+    session_id: String,
+    x: Option<i32>,
+    y: Option<i32>,
+    width: Option<u32>,
+    height: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -537,6 +551,10 @@ struct AppSettings {
     webhook_secret: Option<String>,
     #[serde(default = "default_true")]
     show_active_sessions_group: bool,
+    /// Write a one-line subtitle for each chat session with Haiku after a
+    /// turn ends (a short `claude -p` call on the user's own login).
+    #[serde(default = "default_true")]
+    ai_titles_enabled: bool,
     /// Show all active sessions as a card grid instead of one at a time
     #[serde(default)]
     grid_view: bool,
@@ -621,6 +639,7 @@ impl Default for AppSettings {
             remote_pin: None,
             webhook_secret: None,
             show_active_sessions_group: true,
+            ai_titles_enabled: true,
             grid_view: false,
             default_model: default_model_default(),
             webhook_model: None,
@@ -662,6 +681,10 @@ struct SessionData {
     /// disarms itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     keepalive_until: Option<String>,
+    /// Short Haiku-written summary of what the session is working on, shown
+    /// under the name. Regenerated as the conversation moves on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ai_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -886,6 +909,9 @@ fn run_db_migrations() {
     let _ = conn.execute("ALTER TABLE sessions ADD COLUMN cache_expires_at TEXT", []);
     let _ = conn.execute("ALTER TABLE sessions ADD COLUMN cache_ttl_secs INTEGER", []);
     let _ = conn.execute("ALTER TABLE sessions ADD COLUMN keepalive_until TEXT", []);
+
+    // Migration: Haiku-written session subtitle
+    let _ = conn.execute("ALTER TABLE sessions ADD COLUMN ai_title TEXT", []);
 
     // Migration: Add running_pid column to track process PIDs across restarts
     let _ = conn.execute("ALTER TABLE sessions ADD COLUMN running_pid INTEGER", []);
@@ -1189,7 +1215,7 @@ fn is_valid_token(token: &str) -> bool {
 fn load_sessions() -> Result<Vec<SessionData>, String> {
     let conn = DB_CONNECTION.lock();
     let mut stmt = conn
-        .prepare("SELECT id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order, folder_id, env_vars, context_tokens, cache_expires_at, cache_ttl_secs, keepalive_until FROM sessions ORDER BY sort_order ASC, created_at DESC")
+        .prepare("SELECT id, name, agent_type, command, working_dir, created_at, claude_session_id, sort_order, folder_id, env_vars, context_tokens, cache_expires_at, cache_ttl_secs, keepalive_until, ai_title FROM sessions ORDER BY sort_order ASC, created_at DESC")
         .map_err(|e| e.to_string())?;
 
     let sessions = stmt
@@ -1209,6 +1235,7 @@ fn load_sessions() -> Result<Vec<SessionData>, String> {
                 cache_expires_at: row.get(11).ok().flatten(),
                 cache_ttl_secs: row.get(12).ok().flatten(),
                 keepalive_until: row.get(13).ok().flatten(),
+                ai_title: row.get(14).ok().flatten(),
             })
         })
         .map_err(|e| e.to_string())?
@@ -2706,6 +2733,7 @@ fn spawn_json_process(
                         // Save to DB on result messages (conversation turn complete)
                         if is_result {
                             save_session_messages_to_db(&session_id_stdout);
+                            maybe_generate_session_title(app_stdout.clone(), &session_id_stdout);
                         }
 
                         // Emit pre-parsed message to Tauri frontend
@@ -3141,11 +3169,19 @@ fn get_window_state_path() -> PathBuf {
     data_dir.join("window_state.json")
 }
 
-/// Save window state to config file
+/// Save window state to config file. The pop-out list is owned by the Rust
+/// side (see open_session_window and friends); the frontend's copy is
+/// whatever it loaded at launch, so it is not allowed to overwrite it.
 #[tauri::command]
 fn save_window_state(state: WindowState) -> Result<(), String> {
+    let mut state = state;
+    state.popouts = read_window_state().popouts;
+    write_window_state_raw(&state)
+}
+
+fn write_window_state_raw(state: &WindowState) -> Result<(), String> {
     let path = get_window_state_path();
-    let json = serde_json::to_string_pretty(&state)
+    let json = serde_json::to_string_pretty(state)
         .map_err(|e| format!("Failed to serialize window state: {}", e))?;
     std::fs::write(&path, json)
         .map_err(|e| format!("Failed to write window state: {}", e))?;
@@ -3164,6 +3200,406 @@ fn load_window_state() -> Result<WindowState, String> {
     let state: WindowState = serde_json::from_str(&json)
         .map_err(|e| format!("Failed to parse window state: {}", e))?;
     Ok(state)
+}
+
+// ---- AI session subtitles -----------------------------------------------------
+//
+// After a turn ends, a short Haiku call summarizes what the session is working
+// on ("Auctria Stripe setup") for the sidebar. It goes through `claude -p` on
+// the user's own login, like every other Claude call the app makes, so it needs
+// no API key. Claude Code writes such titles itself for interactive sessions,
+// but a session started with `-n <name>` gets a custom-title record instead,
+// so the app has to produce its own.
+
+const AI_TITLE_MODEL: &str = "claude-haiku-4-5";
+const AI_TITLE_MIN_INTERVAL_SECS: u64 = 180;
+const AI_TITLE_MIN_NEW_TURNS: usize = 3;
+
+struct AiTitleState {
+    in_flight: bool,
+    last_at: Option<std::time::Instant>,
+    user_turns_at_last: usize,
+}
+
+static AI_TITLE_STATE: Lazy<Mutex<HashMap<String, AiTitleState>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Text of a message the user would read: what they typed, or the assistant's
+/// prose (never tool calls or tool results).
+fn readable_message_text(msg: &serde_json::Value) -> Option<(&'static str, String)> {
+    let kind = msg.get("type").and_then(|t| t.as_str())?;
+    // Subagent output is a level below the conversation
+    if msg.get("parent_tool_use_id").map_or(false, |v| !v.is_null()) {
+        return None;
+    }
+    let content = msg.get("result").or_else(|| msg.get("message").and_then(|m| m.get("content")));
+    match kind {
+        "user" => {
+            let text = content.and_then(|c| c.as_str())?.trim().to_string();
+            if text.is_empty() { None } else { Some(("user", text)) }
+        }
+        "assistant" => {
+            let blocks = content.and_then(|c| c.as_array())?;
+            let text: String = blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
+            if text.is_empty() { None } else { Some(("assistant", text)) }
+        }
+        _ => None,
+    }
+}
+
+/// The recent conversation, shaped for the title prompt: the last few
+/// exchanges, each trimmed, capped in total so the call stays cheap.
+fn build_title_excerpt(session_id: &str) -> (usize, String) {
+    let messages = SESSION_MESSAGES.lock();
+    let msgs = match messages.get(session_id) {
+        Some(m) => m,
+        None => return (0, String::new()),
+    };
+    let readable: Vec<(&'static str, String)> = msgs.iter().filter_map(readable_message_text).collect();
+    let user_turns = readable.iter().filter(|(k, _)| *k == "user").count();
+    let mut parts: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    for (kind, text) in readable.iter().rev() {
+        let mut t: String = text.chars().take(500).collect();
+        if t.len() < text.len() { t.push_str(" …"); }
+        total += t.len();
+        parts.push(format!("{}: {}", kind, t));
+        if parts.len() >= 12 || total > 5000 { break; }
+    }
+    parts.reverse();
+    (user_turns, parts.join("\n\n"))
+}
+
+/// Decide whether this session is due for a new subtitle and, if so, produce
+/// one on a worker thread. Called from the stream reader on every turn end.
+fn maybe_generate_session_title(app: AppHandle, session_id: &str) {
+    if !load_app_settings().map(|s| s.ai_titles_enabled).unwrap_or(true) {
+        return;
+    }
+    let (user_turns, excerpt) = build_title_excerpt(session_id);
+    if user_turns == 0 || excerpt.len() < 40 {
+        return;
+    }
+    let has_title = load_sessions()
+        .ok()
+        .and_then(|list| list.into_iter().find(|s| s.id == session_id))
+        .map_or(false, |s| s.ai_title.as_deref().map_or(false, |t| !t.is_empty()));
+    {
+        let mut states = AI_TITLE_STATE.lock();
+        let state = states.entry(session_id.to_string()).or_insert(AiTitleState {
+            in_flight: false,
+            last_at: None,
+            user_turns_at_last: 0,
+        });
+        if state.in_flight {
+            return;
+        }
+        if has_title {
+            // Only revisit once the conversation has moved on and some time passed
+            let enough_turns = user_turns >= state.user_turns_at_last + AI_TITLE_MIN_NEW_TURNS;
+            let enough_time = state.last_at.map_or(true, |t| t.elapsed().as_secs() >= AI_TITLE_MIN_INTERVAL_SECS);
+            if !(enough_turns && enough_time) && state.last_at.is_some() {
+                return;
+            }
+            if state.last_at.is_none() {
+                // Title from a previous launch: treat it as current and wait for movement
+                state.last_at = Some(std::time::Instant::now());
+                state.user_turns_at_last = user_turns;
+                return;
+            }
+        }
+        state.in_flight = true;
+        state.last_at = Some(std::time::Instant::now());
+        state.user_turns_at_last = user_turns;
+    }
+
+    let session_id = session_id.to_string();
+    std::thread::spawn(move || {
+        let result = run_title_generation(&excerpt);
+        {
+            let mut states = AI_TITLE_STATE.lock();
+            if let Some(state) = states.get_mut(&session_id) {
+                state.in_flight = false;
+            }
+        }
+        match result {
+            Ok(title) => {
+                let saved = {
+                    let conn = DB_CONNECTION.lock();
+                    conn.execute("UPDATE sessions SET ai_title = ?1 WHERE id = ?2", rusqlite::params![title, session_id])
+                };
+                if let Err(e) = saved {
+                    eprintln!("[ai-title] failed to save title for {}: {}", session_id, e);
+                    return;
+                }
+                let _ = app.emit("session-title-updated", serde_json::json!({
+                    "session_id": session_id,
+                    "title": title
+                }));
+                if let Some(session) = load_sessions().ok().and_then(|l| l.into_iter().find(|s| s.id == session_id)) {
+                    broadcast_session_updated(&session);
+                }
+            }
+            Err(e) => eprintln!("[ai-title] {}: {}", session_id, e),
+        }
+    });
+}
+
+/// Drop OSC (`ESC ] ... BEL` / `ESC ] ... ESC \\`) and CSI (`ESC [ ... m`)
+/// sequences, keeping the printable text between them.
+fn strip_terminal_escapes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some(']') => {
+                // OSC: runs to BEL or ESC \
+                let mut prev = '\0';
+                for n in chars.by_ref() {
+                    if n == '\x07' || (prev == '\x1b' && n == '\\') {
+                        break;
+                    }
+                    prev = n;
+                }
+            }
+            Some('[') => {
+                // CSI: parameter bytes then one final byte in 0x40..=0x7e
+                for n in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// One `claude -p` call on Haiku with the excerpt on stdin. Returns the title.
+fn run_title_generation(excerpt: &str) -> Result<String, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let home_dir = dirs::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "/Users".to_string());
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let existing_path = std::env::var("PATH").unwrap_or_default();
+    let enhanced_path = format!(
+        "{}/.local/bin:{}/.nvm/versions/node/v24.10.0/bin:{}/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:{}",
+        home_dir, home_dir, home_dir, existing_path
+    );
+    // No session file, no tools, no hooks worth keeping: this is a one-shot
+    // classification call, not a session.
+    let cmd_str = format!(
+        "claude -p --no-session-persistence --model {} --output-format text --tools \"\"",
+        AI_TITLE_MODEL
+    );
+    let prompt = format!(
+        "Below is an excerpt from a conversation between a user and a coding agent. \
+         Reply with a title of at most six words that says what the conversation is working on, \
+         the way a terminal tab title would. Prefer the specific subject over generic words. \
+         No quotes, no trailing period, nothing but the title.\n\n---\n{}\n---",
+        excerpt
+    );
+
+    let mut cmd = Command::new(&shell);
+    cmd.args(["-i", "-l", "-c", &cmd_str])
+        .current_dir(&home_dir)
+        .env("HOME", &home_dir)
+        .env("PATH", &enhanced_path)
+        .env("SHELL", &shell)
+        .env("LANG", "en_US.UTF-8")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if let Some(dir) = resolve_claude_config_dir(&std::collections::HashMap::new()) {
+        cmd.env("CLAUDE_CONFIG_DIR", dir);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {}", e))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(prompt.as_bytes());
+    }
+    // A hung CLI must not leak a process; give it 90 seconds
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    return Err("timed out".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(e) => return Err(format!("wait failed: {}", e)),
+        }
+    }
+    let output = child.wait_with_output().map_err(|e| format!("read failed: {}", e))?;
+    if !output.status.success() {
+        return Err(format!("claude exited with {}", output.status));
+    }
+    // The login shell's rc files can print terminal escape sequences (iTerm
+    // shell integration does) ahead of the CLI's own output
+    let raw = strip_terminal_escapes(&String::from_utf8_lossy(&output.stdout));
+    // First non-empty line, stripped of quotes and trailing punctuation
+    let title = raw
+        .lines()
+        .map(|l| l.trim().trim_matches(|c| c == '"' || c == '\'' || c == '`').trim_end_matches('.').trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string();
+    if title.is_empty() || title.chars().count() > 80 || title.contains('\n') {
+        return Err(format!("unusable title: {:?}", raw.trim()));
+    }
+    Ok(title)
+}
+
+// ---- Pop-out session windows ------------------------------------------------
+//
+// A session can be shown in its own window (label `session-<id>`) so it can
+// live on another monitor. The window loads the same frontend, which reads
+// its label and renders only that session; the backend is shared, so PTYs and
+// Claude processes are unaffected.
+
+const POPOUT_LABEL_PREFIX: &str = "session-";
+
+/// Set while the app is shutting down, so pop-out windows being torn down
+/// aren't mistaken for the user closing them (which forgets their state).
+static EXITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn popout_label(session_id: &str) -> String {
+    format!("{}{}", POPOUT_LABEL_PREFIX, session_id)
+}
+
+fn read_window_state() -> WindowState {
+    load_window_state().unwrap_or_default()
+}
+
+fn write_window_state(state: &WindowState) -> Result<(), String> {
+    write_window_state_raw(state)
+}
+
+/// Open (or focus) the pop-out window for a session.
+#[tauri::command]
+fn open_session_window(app: AppHandle, session_id: String, title: String) -> Result<(), String> {
+    let label = popout_label(&session_id);
+    if let Some(existing) = app.get_webview_window(&label) {
+        let _ = existing.unminimize();
+        let _ = existing.set_focus();
+        return Ok(());
+    }
+    let saved = read_window_state()
+        .popouts
+        .into_iter()
+        .find(|p| p.session_id == session_id);
+
+    let mut builder = tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App("index.html".into()))
+        .title(&title)
+        .min_inner_size(480.0, 360.0);
+    match &saved {
+        Some(p) if p.width.is_some() && p.height.is_some() => {
+            builder = builder.inner_size(p.width.unwrap() as f64, p.height.unwrap() as f64);
+        }
+        _ => {
+            builder = builder.inner_size(1000.0, 720.0);
+        }
+    }
+    if let Some(p) = &saved {
+        if let (Some(x), Some(y)) = (p.x, p.y) {
+            builder = builder.position(x as f64, y as f64);
+        }
+    } else if let Some(main) = app.get_webview_window("main") {
+        // Cascade off the main window so the new one is obviously new
+        if let Ok(pos) = main.outer_position() {
+            let scale = main.scale_factor().unwrap_or(1.0);
+            builder = builder.position(pos.x as f64 / scale + 60.0, pos.y as f64 / scale + 60.0);
+        }
+    }
+    let window = builder.build().map_err(|e| format!("Failed to open session window: {}", e))?;
+    let _ = window.set_focus();
+
+    // Remember it so the layout comes back next launch
+    let mut state = read_window_state();
+    if !state.popouts.iter().any(|p| p.session_id == session_id) {
+        state.popouts.push(PopoutState { session_id, ..Default::default() });
+        write_window_state(&state)?;
+    }
+    Ok(())
+}
+
+/// A pop-out window moved or resized: remember where it is.
+#[tauri::command]
+fn save_popout_state(session_id: String, x: i32, y: i32, width: u32, height: u32) -> Result<(), String> {
+    let mut state = read_window_state();
+    match state.popouts.iter_mut().find(|p| p.session_id == session_id) {
+        Some(p) => {
+            p.x = Some(x);
+            p.y = Some(y);
+            p.width = Some(width);
+            p.height = Some(height);
+        }
+        None => state.popouts.push(PopoutState {
+            session_id,
+            x: Some(x),
+            y: Some(y),
+            width: Some(width),
+            height: Some(height),
+        }),
+    }
+    write_window_state(&state)
+}
+
+/// Pop-out windows to reopen on launch.
+#[tauri::command]
+fn list_popouts() -> Vec<PopoutState> {
+    read_window_state().popouts
+}
+
+/// Drop a session's pop-out from the saved layout (the user closed it).
+fn forget_popout(session_id: &str) {
+    let mut state = read_window_state();
+    let before = state.popouts.len();
+    state.popouts.retain(|p| p.session_id != session_id);
+    if state.popouts.len() != before {
+        let _ = write_window_state(&state);
+    }
+}
+
+/// Close every pop-out window without forgetting its saved geometry.
+fn close_all_popouts(app: &AppHandle) {
+    EXITING.store(true, std::sync::atomic::Ordering::Relaxed);
+    for (label, window) in app.webview_windows() {
+        if label.starts_with(POPOUT_LABEL_PREFIX) {
+            let _ = window.close();
+        }
+    }
+}
+
+/// Route a menu action to the window the user is looking at. Pop-outs load
+/// the same frontend, so a broadcast would make every window act on it.
+fn emit_menu(app: &AppHandle, id: &str) {
+    let focused = app
+        .webview_windows()
+        .into_iter()
+        .find(|(_, w)| w.is_focused().unwrap_or(false))
+        .map(|(label, _)| label);
+    let target = focused.unwrap_or_else(|| "main".to_string());
+    // Broadcast with the target named: JS listeners see every emit regardless
+    // of target, and filter on `window` themselves
+    let _ = app.emit("menu-event", serde_json::json!({ "id": id, "window": target }));
 }
 
 /// Save app settings to config file
@@ -3923,6 +4359,7 @@ async fn api_list_sessions(_headers: axum::http::HeaderMap) -> impl IntoResponse
                     "claude_session_id": s.claude_session_id,
                     "sort_order": s.sort_order,
                     "folder_id": s.folder_id,
+                    "ai_title": s.ai_title,
                     "running": is_running
                 })
             }).collect();
@@ -3950,6 +4387,7 @@ async fn api_list_sessions(_headers: axum::http::HeaderMap) -> impl IntoResponse
                     "claude_session_id": s.claude_session_id,
                     "sort_order": s.sort_order,
                     "folder_id": s.folder_id,
+                    "ai_title": s.ai_title,
                     "running": false
                 })
             }).collect();
@@ -4028,6 +4466,7 @@ async fn api_create_session(
         cache_expires_at: None,
         cache_ttl_secs: None,
         keepalive_until: None,
+        ai_title: None,
     };
 
     // Save to database
@@ -4290,6 +4729,7 @@ async fn api_webhook_teams(
                 cache_expires_at: None,
                 cache_ttl_secs: None,
                 keepalive_until: None,
+                ai_title: None,
             };
             if let Err(e) = save_session(session.clone()) {
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response();
@@ -4581,6 +5021,7 @@ fn fire_job(job: &ScheduledJob) {
                 cache_expires_at: None,
                 cache_ttl_secs: None,
                 keepalive_until: None,
+                ai_title: None,
             };
             if save_session(session.clone()).is_err() { return; }
             let _ = app.emit("remote-session-created", serde_json::json!({
@@ -4728,6 +5169,12 @@ async fn api_mcp_execute(
         .and_then(|v| v.as_u64())
         .unwrap_or(5000);
 
+    // Which window runs it: the main window unless a pop-out is named
+    let target_window = body.get("window")
+        .and_then(|v| v.as_str())
+        .unwrap_or("main")
+        .to_string();
+
     // Generate unique request ID
     let request_id = uuid::Uuid::new_v4().to_string();
 
@@ -4740,9 +5187,19 @@ async fn api_mcp_execute(
     // Emit event to frontend to execute the JS
     let app_opt = APP_HANDLE.lock().clone();
     if let Some(app) = app_opt {
+        if app.get_webview_window(&target_window).is_none() {
+            let labels: Vec<String> = app.webview_windows().keys().cloned().collect();
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                "error": "window_not_found",
+                "message": format!("No window '{}'; open windows: {}", target_window, labels.join(", "))
+            }))).into_response();
+        }
+        // JS listeners default to "any target", so a targeted emit still
+        // reaches every window; the label in the payload is what they filter on
         let _ = app.emit("mcp-execute", serde_json::json!({
             "request_id": request_id,
-            "code": code
+            "code": code,
+            "window": target_window
         }));
     } else {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
@@ -5179,6 +5636,7 @@ async fn handle_ws_mobile(socket: WebSocket) {
                                     "agent_type": s.agent_type,
                                     "working_dir": s.working_dir,
                                     "folder_id": s.folder_id,
+                                    "ai_title": s.ai_title,
                                     "running": running,
                                 })
                             }).collect();
@@ -5641,51 +6099,51 @@ fn setup_app(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         let id = event.id().as_ref();
         match id {
             "new_session" => {
-                let _ = app.emit("menu-event", "new_session");
+                let _ = emit_menu(app, "new_session");
             }
             "close_session" => {
-                let _ = app.emit("menu-event", "close_session");
+                let _ = emit_menu(app, "close_session");
             }
             "settings" => {
-                let _ = app.emit("menu-event", "settings");
+                let _ = emit_menu(app, "settings");
             }
             "toggle_sidebar" => {
-                let _ = app.emit("menu-event", "toggle_sidebar");
+                let _ = emit_menu(app, "toggle_sidebar");
             }
             "zoom_in" => {
-                let _ = app.emit("menu-event", "zoom_in");
+                let _ = emit_menu(app, "zoom_in");
             }
             "zoom_out" => {
-                let _ = app.emit("menu-event", "zoom_out");
+                let _ = emit_menu(app, "zoom_out");
             }
             "reset_zoom" => {
-                let _ = app.emit("menu-event", "reset_zoom");
+                let _ = emit_menu(app, "reset_zoom");
             }
             "rename_session" => {
-                let _ = app.emit("menu-event", "rename_session");
+                let _ = emit_menu(app, "rename_session");
             }
             "duplicate_session" => {
-                let _ = app.emit("menu-event", "duplicate_session");
+                let _ = emit_menu(app, "duplicate_session");
             }
             "reset_session_id" => {
-                let _ = app.emit("menu-event", "reset_session_id");
+                let _ = emit_menu(app, "reset_session_id");
             }
             "browse_claude_sessions" => {
-                let _ = app.emit("menu-event", "browse_claude_sessions");
+                let _ = emit_menu(app, "browse_claude_sessions");
             }
             "next_session" => {
-                let _ = app.emit("menu-event", "next_session");
+                let _ = emit_menu(app, "next_session");
             }
             "prev_session" => {
-                let _ = app.emit("menu-event", "prev_session");
+                let _ = emit_menu(app, "prev_session");
             }
             "about" => {
-                let _ = app.emit("menu-event", "about");
+                let _ = emit_menu(app, "about");
             }
             _ => {
                 // Handle recently closed items (recent_0, recent_1, etc.)
                 if id.starts_with("recent_") {
-                    let _ = app.emit("menu-event", id);
+                    let _ = emit_menu(app, id);
                 }
             }
         }
@@ -5833,11 +6291,32 @@ pub fn run() {
             import_orphan_jsonls,
             propose_session_jsonl_reconciliation,
             apply_session_jsonl_reconciliation,
-            fetch_claude_usage_limits
+            fetch_claude_usage_limits,
+            open_session_window,
+            save_popout_state,
+            list_popouts
         ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                let label = window.label().to_string();
+                if label == "main" {
+                    // The pop-outs belong to the main window; without this the
+                    // app would linger with only a pop-out open.
+                    close_all_popouts(window.app_handle());
+                } else if let Some(session_id) = label.strip_prefix(POPOUT_LABEL_PREFIX) {
+                    if !EXITING.load(std::sync::atomic::Ordering::Relaxed) {
+                        forget_popout(session_id);
+                        let _ = window.app_handle().emit("popout-closed", session_id);
+                    }
+                }
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                EXITING.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             if let tauri::RunEvent::Exit = event {
                 // Kill all JSON processes on app exit
                 let processes = JSON_PROCESSES.lock();

@@ -90,16 +90,66 @@ curl -s http://localhost:3847/api/auth/check
 ### MCP Tools
 
 - `take_screenshot` - Capture the current app state (title, URL, body text)
-- `execute_js` - Run JavaScript in the webview
+- `execute_js` - Run JavaScript in the webview. The code is evaluated as an
+  expression, so wrap multi-statement code in an IIFE: `(() => { ...; return x; })()`
 - `click_element`, `type_text` - Interact with UI elements
 - `list_elements` - List all interactive elements with selectors
 - `get_ui_state` - Get detailed UI state including buttons, inputs, links
+- `select_window` - Point the tools above at a window: `main` (default) or a
+  pop-out session window's `session-<session id>`
+
+Without the bridge, the same thing over HTTP (the local token lives in
+`~/Library/Application Support/agent-hub-dev/local-token`):
+```bash
+curl -s http://localhost:3857/api/mcp/execute -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"window":"session-<id>","code":"document.title"}'
+```
+A request naming a window that isn't open gets a 404 listing the open labels.
 
 ### Testing Dev App via MCP
 
 1. Make sure dev app is running: `npm run tauri dev`
 2. Verify it's on port 3857: `lsof -i :3857`
 3. Use MCP tools - they will interact with the dev app
+
+## Pop-out Session Windows
+
+A chat session can be opened in its own window (footer `⧉` button, or
+"Open in New Window" in the session's context menu) so it can sit on another
+monitor. Pop-outs are Tauri windows labelled `session-<session id>` that load
+the same frontend; `src/main.ts` reads the window label at startup and, in a
+pop-out, hides the sidebar and shows just that session.
+
+- The Rust side is shared, and process events are broadcast to every window,
+  so a pop-out only renders. The main window stays the owner of one-time side
+  effects: notifications, persisting lifecycle notices, MCP and pairing.
+- A message typed in one window is echoed to the others via the
+  `hub-local-message` event and persisted where it was typed.
+- Tauri JS listeners receive *targeted* emits too, so events meant for one
+  window (`menu-event`, `mcp-execute`) carry a `window` label in the payload
+  and the frontend filters on it.
+- Pop-out geometry is stored under `popouts` in `window_state.json` (owned by
+  Rust; the main window's save never overwrites it) and reopened on launch.
+  Closing a pop-out forgets it; quitting keeps it.
+
+## Session Subtitles (Haiku)
+
+After each completed turn of a chat session the backend may write a one-line
+subtitle ("Auctria Stripe setup") into `sessions.ai_title`, shown under the
+name in the desktop sidebar, in a pop-out's window title, and on the mobile
+session card. See `maybe_generate_session_title` in `src-tauri/src/lib.rs`.
+
+- It runs `claude -p --model claude-haiku-4-5 --no-session-persistence
+  --tools ""` with the last few readable exchanges on stdin, so it uses the
+  same login as every other session and leaves no transcript file. Do not add
+  `--bare`: that mode ignores keychain/OAuth auth and fails with "Not logged in".
+- Throttled per session: first title after the first turn, then only after 3
+  more user turns and at least 3 minutes. Off via the "Summarize sessions with
+  Haiku" checkbox in Settings (`ai_titles_enabled`).
+- Claude Code writes its own `ai-title` records only for interactive
+  sessions; a session started with `-n <name>` gets a `custom-title` record
+  instead, which is why the app generates its own.
 
 ## Remote Access & Teams Webhook
 

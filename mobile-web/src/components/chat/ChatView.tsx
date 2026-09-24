@@ -14,6 +14,8 @@ export function ChatView({ sessionId }: ChatViewProps) {
   const lastSearchQuery = useGlobalStore((s) => s.lastSearchQuery);
   const triggerBackToSearch = useGlobalStore((s) => s.triggerBackToSearch);
   const { messages } = useSessionStore();
+  const activityExpanded = useSessionStore((s) => s.activityExpanded.get(sessionId) ?? false);
+  const setActivityExpanded = useSessionStore((s) => s.setActivityExpanded);
 
   const session = sessions.get(sessionId);
   const status = sessionStatus.get(sessionId);
@@ -57,6 +59,15 @@ export function ChatView({ sessionId }: ChatViewProps) {
         {status?.isProcessing && (
           <div className="w-2.5 h-2.5 rounded-full bg-blue-500 animate-pulse" />
         )}
+        <button
+          type="button"
+          onClick={() => setActivityExpanded(sessionId, !activityExpanded)}
+          title={activityExpanded ? 'Roll up tool calls' : 'Show all tool calls and subagent output'}
+          aria-pressed={activityExpanded}
+          className={`text-sm px-2 py-1 rounded border ${activityExpanded ? 'border-[#0e9fd8] text-[#0e9fd8]' : 'border-[#3c3c3c] text-gray-400'}`}
+        >
+          {activityExpanded ? '⊟' : '⊞'}
+        </button>
       </div>
 
       {/* Back-to-search pill: visible when the user landed here via a
@@ -75,7 +86,7 @@ export function ChatView({ sessionId }: ChatViewProps) {
 
       {/* Messages */}
       <div className="flex-1 overflow-hidden">
-        <MessageList sessionId={sessionId} messages={sessionMessages} />
+        <MessageList key={sessionId} sessionId={sessionId} messages={sessionMessages} />
       </div>
 
       {/* Input */}

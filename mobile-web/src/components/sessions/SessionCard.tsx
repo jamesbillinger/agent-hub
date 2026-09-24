@@ -32,7 +32,7 @@ export function SessionCard({ session }: SessionCardProps) {
       <div className="flex-1 min-w-0">
         <div className="text-white font-medium truncate">{session.name}</div>
         <div className="text-sm text-gray-500 truncate">
-          {session.agent_type} • {session.working_dir.replace(/^~\//, '')}
+          {session.ai_title || `${session.agent_type} • ${session.working_dir.replace(/^~\//, '')}`}
         </div>
       </div>
 

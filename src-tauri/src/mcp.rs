@@ -81,12 +81,15 @@ impl JsonRpcResponse {
 /// MCP Server for controlling the Agent Hub app
 pub struct McpServer {
     app_handle: Arc<Mutex<Option<AppHandle>>>,
+    /// Which window the tools act on: "main" or a pop-out's `session-<id>`.
+    target_window: Arc<Mutex<String>>,
 }
 
 impl McpServer {
     pub fn new() -> Self {
         Self {
             app_handle: Arc::new(Mutex::new(None)),
+            target_window: Arc::new(Mutex::new("main".to_string())),
         }
     }
 
@@ -98,7 +101,41 @@ impl McpServer {
     async fn get_window(&self) -> Result<WebviewWindow, String> {
         let handle = self.app_handle.lock().await;
         let handle = handle.as_ref().ok_or("App handle not initialized")?;
-        handle.get_webview_window("main").ok_or("Main window not found".to_string())
+        let label = self.target_window.lock().await.clone();
+        handle
+            .get_webview_window(&label)
+            .ok_or(format!("Window '{}' not found (use list_windows / select_window)", label))
+    }
+
+    async fn tool_list_windows(&self) -> Result<String, String> {
+        let handle = self.app_handle.lock().await;
+        let handle = handle.as_ref().ok_or("App handle not initialized")?;
+        let selected = self.target_window.lock().await.clone();
+        let windows: Vec<Value> = handle
+            .webview_windows()
+            .into_iter()
+            .map(|(label, w)| {
+                json!({
+                    "label": label,
+                    "title": w.title().unwrap_or_default(),
+                    "focused": w.is_focused().unwrap_or(false),
+                    "selected": label == selected,
+                })
+            })
+            .collect();
+        Ok(json!({ "windows": windows }).to_string())
+    }
+
+    async fn tool_select_window(&self, label: &str) -> Result<String, String> {
+        {
+            let handle = self.app_handle.lock().await;
+            let handle = handle.as_ref().ok_or("App handle not initialized")?;
+            if handle.get_webview_window(label).is_none() {
+                return Err(format!("Window '{}' not found", label));
+            }
+        }
+        *self.target_window.lock().await = label.to_string();
+        Ok(json!({ "success": true, "selected": label }).to_string())
     }
 
     /// Execute JS and get the result back via callback
@@ -237,6 +274,29 @@ impl McpServer {
                 }
             },
             {
+                "name": "list_windows",
+                "description": "List the app's windows (main plus any pop-out session windows) and which one the other tools act on",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "name": "select_window",
+                "description": "Point the other tools at a window by label: 'main' or a pop-out's 'session-<id>'",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "label": {
+                            "type": "string",
+                            "description": "Window label from list_windows"
+                        }
+                    },
+                    "required": ["label"]
+                }
+            },
+            {
                 "name": "get_text",
                 "description": "Get text content from an element",
                 "inputSchema": {
@@ -357,6 +417,13 @@ impl McpServer {
                 self.tool_get_text(selector).await
             }
             "list_elements" => self.tool_list_elements().await,
+            "list_windows" => self.tool_list_windows().await,
+            "select_window" => {
+                let label = args.get("label")
+                    .and_then(|s| s.as_str())
+                    .ok_or("Missing 'label' parameter")?;
+                self.tool_select_window(label).await
+            }
             _ => Err(format!("Unknown tool: {}", name)),
         }
     }

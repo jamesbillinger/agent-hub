@@ -4507,3 +4507,46 @@ details.subagent-run.c5 { --run-color: #f7768e; }
   color: var(--accent-blue);
   font-variant-numeric: tabular-nums;
 }
+
+/* ---- Pop-out session windows ------------------------------------------- */
+
+/* A pop-out shows one session: no sidebar, no grid, no way to pop out again */
+body.popout #sidebar,
+body.popout #sidebar-resize-handle,
+body.popout #mobile-header,
+body.popout #grid-toggle-btn,
+body.popout .chat-popout-btn {
+  display: none !important;
+}
+
+.chat-popout-btn {
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  margin-left: 8px;
+}
+.chat-popout-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--border-color);
+}
+
+.session-item .popout-badge {
+  color: var(--text-secondary);
+  font-size: 11px;
+  margin-left: 2px;
+}
+
+/* Haiku-written session subtitle under the name */
+.session-item .subtitle {
+  font-size: 11px;
+  color: var(--text-secondary);
+  opacity: 0.75;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 1px;
+}

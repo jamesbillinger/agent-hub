@@ -30,10 +30,15 @@ export type ContentBlock = TextContent | ToolUseContent | ToolResultContent | Im
 
 export interface Message {
   type: 'system' | 'user' | 'assistant' | 'result';
-  subtype?: 'init' | 'success' | 'error';
+  subtype?: 'init' | 'success' | 'error' | 'resumed' | 'stopped' | 'status' | 'compact_boundary' | 'local_command';
   session_id?: string;
   uuid?: string;
   parentUuid?: string;
+  // Set on subagent output: the Agent tool_use that spawned the run.
+  parent_tool_use_id?: string | null;
+  // Millis when the desktop received it (live), or ISO timestamp (raw JSONL history).
+  received_at?: number;
+  timestamp?: string;
   message?: {
     id?: string;
     role?: string;

@@ -110,6 +110,17 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {}, required: [] }
   },
   {
+    name: 'select_window',
+    description: "Point the UI tools at a window: 'main' (default) or a pop-out session window's 'session-<session id>'",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        label: { type: 'string', description: "Window label: 'main' or 'session-<id>'" }
+      },
+      required: ['label']
+    }
+  },
+  {
     name: 'search_messages',
     description: 'Full-text search across the user\'s Claude Code conversation history. Returns ranked hits with snippets, session names, timestamps, and pointers (file_path + file_offset) to seek into the source JSONL.',
     inputSchema: {
@@ -171,10 +182,14 @@ function httpJson(method, path) {
   });
 }
 
+// Which app window the tools act on: 'main', or a pop-out session window's
+// 'session-<id>'. Changed with the select_window tool.
+let targetWindow = 'main';
+
 // Execute JS via HTTP API
 function executeJs(code, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
-    const data = JSON.stringify({ code, timeout_ms: timeoutMs });
+    const data = JSON.stringify({ code, timeout_ms: timeoutMs, window: targetWindow });
 
     const req = http.request({
       hostname: 'localhost',
@@ -350,6 +365,12 @@ const toolHandlers = {
 
   async rebuild_search_index() {
     return httpJson('POST', '/api/search/rebuild');
+  },
+
+  async select_window({ label }) {
+    if (!label) throw new Error("Missing 'label'");
+    targetWindow = label;
+    return { success: true, selected: label };
   },
 
   async list_elements() {

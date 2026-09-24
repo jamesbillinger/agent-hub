@@ -8,6 +8,7 @@ export interface Session {
   claude_session_id?: string;
   sort_order: number;
   folder_id?: string | null;
+  ai_title?: string | null;
 }
 
 export interface SessionStatus {

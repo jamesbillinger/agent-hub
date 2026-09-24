@@ -31,6 +31,13 @@ interface SessionState {
 
   setScrollPosition: (sessionId: string, isAtBottom: boolean) => void;
   getScrollPosition: (sessionId: string) => ScrollPosition;
+
+  // Activity rollup: "show all activity" per session, and explicit open/closed
+  // overrides per group (keyed by the group's first message).
+  activityExpanded: Map<string, boolean>;
+  setActivityExpanded: (sessionId: string, expanded: boolean) => void;
+  groupOpen: Map<string, Map<string, boolean>>;
+  setGroupOpen: (sessionId: string, groupKey: string, open: boolean) => void;
 }
 
 // Generate a key for deduplication
@@ -60,6 +67,25 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   pendingImages: new Map(),
   scrollPosition: new Map(),
   seenMessageKeys: new Map(),
+  activityExpanded: new Map(),
+  groupOpen: new Map(),
+
+  setActivityExpanded: (sessionId, expanded) => {
+    const next = new Map(get().activityExpanded);
+    next.set(sessionId, expanded);
+    // Turning it off folds everything back except the live tail
+    const groupOpen = new Map(get().groupOpen);
+    groupOpen.delete(sessionId);
+    set({ activityExpanded: next, groupOpen });
+  },
+
+  setGroupOpen: (sessionId, groupKey, open) => {
+    const groupOpen = new Map(get().groupOpen);
+    const perSession = new Map(groupOpen.get(sessionId) ?? []);
+    perSession.set(groupKey, open);
+    groupOpen.set(sessionId, perSession);
+    set({ groupOpen });
+  },
 
   setMessages: (sessionId, messages) => {
     const messagesMap = new Map(get().messages);

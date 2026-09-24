@@ -134,3 +134,62 @@ body {
   padding: 0 2px;
   border-radius: 2px;
 }
+
+/* Activity rollup: folded runs of tool calls / subagent output */
+.ah-activity {
+  margin: 4px 12px;
+  border: 1px solid #2f2f2f;
+  border-radius: 8px;
+  background: #202020;
+  overflow: hidden;
+}
+.ah-activity-header {
+  width: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  padding: 8px 10px;
+  text-align: left;
+  font-size: 12px;
+  color: #9a9a9a;
+  background: transparent;
+  border: 0;
+}
+.ah-activity.open .ah-activity-header {
+  border-bottom: 1px solid #2f2f2f;
+}
+.ah-activity-caret {
+  color: #6b6b6b;
+  width: 10px;
+}
+.ah-activity-summary {
+  color: #bdbdbd;
+}
+.ah-activity-errors {
+  color: #f0a0a0;
+}
+.ah-activity-tools {
+  color: #6b6b6b;
+  margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+.ah-activity-body {
+  padding: 4px 0;
+}
+.ah-activity-body .px-4 {
+  padding-left: 8px;
+  padding-right: 8px;
+}
+.ah-subagent-run {
+  margin: 4px 8px;
+  border-left: 2px solid #3a5a6a;
+  padding-left: 6px;
+}
+.ah-subagent-run > summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: #8ab;
+  padding: 4px 0;
+}

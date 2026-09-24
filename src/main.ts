@@ -1,6 +1,37 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { listen, emit } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalPosition, LogicalSize, type Theme } from "@tauri-apps/api/window";
+
+// ---- Pop-out windows -------------------------------------------------------
+//
+// A session can be shown in its own window (label `session-<id>`) so it can
+// live on another monitor. Pop-outs load this same frontend and render one
+// session with the sidebar hidden. The backend is shared, and Rust broadcasts
+// process events to every window, so a pop-out just renders what it receives.
+// The main window stays the owner of everything with side effects that must
+// happen once - notifications, persisting lifecycle notices, MCP, pairing.
+const windowLabel = getCurrentWindow().label;
+const popoutSessionId: string | null = windowLabel.startsWith("session-") ? windowLabel.slice("session-".length) : null;
+const isPopout = popoutSessionId !== null;
+// Sessions the main window has open in pop-out windows (badge in the list)
+const poppedOutSessions = new Set<string>();
+
+/**
+ * Run `fn` on the next animation frame, or after a short timeout if no frame
+ * comes first. WebKit stops delivering frames to a window that is minimized
+ * or fully covered by another - with pop-outs that is a normal state, and a
+ * transcript that only renders on frames would sit frozen until uncovered.
+ */
+function nextFrame(fn: () => void): void {
+  let done = false;
+  const run = () => {
+    if (done) return;
+    done = true;
+    fn();
+  };
+  requestAnimationFrame(run);
+  window.setTimeout(run, 120);
+}
 import { getVersion } from "@tauri-apps/api/app";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { check } from "@tauri-apps/plugin-updater";
@@ -195,6 +226,7 @@ interface Session {
   outputByteCount?: number; // Track bytes for periodic texture atlas clearing
   folderId?: string;
   envVars?: string; // JSON string of env var key-value pairs
+  aiTitle?: string;   // Haiku-written one-liner of what the session is working on
   // Cache state, persisted so the list can show it without opening the session
   contextTokens?: number;   // context on the last top-level assistant turn
   cacheExpiresAt?: string;  // RFC3339; when the prompt cache goes cold
@@ -217,6 +249,7 @@ interface SessionData {
   cache_expires_at?: string | null;
   cache_ttl_secs?: number | null;
   keepalive_until?: string | null;
+  ai_title?: string | null;
 }
 
 interface Folder {
@@ -438,6 +471,7 @@ interface AppSettings {
   webhook_secret?: string | null;
   teams_reply_url?: string | null;
   show_active_sessions_group: boolean;
+  ai_titles_enabled?: boolean;
   grid_view?: boolean;
   default_model?: string | null;
   webhook_model?: string | null;
@@ -479,6 +513,7 @@ let appSettings: AppSettings = {
   read_aloud_enabled: false,
   renderer: "webgl",
   show_active_sessions_group: true,
+  ai_titles_enabled: true,
   default_model: "claude-opus-5-5[1m]",
   webhook_model: null,
   claude_config_dir: null,
@@ -942,6 +977,7 @@ let settingsBellNotificationsCheckbox: HTMLInputElement;
 let settingsBounceDockCheckbox: HTMLInputElement;
 let settingsReadAloudCheckbox: HTMLInputElement;
 let settingsActiveSessionsGroupCheckbox: HTMLInputElement;
+let settingsAiTitlesCheckbox: HTMLInputElement;
 let settingsRendererSelect: HTMLSelectElement;
 let settingsRemotePinInput: HTMLInputElement;
 let settingsWebhookSecretInput: HTMLInputElement;
@@ -987,13 +1023,18 @@ document.addEventListener("DOMContentLoaded", async () => {
   settingsBounceDockCheckbox = document.getElementById("settings-bounce-dock") as HTMLInputElement;
   settingsReadAloudCheckbox = document.getElementById("settings-read-aloud") as HTMLInputElement;
   settingsActiveSessionsGroupCheckbox = document.getElementById("settings-active-sessions-group") as HTMLInputElement;
+  settingsAiTitlesCheckbox = document.getElementById("settings-ai-titles") as HTMLInputElement;
   settingsRendererSelect = document.getElementById("settings-renderer") as HTMLSelectElement;
   settingsRemotePinInput = document.getElementById("settings-remote-pin") as HTMLInputElement;
   settingsWebhookSecretInput = document.getElementById("settings-webhook-secret") as HTMLInputElement;
   settingsTeamsReplyUrlInput = document.getElementById("settings-teams-reply-url") as HTMLInputElement;
 
-  // Load window state and app settings
-  await loadWindowState();
+  if (isPopout) document.body.classList.add("popout");
+
+  // Load window state and app settings. A pop-out has its own geometry,
+  // managed in enterPopoutMode(); applying the main window's here would
+  // stack it exactly on top.
+  if (!isPopout) await loadWindowState();
   await loadAppSettings();
 
   // Restore grid view if it was active last time (desktop only)
@@ -1218,7 +1259,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // Keepalive sweep. Cheap: it exits immediately unless a session is armed and
   // genuinely near expiry.
-  window.setInterval(() => { void sweepKeepalive(); }, 60_000);
+  if (!isPopout) window.setInterval(() => { void sweepKeepalive(); }, 60_000);
 
   // Event delegation for diff expand buttons and clickable paths (dynamically added)
   // Use chat-container since chat-messages elements are created dynamically per session
@@ -1325,8 +1366,59 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   // Listen for menu events from Rust
-  await listen<string>("menu-event", (event) => {
-    handleMenuEvent(event.payload);
+  // Rust names the window the menu action is for (the focused one)
+  await listen<{ id: string; window: string }>("menu-event", (event) => {
+    if (event.payload.window !== windowLabel) return;
+    handleMenuEvent(event.payload.id);
+  });
+
+  // A message typed in another window of this app: render it here too. It was
+  // persisted where it was born.
+  await listen<{ sessionId: string; message: ClaudeJsonMessage; from: string }>("hub-local-message", (event) => {
+    const { sessionId, message, from } = event.payload;
+    if (from === windowLabel) return;
+    if (!chatSessions.has(sessionId)) return;
+    addChatMessage(sessionId, message, false);
+    const cs = chatSessions.get(sessionId)!;
+    if (message.type === "user") {
+      cs.isProcessing = true;
+      cs.dirty = true;
+      updateSessionActivityIndicator(sessionId, true);
+      renderSessionList();
+    }
+  });
+
+  // Session renamed/edited in another window
+  await listen<{ id: string; name: string; from: string }>("hub-session-saved", async (event) => {
+    const { id, name, from } = event.payload;
+    if (from === windowLabel) return;
+    const session = sessions.get(id);
+    if (session && session.name !== name) {
+      session.name = name;
+      renderSessionList();
+    }
+    if (isPopout && id === popoutSessionId) await refreshPopoutTitle();
+  });
+
+  // Session closed in the main window: a pop-out showing it has nothing left to show
+  await listen<{ id: string }>("hub-session-closed", async (event) => {
+    if (isPopout && event.payload.id === popoutSessionId) await getCurrentWindow().close();
+  });
+
+  // The user closed a pop-out window (Rust forwards this to main only)
+  await listen<string>("popout-closed", (event) => {
+    if (isPopout) return;
+    poppedOutSessions.delete(event.payload);
+    renderSessionList();
+  });
+
+  // Haiku wrote (or rewrote) a session's subtitle
+  await listen<{ session_id: string; title: string }>("session-title-updated", async (event) => {
+    const session = sessions.get(event.payload.session_id);
+    if (!session) return;
+    session.aiTitle = event.payload.title;
+    renderSessionList();
+    if (isPopout && session.id === popoutSessionId) await refreshPopoutTitle();
   });
 
   // Listen for PTY events
@@ -1363,7 +1455,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     if (!writeFrameScheduled) {
       writeFrameScheduled = true;
-      requestAnimationFrame(flushPendingWrites);
+      nextFrame(flushPendingWrites);
     }
   });
 
@@ -1523,7 +1615,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     // Schedule flush on next animation frame if not already scheduled
     if (!messageFlushScheduled) {
       messageFlushScheduled = true;
-      requestAnimationFrame(flushMessageBuffer);
+      nextFrame(flushMessageBuffer);
     }
   });
 
@@ -1558,7 +1650,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     // Schedule flush on next animation frame if not already scheduled
     if (!outputFlushScheduled) {
       outputFlushScheduled = true;
-      requestAnimationFrame(flushOutputBuffer);
+      nextFrame(flushOutputBuffer);
     }
   });
 
@@ -1816,6 +1908,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           hasBeenStarted: false,
           sortOrder: newSessionData.sort_order || minSortOrder - 1,
           envVars: newSessionData.env_vars || undefined,
+          aiTitle: newSessionData.ai_title || undefined,
         };
         sessions.set(session.id, session);
       }
@@ -1841,6 +1934,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // Listen for pairing requests (show code to user for mobile authentication)
   await listen<{ code: string; device_name?: string }>("pairing-requested", async (event) => {
+    if (isPopout) return; // the main window shows the code
     const { code, device_name } = event.payload;
 
     // Show pairing modal with the code
@@ -1860,7 +1954,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   // Listen for MCP execute requests from the HTTP API
-  await listen<{ request_id: string; code: string }>("mcp-execute", async (event) => {
+  await listen<{ request_id: string; code: string; window?: string }>("mcp-execute", async (event) => {
+    // Every window hears this; only the one the request named runs it
+    if ((event.payload.window ?? "main") !== windowLabel) return;
     const { request_id, code } = event.payload;
     let result: unknown;
     try {
@@ -1956,9 +2052,16 @@ document.addEventListener("DOMContentLoaded", async () => {
     if ((e.metaKey || e.ctrlKey) && e.key === "w") {
       const activeEl = document.activeElement;
       const isTyping = activeEl instanceof HTMLInputElement || activeEl instanceof HTMLTextAreaElement;
-      if (!isTyping) {
+      // A pop-out is a window, so Cmd+W closes it even from the input
+      // (Ctrl+W stays with the input, where it deletes a word)
+      if (isPopout && e.metaKey) {
         e.preventDefault();
-        if (activeSessionId) {
+        void getCurrentWindow().close();
+      } else if (!isTyping) {
+        e.preventDefault();
+        if (isPopout) {
+          void getCurrentWindow().close();
+        } else if (activeSessionId) {
           closeSession(activeSessionId);
         }
       }
@@ -2255,7 +2358,12 @@ document.addEventListener("DOMContentLoaded", async () => {
   await loadRecentlyClosed();
 
   // Reopen last session's working set (needs the sessions to exist first)
-  await restoreOpenSessions();
+  if (isPopout) {
+    await enterPopoutMode();
+  } else {
+    await restoreOpenSessions();
+    await reopenPopouts();
+  }
 
   // Initial render
   renderSessionListImmediate();
@@ -2300,6 +2408,7 @@ async function loadSavedSessions() {
         sortOrder: data.sort_order,
         folderId: data.folder_id || undefined,
         envVars: data.env_vars || undefined,
+        aiTitle: data.ai_title || undefined,
         contextTokens: data.context_tokens ?? undefined,
         cacheExpiresAt: data.cache_expires_at ?? undefined,
         cacheTtlSecs: data.cache_ttl_secs ?? undefined,
@@ -2330,6 +2439,8 @@ async function loadFolders() {
 }
 
 async function saveSessionToDb(session: Session) {
+  void emit("hub-session-saved", { id: session.id, name: session.name, from: windowLabel });
+  if (isPopout && session.id === popoutSessionId) void refreshPopoutTitle();
   try {
     const data: SessionData = {
       id: session.id,
@@ -2665,7 +2776,7 @@ async function saveSessionFromModal() {
 // ============================================
 
 function checkMobileLayout(): boolean {
-  return window.matchMedia("(max-width: 768px)").matches;
+  return !isPopout && window.matchMedia("(max-width: 768px)").matches;
 }
 
 function setMobileView(view: MobileView): void {
@@ -3437,6 +3548,8 @@ async function closeSession(sessionId: string) {
   await deleteTerminalBuffer(sessionId);
 
   sessions.delete(sessionId);
+  poppedOutSessions.delete(sessionId);
+  void emit("hub-session-closed", { id: sessionId });
 
   // Switch to another session or show empty state
   if (activeSessionId === sessionId) {
@@ -4025,7 +4138,7 @@ function scrollToPendingTarget() {
 function scheduleRenderSessionList() {
   if (renderSessionListPending) return;
   renderSessionListPending = true;
-  requestAnimationFrame(() => {
+  nextFrame(() => {
     renderSessionListPending = false;
     renderSessionListImmediate();
   });
@@ -4206,7 +4319,8 @@ function createSessionItem(session: Session, index: number): HTMLElement {
     <div class="drag-handle" title="Drag to reorder">⋮⋮</div>
     <div class="status ${statusClass}"></div>
     <div class="details">
-      <div class="name">${escapeHtml(session.name)}</div>
+      <div class="name">${escapeHtml(session.name)}${poppedOutSessions.has(session.id) ? ' <span class="popout-badge" title="Open in its own window">⧉</span>' : ""}</div>
+      ${session.aiTitle ? `<div class="subtitle" title="${escapeHtml(session.aiTitle)}">${escapeHtml(session.aiTitle)}</div>` : ""}
       ${agentBadgeHtml}
     </div>
     ${chipHtml}
@@ -4450,6 +4564,12 @@ function showSessionContextMenu(x: number, y: number, sessionId: string) {
     // Show/hide submenu on hover
     moveItem.addEventListener("mouseenter", () => { submenu.style.display = "block"; });
     moveItem.addEventListener("mouseleave", () => { submenu.style.display = "none"; });
+  }
+
+  // Chat sessions can live in their own window (another monitor, say)
+  const ctxSession = sessions.get(sessionId);
+  if (ctxSession && isJsonAgent(ctxSession.agentType)) {
+    addMenuItem(menu, poppedOutSessions.has(sessionId) ? "Show Window" : "Open in New Window", () => popOutSession(sessionId));
   }
 
   // Edit session (opens full edit modal with env vars, agent type, etc.)
@@ -5346,6 +5466,7 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
       <div class="chat-context" title="Context usage">—</div>
       <div class="chat-background" title="Background tasks"></div>
       <button class="chat-activity-toggle" title="Show all tool calls and subagent output instead of rolling them up">⊞ activity</button>
+      <button class="chat-popout-btn" title="Open this session in its own window">⧉</button>
     </div>
   `;
 
@@ -5392,6 +5513,9 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
 
   // File attachment button click opens file picker
   attachBtn.addEventListener("click", () => fileInput.click());
+
+  const popoutBtn = containerEl.querySelector(".chat-popout-btn") as HTMLButtonElement;
+  popoutBtn.addEventListener("click", () => popOutSession(session.id));
 
   const activityToggle = containerEl.querySelector(".chat-activity-toggle") as HTMLButtonElement;
   activityToggle.addEventListener("click", () => {
@@ -8243,6 +8367,14 @@ const saveInProgress = new Map<string, boolean>();
  * the whole session - 30MB+ on a long one, and it used to run per message.
  */
 function persistLocalChatMessage(sessionId: string, message: ClaudeJsonMessage): void {
+  // What the user typed here shows up in every other window on this session
+  if (message.type === "user") {
+    void emit("hub-local-message", { sessionId, message, from: windowLabel });
+  } else if (isPopout) {
+    // Lifecycle notices ("session stopped", errors) are raised in every
+    // window; the main window persists them, so a pop-out would only duplicate
+    return;
+  }
   invoke("append_chat_message", { sessionId, message }).catch((err) => {
     console.error("Failed to persist chat message:", err);
   });
@@ -8489,9 +8621,13 @@ function buildMessageEl(chatSession: ChatSession, message: ClaudeJsonMessage): H
   }
 
   if (message.type === "user") {
-    // Skip user messages with empty content (e.g., tool_result messages)
+    // Messages typed here carry the text in `result`; records restored from
+    // the JSONL transcript (and from mobile) carry it in `message.content`.
+    // Tool results are arrays there and are never shown.
+    const content = message.message?.content;
+    const userText = message.result ?? (typeof content === "string" ? content : "");
     const hasImages = message.images && message.images.length > 0;
-    if (!hasImages && !message.result?.trim()) {
+    if (!hasImages && !userText.trim()) {
       return null;
     }
     messageEl.classList.add("user");
@@ -8505,8 +8641,8 @@ function buildMessageEl(chatSession: ChatSession, message: ClaudeJsonMessage): H
       }
       userHtml += '</div>';
     }
-    if (message.result?.trim()) {
-      userHtml += `<div class="user-text">${escapeHtml(message.result)}</div>`;
+    if (userText.trim()) {
+      userHtml += `<div class="user-text">${escapeHtml(userText)}</div>`;
     }
     const userTime = formatMessageTime(message);
     if (userTime) userHtml += `<div class="token-usage">${userTime}</div>`;
@@ -8908,6 +9044,7 @@ async function showSettingsModal(): Promise<void> {
   settingsBounceDockCheckbox.checked = appSettings.bounce_dock_on_bell ?? true;
   settingsReadAloudCheckbox.checked = appSettings.read_aloud_enabled ?? false;
   settingsActiveSessionsGroupCheckbox.checked = appSettings.show_active_sessions_group ?? true;
+  settingsAiTitlesCheckbox.checked = appSettings.ai_titles_enabled ?? true;
   settingsRendererSelect.value = appSettings.renderer || "webgl";
   settingsRemotePinInput.value = appSettings.remote_pin || "";
   settingsWebhookSecretInput.value = appSettings.webhook_secret || "";
@@ -9053,6 +9190,7 @@ async function saveSettings(): Promise<void> {
     webhook_secret: settingsWebhookSecretInput.value || null,
     teams_reply_url: settingsTeamsReplyUrlInput.value || null,
     show_active_sessions_group: settingsActiveSessionsGroupCheckbox.checked,
+    ai_titles_enabled: settingsAiTitlesCheckbox.checked,
     grid_view: appSettings.grid_view ?? false,
     claude_config_dir: (document.getElementById("settings-claude-config-dir") as HTMLInputElement).value || null,
     claude_search_dirs: (() => {
@@ -9607,6 +9745,23 @@ function hidePairingModal(): void {
 // Menu event handler
 
 function handleMenuEvent(eventId: string): void {
+  if (isPopout) {
+    // Rust routes menu events to the focused window. A pop-out shows one
+    // session and has no sidebar, so only a few actions mean anything here.
+    switch (eventId) {
+      case "close_session":
+        void getCurrentWindow().close();
+        return;
+      case "settings":
+      case "zoom_in":
+      case "zoom_out":
+      case "reset_zoom":
+      case "rename_session":
+        break;
+      default:
+        return;
+    }
+  }
   switch (eventId) {
     case "new_session":
       createQuickSession();
@@ -9764,6 +9919,83 @@ async function duplicateSession(sessionId: string): Promise<void> {
 // have been loaded from the database.
 let loadedWindowState: WindowState | null = null;
 
+/** Open (or focus) a session's own window. */
+async function popOutSession(sessionId: string): Promise<void> {
+  const session = sessions.get(sessionId);
+  if (!session) return;
+  try {
+    await invoke("open_session_window", { sessionId, title: session.name });
+    poppedOutSessions.add(sessionId);
+    renderSessionList();
+  } catch (err) {
+    console.error("Failed to open session window:", err);
+    showToast(`Couldn't open window: ${err}`);
+  }
+}
+
+/** Bring back the pop-out windows that were open when the app last quit. */
+async function reopenPopouts(): Promise<void> {
+  try {
+    const saved = await invoke<{ session_id: string }[]>("list_popouts");
+    for (const p of saved) {
+      if (sessions.has(p.session_id)) await popOutSession(p.session_id);
+    }
+  } catch (err) {
+    console.error("Failed to reopen pop-out windows:", err);
+  }
+}
+
+/** Pop-out window title: the session name, plus its subtitle when there is one. */
+async function refreshPopoutTitle(): Promise<void> {
+  const session = popoutSessionId ? sessions.get(popoutSessionId) : undefined;
+  if (!session) return;
+  const title = session.aiTitle ? `${session.name} · ${session.aiTitle}` : session.name;
+  try {
+    await getCurrentWindow().setTitle(title);
+  } catch (err) {
+    console.error("Failed to set window title:", err);
+  }
+}
+
+/**
+ * This window is a pop-out: show its one session and keep its geometry saved
+ * so it comes back on the same monitor next launch.
+ */
+async function enterPopoutMode(): Promise<void> {
+  const win = getCurrentWindow();
+  const session = popoutSessionId ? sessions.get(popoutSessionId) : undefined;
+  if (!session || !popoutSessionId) {
+    await win.close();
+    return;
+  }
+  await refreshPopoutTitle();
+  await switchToSession(popoutSessionId);
+
+  let geometryTimer: number | null = null;
+  const saveGeometry = () => {
+    if (geometryTimer) clearTimeout(geometryTimer);
+    geometryTimer = window.setTimeout(async () => {
+      try {
+        const scale = await win.scaleFactor();
+        const size = await win.innerSize();
+        const pos = await win.outerPosition();
+        await invoke("save_popout_state", {
+          sessionId: popoutSessionId,
+          x: Math.round(pos.x / scale),
+          y: Math.round(pos.y / scale),
+          width: Math.round(size.width / scale),
+          height: Math.round(size.height / scale),
+        });
+      } catch (err) {
+        console.error("Failed to save pop-out geometry:", err);
+      }
+    }, 400);
+  };
+  await win.onResized(saveGeometry);
+  await win.onMoved(saveGeometry);
+  saveGeometry();
+}
+
 /**
  * Load window state from backend and apply it.
  */
@@ -9867,6 +10099,7 @@ async function restoreOpenSessions(): Promise<void> {
  * Save the current window state to backend.
  */
 async function saveWindowState(): Promise<void> {
+  if (isPopout) return; // pop-out geometry is saved by enterPopoutMode()
   try {
     const win = getCurrentWindow();
     const size = await win.innerSize();
@@ -10142,6 +10375,7 @@ function setupSidebarResize(): void {
  * Show a macOS notification.
  */
 async function showNotification(title: string, body: string): Promise<void> {
+  if (isPopout) return; // the main window notifies once for the whole app
   try {
     let permissionGranted = await isPermissionGranted();
 
