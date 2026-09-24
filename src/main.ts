@@ -1410,6 +1410,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (isPopout) return;
     poppedOutSessions.delete(event.payload);
     renderSessionList();
+    // Back into the grid if it's running or pinned there
+    syncGridCards();
   });
 
   // Haiku wrote (or rewrote) a session's subtitle
@@ -1418,6 +1420,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (!session) return;
     session.aiTitle = event.payload.title;
     renderSessionList();
+    refreshSessionTitles();
     if (isPopout && session.id === popoutSessionId) await refreshPopoutTitle();
   });
 
@@ -4147,7 +4150,48 @@ function scheduleRenderSessionList() {
 /**
  * Render the session list immediately (use scheduleRenderSessionList for coalescing).
  */
+/** Grid card headers and the window title follow the session's name and subtitle. */
+function refreshSessionTitles(): void {
+  for (const card of gridContainerEl.querySelectorAll<HTMLElement>(".grid-card")) {
+    const session = card.dataset.sessionId ? sessions.get(card.dataset.sessionId) : undefined;
+    if (!session) continue;
+    const titleEl = card.querySelector(".grid-card-title");
+    if (titleEl && titleEl.textContent !== session.name) titleEl.textContent = session.name;
+    const subEl = card.querySelector<HTMLElement>(".grid-card-subtitle");
+    if (subEl) {
+      const sub = session.aiTitle ?? "";
+      if (subEl.textContent !== sub) subEl.textContent = sub;
+      subEl.title = sub;
+    }
+  }
+  void refreshMainWindowTitle();
+}
+
+// The title the window was created with ("Agent Hub" or "Agent Hub (Dev)")
+let baseWindowTitle: string | null = null;
+
+/**
+ * Main window title bar: the selected session and its subtitle in single
+ * view, so the subtitle has room the sidebar row doesn't. Grid view and the
+ * empty state fall back to the app name.
+ */
+async function refreshMainWindowTitle(): Promise<void> {
+  if (isPopout) return;
+  try {
+    const win = getCurrentWindow();
+    if (baseWindowTitle === null) baseWindowTitle = await win.title();
+    const session = !gridViewActive && activeSessionId ? sessions.get(activeSessionId) : undefined;
+    const title = session
+      ? `${session.name}${session.aiTitle ? ` · ${session.aiTitle}` : ""} — ${baseWindowTitle}`
+      : baseWindowTitle;
+    if ((await win.title()) !== title) await win.setTitle(title);
+  } catch (err) {
+    console.error("Failed to set window title:", err);
+  }
+}
+
 function renderSessionListImmediate() {
+  refreshSessionTitles();
   perfStart("renderSessionList");
   sessionListEl.innerHTML = "";
   activeSessionsEl.innerHTML = "";
@@ -4716,6 +4760,7 @@ async function createFolder(name?: string) {
 }
 
 function updateView() {
+  void refreshMainWindowTitle();
   // Grid view replaces all single-session panes
   if (gridViewActive) {
     emptyStateEl.style.display = "none";
@@ -4883,8 +4928,12 @@ function getFocusedSessionId(): string | null {
 
 /** Sessions that should have a card: running ones, the selection, and any the user opened while in the grid. */
 function getGridSessions(): Session[] {
+  // A session shown in its own window leaves the grid, so the cards that
+  // remain get the space; it comes back when that window closes
   const list = Array.from(sessions.values()).filter(
-    (s) => (s.isRunning || s.id === activeSessionId || gridPinned.has(s.id)) && !gridDismissed.has(s.id)
+    (s) => (s.isRunning || s.id === activeSessionId || gridPinned.has(s.id))
+      && !gridDismissed.has(s.id)
+      && !poppedOutSessions.has(s.id)
   );
   return list.sort((a, b) => a.sortOrder - b.sortOrder);
 }
@@ -5017,10 +5066,11 @@ function createGridCard(session: Session): HTMLElement {
     <div class="grid-card-header">
       <span class="status-dot"></span>
       <span class="grid-card-title" title="Open full view">${escapeHtml(session.name)}</span>
+      <span class="grid-card-subtitle">${escapeHtml(session.aiTitle ?? "")}</span>
       <span class="grid-card-model" title="Active model"></span>
       <span class="grid-card-cache"></span>
       <span class="grid-card-status"></span>
-      ${isChat ? `<button class="grid-card-zoom" title="Zoom (Esc to close)">⤢</button>` : ""}
+      ${isChat ? `<button class="grid-card-popout" title="Open in its own window">⧉</button><button class="grid-card-zoom" title="Zoom (Esc to close)">⤢</button>` : ""}
       <button class="grid-card-close" title="Suspend session (stop, keep history)">×</button>
     </div>
     <div class="grid-card-body">
@@ -5063,6 +5113,7 @@ function createGridCard(session: Session): HTMLElement {
   });
 
   if (isChat) {
+    card.querySelector(".grid-card-popout")!.addEventListener("click", () => popOutSession(session.id));
     card.querySelector(".grid-card-zoom")!.addEventListener("click", () => toggleGridZoom(session.id));
     // Double-click the header (not its buttons) also zooms
     card.querySelector(".grid-card-header")!.addEventListener("dblclick", (e) => {
@@ -9927,6 +9978,7 @@ async function popOutSession(sessionId: string): Promise<void> {
     await invoke("open_session_window", { sessionId, title: session.name });
     poppedOutSessions.add(sessionId);
     renderSessionList();
+    syncGridCards();
   } catch (err) {
     console.error("Failed to open session window:", err);
     showToast(`Couldn't open window: ${err}`);

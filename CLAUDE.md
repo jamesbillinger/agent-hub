@@ -85,7 +85,7 @@ curl -s http://localhost:3857/api/auth/check
 curl -s http://localhost:3847/api/auth/check
 ```
 
-**IMPORTANT:** The window title shown in `take_screenshot` is always "Agent Hub" (from index.html), NOT "Agent Hub (Dev)". Don't rely on the title to determine which app you're connected to. Use the port check above instead.
+**IMPORTANT:** Don't rely on the window title to determine which app you're connected to. In single-session view it is "<session name> · <subtitle> — Agent Hub" (or "… — Agent Hub (Dev)"), and in grid view or with no session just the app name. Use the port check above instead.
 
 ### MCP Tools
 
