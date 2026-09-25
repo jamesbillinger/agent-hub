@@ -1037,8 +1037,11 @@ document.addEventListener("DOMContentLoaded", async () => {
   if (!isPopout) await loadWindowState();
   await loadAppSettings();
 
-  // Restore grid view if it was active last time (desktop only)
-  if (appSettings.grid_view && !checkMobileLayout()) {
+  // Restore grid view if it was active last time (desktop only). A pop-out
+  // shows one session and never the grid - in grid mode it would collect a
+  // card for every running session, which is exactly what popping out is
+  // meant to avoid.
+  if (appSettings.grid_view && !isPopout && !checkMobileLayout()) {
     setGridView(true, false);
   }
 
@@ -4859,7 +4862,7 @@ function updateStartBanner() {
  * with a card per active session (status, latest response, quick input).
  */
 function setGridView(active: boolean, persist: boolean = true): void {
-  if (isMobileLayout) active = false;
+  if (isMobileLayout || isPopout) active = false;
   if (gridViewActive === active) {
     if (active) syncGridCards();
     updateView();
