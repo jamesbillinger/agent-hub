@@ -5907,7 +5907,7 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
         const settingsDefault = appSettings.default_model ? `Settings default: \`${appSettings.default_model}\`` : "No settings default (using CLI config)";
         addChatMessage(sessionId, {
           type: "system",
-          result: `**Current model:** ${activeModelName}${mismatchLine}\n${contextLine}\n${settingsDefault}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`opus\` (Opus 5.5, 1M), \`opus-200k\`, \`opus-5\`, \`fable\` (Fable 5.1, 1M), \`fable-200k\`, \`fable-5\`, \`sonnet\` (Sonnet 5), \`haiku\`, \`opus-4.8\`, \`opus-4.7\`, \`opus-4.6\`, \`sonnet-4.6\`, \`default\`\n**Full IDs:** \`claude-opus-5-5[1m]\`, \`claude-opus-5-5\`, \`claude-opus-5[1m]\`, \`claude-fable-5-1[1m]\`, \`claude-fable-5[1m]\`, \`claude-opus-4-8[1m]\`, \`claude-sonnet-5\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
+          result: `**Current model:** ${activeModelName}${mismatchLine}\n${contextLine}\n${settingsDefault}\n\n**Usage:** \`/model <name>\`\n\n**Shortcuts:** \`opus\` (Opus 5.5, 1M), \`opus-200k\`, \`opus-5\`, \`fable\` (Fable 5.1, 1M), \`fable-200k\`, \`fable-5\`, \`sonnet\` (Sonnet 5.5), \`sonnet-5\`, \`haiku\`, \`opus-4.8\`, \`opus-4.7\`, \`opus-4.6\`, \`sonnet-4.6\`, \`default\`\n**Full IDs:** \`claude-opus-5-5[1m]\`, \`claude-opus-5-5\`, \`claude-opus-5[1m]\`, \`claude-fable-5-1[1m]\`, \`claude-fable-5[1m]\`, \`claude-opus-4-8[1m]\`, \`claude-sonnet-5-5\`, \`claude-sonnet-5\`, etc.\n**Reset:** \`/model default\` to use CLI default`,
         });
         return true;
       }
@@ -5957,7 +5957,8 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
         "opus-5.5": "claude-opus-5-5[1m]",
         "opus-5": "claude-opus-5[1m]",
         "opus-4.8": "claude-opus-4-8[1m]",
-        sonnet: "claude-sonnet-5",
+        sonnet: "claude-sonnet-5-5",
+        "sonnet-5.5": "claude-sonnet-5-5",
         "sonnet-5": "claude-sonnet-5",
         "opus-4.7": "claude-opus-4-7[1m]",
         "opus-4.6": "claude-opus-4-6[1m]",
@@ -7602,6 +7603,7 @@ const MODEL_MAX_CONTEXT: Record<string, number> = {
   "claude-opus-5-5": 200000,
   "claude-opus-5[1m]": 1000000,
   "claude-opus-5": 200000,
+  "claude-sonnet-5-5": 1000000,
   "claude-sonnet-5": 1000000,
   "claude-fable-5-1[1m]": 1000000,
   "claude-fable-5-1": 200000,
