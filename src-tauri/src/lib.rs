@@ -3659,6 +3659,43 @@ fn read_image_file(path: String) -> Result<String, String> {
     Ok(format!("data:{};base64,{}", media_type, base64_data))
 }
 
+/// Which of these paths exist on disk. The chat uses it to decide which
+/// path-looking code spans to turn into links, so an app route like
+/// `/fast-start` stays plain text.
+#[tauri::command]
+fn existing_paths(paths: Vec<String>) -> Vec<bool> {
+    paths
+        .iter()
+        .map(|p| std::path::Path::new(shellexpand::tilde(p).as_ref()).exists())
+        .collect()
+}
+
+/// Open a local file or folder with its default app, like `open <path>`.
+/// Done here rather than through the opener plugin's JS API, whose open-path
+/// scope would otherwise have to allow every path on disk.
+#[tauri::command]
+fn open_local_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let expanded = shellexpand::tilde(&path).into_owned();
+    // `open` exits before failing, so a missing file would otherwise "succeed"
+    if !std::path::Path::new(&expanded).exists() {
+        return Err(format!("File not found: {}", path));
+    }
+    app.opener().open_path(expanded, None::<&str>).map_err(|e| e.to_string())
+}
+
+/// Show a local file or folder selected in Finder.
+#[tauri::command]
+fn reveal_local_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let expanded = shellexpand::tilde(&path).into_owned();
+    // `open` exits before failing, so a missing file would otherwise "succeed"
+    if !std::path::Path::new(&expanded).exists() {
+        return Err(format!("File not found: {}", path));
+    }
+    app.opener().reveal_item_in_dir(expanded).map_err(|e| e.to_string())
+}
+
 /// Read a text file and return its contents
 #[tauri::command]
 fn read_text_file(path: String) -> Result<String, String> {
@@ -6271,6 +6308,9 @@ pub fn run() {
             save_app_settings,
             load_app_settings,
             read_image_file,
+            existing_paths,
+            open_local_path,
+            reveal_local_path,
             read_text_file,
             find_latest_plan_file,
             get_web_server_port,
@@ -6380,6 +6420,9 @@ pub fn run() {
             save_app_settings,
             load_app_settings,
             read_image_file,
+            existing_paths,
+            open_local_path,
+            reveal_local_path,
             read_text_file,
             find_latest_plan_file,
             get_web_server_port,

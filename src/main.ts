@@ -191,6 +191,77 @@ renderer.code = function(code: Tokens.Code) {
   </div>`;
 };
 
+// The working directory of the session whose markdown is being rendered, so a
+// relative path in it resolves against where the agent ran. Set around each
+// marked.parse call by renderAgentMarkdown.
+let markdownCwd = "";
+
+/** Same as marked.parse, with relative local paths resolved against cwd. */
+function renderAgentMarkdown(text: string, cwd: string): string {
+  markdownCwd = cwd;
+  try {
+    return marked.parse(text) as string;
+  } finally {
+    markdownCwd = "";
+  }
+}
+
+// A URL with a scheme (https:, data:, vscode:...) as opposed to a local path.
+// file: is a local path for our purposes, so it's excluded.
+const URL_SCHEME_RE = /^(?!file:)[a-z][a-z0-9+.-]*:/i;
+
+/** Make a local path absolute (or ~-relative) against markdownCwd. */
+function resolveLocalPath(path: string): string {
+  if (/^file:\/\//i.test(path)) path = decodeURI(path.slice(7));
+  if (path.startsWith("/") || path.startsWith("~/") || !markdownCwd) return path;
+  const parts = markdownCwd.split("/");
+  for (const part of path.split("/")) {
+    if (part === "..") parts.pop();
+    else if (part && part !== ".") parts.push(part);
+  }
+  return parts.join("/");
+}
+
+// A markdown image of a local file. The webview would resolve
+// <img src="/tmp/x.png"> against tauri://localhost and show a broken image, so
+// read it from disk the same way as an [Image: source: ...] reference.
+renderer.image = function(image: Tokens.Image) {
+  if (URL_SCHEME_RE.test(image.href)) return marked.Renderer.prototype.image.call(this, image);
+  return createImagePlaceholder(resolveLocalPath(image.href));
+};
+
+// A markdown link to a local file ([notes](./docs/x.md)) opens it like
+// `open` would, instead of being blocked as in-app navigation
+renderer.link = function(link: Tokens.Link) {
+  if (URL_SCHEME_RE.test(link.href) || link.href.startsWith("#")) {
+    return marked.Renderer.prototype.link.call(this, link);
+  }
+  const { path, line } = splitPathLine(resolveLocalPath(link.href));
+  const lineAttr = line ? ` data-local-line="${line}"` : "";
+  return `<a href="#" class="local-path" data-local-path="${escapeHtml(path)}"${lineAttr} title="${escapeHtml(path)}">${this.parser.parseInline(link.tokens)}</a>`;
+};
+
+// A code span that looks like a file path (`/tmp/x.png`, `~/dev/y`,
+// `src/main.ts:42`) is tagged as a candidate. It only becomes clickable once
+// the file is confirmed to exist - see checkLocalPathCandidates - so routes
+// like `/fast-start` and slugs like `owner/repo` stay plain code.
+const PATH_LIKE_RE = /^(?:(?:~|\.{1,2})?\/[^\s]*[^\s/.,:]|[\w.@-]+(?:\/[\w.@-]+)+)(?::\d+(?::\d+)?)?$/;
+renderer.codespan = function(codespan: Tokens.Codespan) {
+  const text = codespan.text;
+  if (text.includes("//") || !PATH_LIKE_RE.test(text)) {
+    return marked.Renderer.prototype.codespan.call(this, codespan);
+  }
+  const { path, line } = splitPathLine(resolveLocalPath(text));
+  const lineAttr = line ? ` data-local-line="${line}"` : "";
+  return `<code data-local-path="${escapeHtml(path)}"${lineAttr}>${escapeHtml(text)}</code>`;
+};
+
+/** Split a trailing :line or :line:col off a path. */
+function splitPathLine(path: string): { path: string; line?: string } {
+  const m = path.match(/^(.*?):(\d+)(?::\d+)?$/);
+  return m ? { path: m[1], line: m[2] } : { path };
+}
+
 marked.setOptions({
   breaks: true, // Convert \n to <br>
   gfm: true,    // GitHub Flavored Markdown
@@ -1259,6 +1330,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   setupLinkHandling();
+  setupLocalPaths();
 
   // Keepalive sweep. Cheap: it exits immediately unless a session is armed and
   // genuinely near expiry.
@@ -5552,7 +5624,9 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
     pendingImages: [],
     pastedTextBlocks: [],
     pasteBlockCounter: 0,
-    cwd: "",
+    // Until the init message reports the real one; history rendering never
+    // sees init, and relative paths in replies need something to resolve against
+    cwd: session.workingDir,
     toolUseCount: 0,
     streamingTokens: 0,
     startTime: null,
@@ -7132,7 +7206,7 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage, persist =
     for (const block of content) {
       if (block.type === "text" && block.text) {
         // Render markdown to HTML
-        const renderedMarkdown = marked.parse(block.text) as string;
+        const renderedMarkdown = renderAgentMarkdown(block.text, chatSession.cwd);
         // Process image references [Image: source: /path/to/image.png]
         const processedHtml = processImageReferences(renderedMarkdown);
         html += `<div>${processedHtml}</div>`;
@@ -7271,7 +7345,7 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage, persist =
     // Plain system messages (e.g., from slash commands)
     messageEl.classList.add("system");
     // Render markdown
-    const renderedMarkdown = marked.parse(message.result) as string;
+    const renderedMarkdown = renderAgentMarkdown(message.result, chatSession.cwd);
     messageEl.innerHTML = renderedMarkdown;
   } else {
     // Skip rendering other message types but still save
@@ -8710,7 +8784,7 @@ function buildMessageEl(chatSession: ChatSession, message: ClaudeJsonMessage): H
     for (const block of content) {
       if (block.type === "text" && block.text) {
         // Render markdown to HTML
-        const renderedMarkdown = marked.parse(block.text) as string;
+        const renderedMarkdown = renderAgentMarkdown(block.text, chatSession.cwd);
         // Process image references [Image: source: /path/to/image.png]
         const processedHtml = processImageReferences(renderedMarkdown);
         html += `<div>${processedHtml}</div>`;
@@ -10354,6 +10428,89 @@ function setupLinkHandling(): void {
     } else {
       console.warn("Blocked in-app navigation to", url);
     }
+  });
+}
+
+/**
+ * Local file paths in agent replies: click opens one with its default app (as
+ * `open` would), right-click offers Finder, VS Code and copying the path.
+ *
+ * Path-looking code spans arrive tagged data-local-path but inert; a debounced
+ * sweep asks the backend which of them exist and only those get .local-path.
+ * A MutationObserver drives the sweep because messages are built in several
+ * places (live, history, grid cards) and some are attached after rendering.
+ */
+function setupLocalPaths(): void {
+  let sweepTimer: number | null = null;
+  const sweep = async () => {
+    sweepTimer = null;
+    const els = Array.from(
+      document.querySelectorAll<HTMLElement>("code[data-local-path]:not([data-path-checked])")
+    );
+    if (els.length === 0) return;
+    els.forEach((el) => (el.dataset.pathChecked = ""));
+    try {
+      const exists = await invoke<boolean[]>("existing_paths", {
+        paths: els.map((el) => el.dataset.localPath!),
+      });
+      els.forEach((el, i) => {
+        if (!exists[i]) return;
+        el.classList.add("local-path");
+        el.title = `${el.dataset.localPath} — click to open, right-click for more`;
+      });
+    } catch (err) {
+      console.error("Failed to check local paths:", err);
+    }
+  };
+  new MutationObserver(() => {
+    if (sweepTimer === null) sweepTimer = window.setTimeout(sweep, 100);
+  }).observe(document.body, { childList: true, subtree: true });
+
+  const openLocal = (path: string) =>
+    invoke("open_local_path", { path }).catch((err) => {
+      console.error("Failed to open", path, err);
+      showToast(`Couldn't open ${path}`);
+    });
+
+  document.addEventListener("click", (e) => {
+    const el = (e.target as HTMLElement).closest?.(".local-path") as HTMLElement | null;
+    if (!el?.dataset.localPath) return;
+    // Runs before setupLinkHandling's handler, which would block href="#"
+    // anchors as nothing to do
+    e.preventDefault();
+    e.stopPropagation();
+    openLocal(el.dataset.localPath);
+  }, true);
+
+  document.addEventListener("contextmenu", (e) => {
+    const el = (e.target as HTMLElement).closest?.(".local-path") as HTMLElement | null;
+    const path = el?.dataset.localPath;
+    if (!path) return;
+    e.preventDefault();
+    const line = el.dataset.localLine;
+    const menu = createContextMenu(e.clientX, e.clientY);
+    addMenuItem(menu, "Open", () => openLocal(path));
+    addMenuItem(menu, "Reveal in Finder", () => {
+      invoke("reveal_local_path", { path }).catch((err) => {
+        console.error("Failed to reveal", path, err);
+        showToast(`Couldn't reveal ${path}`);
+      });
+    });
+    addMenuItem(menu, "Open in VS Code", async () => {
+      const expanded = path.startsWith("~/")
+        ? (await invoke<string>("get_home_dir")) + path.slice(1)
+        : path;
+      openUrl(`vscode://file${expanded}${line ? `:${line}` : ""}`).catch((err) =>
+        console.error("Failed to open VS Code:", err)
+      );
+    });
+    addMenuDivider(menu);
+    addMenuItem(menu, "Copy Path", () => {
+      navigator.clipboard.writeText(path).then(
+        () => showToast("Path copied"),
+        (err) => console.error("Failed to copy path:", err)
+      );
+    });
   });
 }
 

@@ -4585,3 +4585,18 @@ body.popout .chat-popout-btn {
   color: var(--text-primary);
   background: var(--bg-hover);
 }
+
+/* A local file path in an agent reply (see setupLocalPaths in main.ts):
+   click opens it, right-click offers Finder / VS Code / copy */
+.local-path {
+  cursor: pointer;
+}
+
+code.local-path {
+  color: var(--accent-blue);
+}
+
+.local-path:hover {
+  text-decoration: underline;
+  color: var(--accent-blue-bright, #6cb6ff);
+}
