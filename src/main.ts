@@ -483,6 +483,10 @@ interface ChatSession {
   activityGroups: ActivityGroup[];
   // "Show all activity" toggle for this session: groups render open and stay open.
   activityExpanded: boolean;
+  // Oldest top-level transcript items, detached to keep the live DOM small
+  // (see trimTranscript). Oldest first; "Show earlier" puts them back.
+  earlierEls: HTMLElement[];
+  earlierBtn: HTMLButtonElement | null;
 }
 
 /**
@@ -4187,6 +4191,7 @@ function reopenSearchOverlayFromSnapshot() {
 function scrollToPendingTarget() {
   if (!pendingScrollTargetUuid) return;
   const uuid = pendingScrollTargetUuid;
+  revealEarlierMessage(uuid);
   revealActivityMessage(uuid);
   const tryFind = (attemptsLeft: number) => {
     const el = document.querySelector(
@@ -4244,6 +4249,7 @@ function refreshSessionTitles(): void {
 
 // The title the window was created with ("Agent Hub" or "Agent Hub (Dev)")
 let baseWindowTitle: string | null = null;
+let lastWindowTitle: string | null = null;
 
 /**
  * Main window title bar: the selected session and its subtitle in single
@@ -4259,7 +4265,10 @@ async function refreshMainWindowTitle(): Promise<void> {
     const title = session
       ? `${session.name}${session.aiTitle ? ` · ${session.aiTitle}` : ""} — ${baseWindowTitle}`
       : baseWindowTitle;
-    if ((await win.title()) !== title) await win.setTitle(title);
+    // Runs on every session list render; skip the IPC round trips when unchanged
+    if (title === lastWindowTitle) return;
+    lastWindowTitle = title;
+    await win.setTitle(title);
   } catch (err) {
     console.error("Failed to set window title:", err);
   }
@@ -5483,30 +5492,41 @@ function updateGridCardStatus(sessionId: string): void {
   const dot = card.querySelector(".status-dot") as HTMLElement;
   const statusEl = card.querySelector(".grid-card-status") as HTMLElement;
   const modelEl = card.querySelector(".grid-card-model") as HTMLElement;
-  if (modelEl) modelEl.textContent = formatModelLabel(sessionId);
+  if (modelEl) setTextIfChanged(modelEl, formatModelLabel(sessionId));
 
   // Rides the 1s grid ticker, so the warm countdown updates on its own
   const cacheEl = card.querySelector(".grid-card-cache") as HTMLElement | null;
   if (cacheEl) {
     const chip = cacheChip(session);
-    cacheEl.textContent = chip ? chip.text : "";
-    cacheEl.className = chip ? `grid-card-cache ${chip.cls}` : "grid-card-cache";
-    cacheEl.title = chip ? chip.title : "";
+    setTextIfChanged(cacheEl, chip ? chip.text : "");
+    const cls = chip ? `grid-card-cache ${chip.cls}` : "grid-card-cache";
+    if (cacheEl.className !== cls) cacheEl.className = cls;
+    if (cacheEl.title !== (chip?.title ?? "")) cacheEl.title = chip?.title ?? "";
   }
 
   card.classList.toggle("working", !!cs?.isProcessing);
   if (cs?.isProcessing) {
-    dot.className = "status-dot processing";
+    setClassIfChanged(dot, "status-dot processing");
     const elapsed = cs.startTime ? ` ${formatGridElapsed(Date.now() - cs.startTime)}` : "";
     const tool = getLastToolName(cs);
-    statusEl.textContent = `▶ working${elapsed}${tool ? ` · ${tool}` : ""}`;
+    setTextIfChanged(statusEl, `▶ working${elapsed}${tool ? ` · ${tool}` : ""}`);
   } else if (session.isRunning) {
-    dot.className = "status-dot running";
-    statusEl.textContent = "idle";
+    setClassIfChanged(dot, "status-dot running");
+    setTextIfChanged(statusEl, "idle");
   } else {
-    dot.className = "status-dot";
-    statusEl.textContent = "not running";
+    setClassIfChanged(dot, "status-dot");
+    setTextIfChanged(statusEl, "not running");
   }
+}
+
+// The grid ticker rewrites every card each second; an identical write still
+// replaces the text node and dirties layout, so skip it.
+function setTextIfChanged(el: HTMLElement, text: string): void {
+  if (el.textContent !== text) el.textContent = text;
+}
+
+function setClassIfChanged(el: HTMLElement, cls: string): void {
+  if (el.className !== cls) el.className = cls;
 }
 
 function getAgentLabel(agentType: string): string {
@@ -5637,6 +5657,8 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
     activityGroup: null,
     activityGroups: [],
     activityExpanded: false,
+    earlierEls: [],
+    earlierBtn: null,
   };
 
   // File attachment button click opens file picker
@@ -5799,6 +5821,7 @@ async function initializeChatView(session: Session): Promise<ChatSession> {
   // Always try to load existing messages - buffer may exist even if claudeSessionId is missing
   // (e.g., session was used but claudeSessionId wasn't saved properly)
   await loadChatMessages(session.id, chatSession);
+  trimTranscript(chatSession);
   updateBackgroundIndicator(chatSession);
 
   // If we loaded messages, mark the session as having been started
@@ -5859,6 +5882,8 @@ async function handleSlashCommand(sessionId: string, command: string): Promise<b
       chatSession.messages = [];
       chatSession.activityGroup = null;
       chatSession.activityGroups = [];
+      chatSession.earlierEls = [];
+      chatSession.earlierBtn = null;
       addChatMessage(sessionId, {
         type: "system",
         result: "Chat display cleared. Claude still remembers the conversation.",
@@ -7359,6 +7384,8 @@ function addChatMessage(sessionId: string, message: ClaudeJsonMessage, persist =
   const wasAtBottom = isChatAtBottom(chatSession.messagesEl);
 
   placeMessageEl(chatSession, messageEl, message);
+  // Not while scrolled up - dropping items above would shift what's on screen
+  if (wasAtBottom) trimTranscript(chatSession);
 
   // Only auto-scroll if was already at bottom (or user message)
   if (wasAtBottom || message.type === "user") {
@@ -8958,6 +8985,94 @@ function placeMessageEl(chatSession: ChatSession, messageEl: HTMLElement, messag
   }
   closeActivityGroup(chatSession);
   chatSession.messagesEl.appendChild(messageEl);
+}
+
+// ---- Transcript trimming ---------------------------------------------------
+//
+// Every top-level item in a visible transcript is laid out again whenever
+// anything near it changes - a grid card's 1s status tick, a streamed message,
+// the input box resizing as you type. A long-running session holds thousands
+// of them, and with several on screen in grid view that cost reached seconds
+// per keystroke. So only the newest TRANSCRIPT_KEEP items stay attached; older
+// ones are detached (kept, not rebuilt) behind a "Show earlier" button.
+
+const TRANSCRIPT_KEEP = 200;
+// Trim in batches so it isn't a DOM shuffle on every message
+const TRANSCRIPT_SLACK = 50;
+
+function isTrimmable(chatSession: ChatSession, el: Element): el is HTMLElement {
+  return el !== chatSession.earlierBtn && !el.classList.contains("init-details");
+}
+
+/** Detach the oldest items once the transcript is TRANSCRIPT_SLACK past its limit. */
+function trimTranscript(chatSession: ChatSession): void {
+  const messagesEl = chatSession.messagesEl;
+  const fixed = (chatSession.earlierBtn ? 1 : 0) + (messagesEl.querySelector(":scope > .init-details") ? 1 : 0);
+  let excess = messagesEl.childElementCount - fixed - TRANSCRIPT_KEEP;
+  if (excess < TRANSCRIPT_SLACK) return;
+  const removed: HTMLElement[] = [];
+  for (let el = messagesEl.firstElementChild; el && excess > 0; ) {
+    const next = el.nextElementSibling;
+    if (isTrimmable(chatSession, el)) {
+      removed.push(el);
+      el.remove();
+      excess--;
+    }
+    el = next;
+  }
+  chatSession.earlierEls.push(...removed);
+  updateEarlierButton(chatSession);
+}
+
+/** Put back the newest `count` detached items (all of them by default), keeping the view still. */
+function restoreEarlier(chatSession: ChatSession, count = chatSession.earlierEls.length): void {
+  if (count <= 0) return;
+  const restored = chatSession.earlierEls.splice(-count);
+  const messagesEl = chatSession.messagesEl;
+  const anchor = Array.from(messagesEl.children).find((el) => isTrimmable(chatSession, el)) ?? null;
+  const fromBottom = messagesEl.scrollHeight - messagesEl.scrollTop;
+  const frag = document.createDocumentFragment();
+  frag.append(...restored);
+  messagesEl.insertBefore(frag, anchor);
+  messagesEl.scrollTop = messagesEl.scrollHeight - fromBottom;
+  updateEarlierButton(chatSession);
+}
+
+function updateEarlierButton(chatSession: ChatSession): void {
+  const n = chatSession.earlierEls.length;
+  if (n === 0) {
+    chatSession.earlierBtn?.remove();
+    chatSession.earlierBtn = null;
+    return;
+  }
+  let btn = chatSession.earlierBtn;
+  if (!btn) {
+    btn = document.createElement("button");
+    btn.className = "chat-earlier-btn";
+    btn.addEventListener("click", () => restoreEarlier(chatSession, TRANSCRIPT_KEEP));
+    chatSession.earlierBtn = btn;
+  }
+  btn.textContent = `Show ${Math.min(n, TRANSCRIPT_KEEP)} earlier (${n} hidden)`;
+  // First, or right after the init details when they're shown
+  const init = chatSession.messagesEl.querySelector(":scope > .init-details");
+  const want = init ? init.nextElementSibling : chatSession.messagesEl.firstElementChild;
+  if (want !== btn) chatSession.messagesEl.insertBefore(btn, want);
+}
+
+/** A search jump to a detached message: put it (and everything after it) back. */
+function revealEarlierMessage(uuid: string): void {
+  const selector = `.chat-message[data-uuid="${CSS.escape(uuid)}"]`;
+  for (const cs of chatSessions.values()) {
+    const i = cs.earlierEls.findIndex((el) => {
+      if (el.matches(selector) || el.querySelector(selector)) return true;
+      const group = cs.activityGroups.find((g) => g.el === el);
+      return !!group?.pending.some((m) => m.uuid === uuid);
+    });
+    if (i >= 0) {
+      restoreEarlier(cs, cs.earlierEls.length - i);
+      return;
+    }
+  }
 }
 
 function openActivityGroup(chatSession: ChatSession): ActivityGroup {

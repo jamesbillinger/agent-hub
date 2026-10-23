@@ -1378,6 +1378,23 @@ body.resizing-sidebar {
    messages, rolled up to one line once something readable follows. The open
    group is the live tail. History behind a collapsed header isn't in the DOM
    until it's expanded. */
+/* Older transcript items are detached to keep layout cheap - see trimTranscript */
+.chat-earlier-btn {
+  align-self: center;
+  background: none;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 4px 12px;
+}
+
+.chat-earlier-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--accent-primary);
+}
+
 .activity-group {
   align-self: stretch;
   width: 100%;
