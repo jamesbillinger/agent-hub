@@ -124,7 +124,9 @@ export function MessageList({ sessionId, messages }: MessageListProps) {
           const { message } = item;
           const highlight = !!message.uuid && message.uuid === flashUuid;
           return (
-            <div data-uuid={message.uuid} className={highlight ? 'ah-search-flash' : undefined}>
+            // min-h-px: a row that renders nothing must still have a size, or
+            // virtuoso can't measure it and stops laying out the list
+            <div data-uuid={message.uuid} className={`min-h-px${highlight ? ' ah-search-flash' : ''}`}>
               <MessageBubble message={message} />
             </div>
           );

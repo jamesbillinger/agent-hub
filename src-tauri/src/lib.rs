@@ -1939,6 +1939,16 @@ fn load_claude_session_history(session_id: String, project: String) -> Result<Ve
         .replace('/', "-")
         .trim_start_matches('-')
         .to_string();
+    // The CLI files a transcript under the real path of its cwd, so a session
+    // whose working dir goes through a symlink (~/dev -> /Volumes/Storage/dev)
+    // lives under the resolved name. Try both.
+    let mut folder_names = vec![project_folder_name.clone()];
+    if let Ok(real) = std::fs::canonicalize(&expanded) {
+        let real_name = real.to_string_lossy().replace('/', "-").trim_start_matches('-').to_string();
+        if real_name != project_folder_name {
+            folder_names.push(real_name);
+        }
+    }
 
     // Iterate every configured Claude home (settings.claude_search_dirs) and
     // pick the first one that has the file. Falls back to ~/.claude.
@@ -1964,15 +1974,17 @@ fn load_claude_session_history(session_id: String, project: String) -> Result<Ve
     }
 
     let mut session_file: Option<std::path::PathBuf> = None;
-    for home in &search_homes {
+    'homes: for home in &search_homes {
         let home_expanded = shellexpand::tilde(home).to_string();
-        let candidate = std::path::PathBuf::from(home_expanded)
-            .join("projects")
-            .join(format!("-{}", project_folder_name))
-            .join(format!("{}.jsonl", session_id));
-        if candidate.exists() {
-            session_file = Some(candidate);
-            break;
+        for folder in &folder_names {
+            let candidate = std::path::PathBuf::from(&home_expanded)
+                .join("projects")
+                .join(format!("-{}", folder))
+                .join(format!("{}.jsonl", session_id));
+            if candidate.exists() {
+                session_file = Some(candidate);
+                break 'homes;
+            }
         }
     }
     let session_file = match session_file {

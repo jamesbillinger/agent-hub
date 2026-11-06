@@ -91,6 +91,24 @@ export function MessageBubble({ message }: MessageBubbleProps) {
     );
   }
 
+  // Session notices (resumed, model switch, keepalive ping, compaction).
+  // messageAltitude counts these as readable rows, so they must render
+  // something: a zero-height first row stops react-virtuoso from laying out
+  // the list at all, leaving the whole transcript blank.
+  if (message.type === 'system') {
+    const text = message.subtype === 'compact_boundary' ? 'Context compacted' : message.result;
+    if (text) {
+      return (
+        <div className="px-4 py-2 text-center">
+          <span
+            className="text-sm text-gray-500"
+            dangerouslySetInnerHTML={{ __html: marked.parseInline(text) as string }}
+          />
+        </div>
+      );
+    }
+  }
+
   // Skip other message types
   return null;
 }
