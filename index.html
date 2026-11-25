@@ -341,6 +341,17 @@
             </label>
             <p class="form-hint">After a turn ends, a short Haiku call writes a one-line subtitle for the session ("Auctria Stripe setup") under its name. Uses your Claude login, refreshed as the conversation moves on.</p>
           </div>
+          <div class="form-group checkbox-group">
+            <label for="settings-idle-compact">
+              <input type="checkbox" id="settings-idle-compact" checked />
+              Compact idle sessions before their cache expires
+            </label>
+            <p class="form-hint">When a large chat session has sat idle for most of its 1-hour cache window, run <code>/compact</code> a few minutes before the cache expires. Coming back then costs a small summary instead of re-caching the whole context. Skipped for sessions set to keep their cache warm.</p>
+          </div>
+          <div class="form-group">
+            <label for="settings-idle-compact-min">Only when the context is at least (thousand tokens)</label>
+            <input type="number" id="settings-idle-compact-min" min="10" max="1000" step="10" value="150" />
+          </div>
         </div>
 
         <div class="settings-section">

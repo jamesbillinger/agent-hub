@@ -547,6 +547,8 @@ interface AppSettings {
   teams_reply_url?: string | null;
   show_active_sessions_group: boolean;
   ai_titles_enabled?: boolean;
+  idle_compact_enabled?: boolean;
+  idle_compact_min_tokens?: number;
   grid_view?: boolean;
   default_model?: string | null;
   webhook_model?: string | null;
@@ -589,6 +591,8 @@ let appSettings: AppSettings = {
   renderer: "webgl",
   show_active_sessions_group: true,
   ai_titles_enabled: true,
+  idle_compact_enabled: true,
+  idle_compact_min_tokens: 150000,
   default_model: "claude-opus-5-5[1m]",
   webhook_model: null,
   claude_config_dir: null,
@@ -1338,7 +1342,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // Keepalive sweep. Cheap: it exits immediately unless a session is armed and
   // genuinely near expiry.
-  if (!isPopout) window.setInterval(() => { void sweepKeepalive(); }, 60_000);
+  if (!isPopout) window.setInterval(() => { void sweepKeepalive(); void sweepIdleCompact(); }, 60_000);
 
   // Event delegation for diff expand buttons and clickable paths (dynamically added)
   // Use chat-container since chat-messages elements are created dynamically per session
@@ -3675,7 +3679,10 @@ async function restoreRecentlyClosed(index: number) {
     createdAt: new Date(),
     isRunning: false,
     claudeSessionId: closed.claudeSessionId, // Preserve for --resume
-    hasBeenStarted: false,
+    // Set it here rather than relying on the history load to flip it: the
+    // start below can run before that lands, and without the flag the CLI is
+    // spawned without --resume - a new conversation that knows nothing.
+    hasBeenStarted: !!closed.claudeSessionId,
     sortOrder: minSortOrder - 1,
   };
 
@@ -7824,6 +7831,75 @@ async function sweepKeepalive(): Promise<void> {
   }
 }
 
+// Idle compaction. Compacting must start while the cache is still warm: the
+// summary call then reads the big context at cache-read price, and a returning
+// turn only has to cache the small summary instead of re-writing the whole
+// context. Once the cache has lapsed, compacting costs as much as continuing,
+// so there is no point firing late.
+const IDLE_COMPACT_LEAD_MS = 4 * 60 * 1000;
+// Break-even, with a 1h cache write at 2x input and output at 5x: compacting a
+// context of C costs ~0.1C (cache read) plus ~40k input-equivalent for the
+// summary, and saves ~2C if the session is ever continued. At 150k that pays
+// off once roughly one idle compaction in five is followed by a real turn.
+const IDLE_COMPACT_DEFAULT_MIN_TOKENS = 150_000;
+const IDLE_COMPACT_INSTRUCTIONS =
+  "This session went idle and is being compacted automatically before its prompt cache expires. " +
+  "Keep the current task and its status, decisions made, open questions, and exact file paths, " +
+  "commands, branch names and identifiers needed to pick the work back up.";
+/** Session id -> the cache expiry an idle compact was already tried against. */
+const idleCompactTried: Map<string, string> = new Map();
+
+/**
+ * Compact large idle sessions just before their 1h cache lapses.
+ *
+ * Only 1h-TTL sessions: on a 5m TTL this would fire after every short pause.
+ * One attempt per cache expiry, so a failure isn't retried every minute and a
+ * compacted session (its next turn sets a new expiry) can't loop.
+ */
+async function sweepIdleCompact(): Promise<void> {
+  if (appSettings.idle_compact_enabled === false) return;
+  const minTokens = appSettings.idle_compact_min_tokens || IDLE_COMPACT_DEFAULT_MIN_TOKENS;
+  for (const session of sessions.values()) {
+    if (!isJsonAgent(session.agentType)) continue;
+    if (keepaliveArmed(session)) continue;
+    if (session.cacheTtlSecs !== 3600) continue;
+    if (!session.contextTokens || session.contextTokens < minTokens) continue;
+    if (!session.cacheExpiresAt) continue;
+    const expiry = Date.parse(session.cacheExpiresAt);
+    if (!isFinite(expiry)) continue;
+    const msLeft = expiry - Date.now();
+    // Leave a minute of slack for the 60s sweep interval and process startup.
+    if (msLeft > IDLE_COMPACT_LEAD_MS || msLeft < 60_000) continue;
+    if (idleCompactTried.get(session.id) === session.cacheExpiresAt) continue;
+    const cs = chatSessions.get(session.id);
+    if (cs?.isProcessing) continue;
+    idleCompactTried.set(session.id, session.cacheExpiresAt);
+
+    try {
+      // Like keepalive, not gated on isRunning (stale after a webview reload):
+      // write_to_process errors when there's no process and never starts one.
+      await invoke("write_to_process", {
+        sessionId: session.id,
+        data:
+          JSON.stringify({ type: "user", message: { role: "user", content: `/compact ${IDLE_COMPACT_INSTRUCTIONS}` } }) +
+          "\n",
+      });
+      addChatMessage(session.id, {
+        type: "system",
+        result: `--- Idle compact: ${Math.round(session.contextTokens / 1000)}k tokens, cache expires ${new Date(expiry).toLocaleTimeString()} ---`,
+      });
+      if (cs) {
+        cs.isProcessing = true;
+        updateSessionActivityIndicator(session.id, true);
+      }
+    } catch (err) {
+      // No live process: nothing to compact, and resuming it later would be a
+      // cold start either way.
+      console.log(`Idle compact skipped for "${session.name}":`, err);
+    }
+  }
+}
+
 /**
  * Forget a session's recorded size and cache state. Both reset paths need this:
  * a reset mints a new Claude session id, so the old cache entry can never be
@@ -9290,6 +9366,9 @@ async function showSettingsModal(): Promise<void> {
   settingsReadAloudCheckbox.checked = appSettings.read_aloud_enabled ?? false;
   settingsActiveSessionsGroupCheckbox.checked = appSettings.show_active_sessions_group ?? true;
   settingsAiTitlesCheckbox.checked = appSettings.ai_titles_enabled ?? true;
+  (document.getElementById("settings-idle-compact") as HTMLInputElement).checked = appSettings.idle_compact_enabled ?? true;
+  (document.getElementById("settings-idle-compact-min") as HTMLInputElement).value =
+    String(Math.round((appSettings.idle_compact_min_tokens ?? IDLE_COMPACT_DEFAULT_MIN_TOKENS) / 1000));
   settingsRendererSelect.value = appSettings.renderer || "webgl";
   settingsRemotePinInput.value = appSettings.remote_pin || "";
   settingsWebhookSecretInput.value = appSettings.webhook_secret || "";
@@ -9436,6 +9515,11 @@ async function saveSettings(): Promise<void> {
     teams_reply_url: settingsTeamsReplyUrlInput.value || null,
     show_active_sessions_group: settingsActiveSessionsGroupCheckbox.checked,
     ai_titles_enabled: settingsAiTitlesCheckbox.checked,
+    idle_compact_enabled: (document.getElementById("settings-idle-compact") as HTMLInputElement).checked,
+    idle_compact_min_tokens: (() => {
+      const k = parseInt((document.getElementById("settings-idle-compact-min") as HTMLInputElement).value, 10);
+      return isFinite(k) && k > 0 ? k * 1000 : IDLE_COMPACT_DEFAULT_MIN_TOKENS;
+    })(),
     grid_view: appSettings.grid_view ?? false,
     claude_config_dir: (document.getElementById("settings-claude-config-dir") as HTMLInputElement).value || null,
     claude_search_dirs: (() => {

@@ -555,6 +555,13 @@ struct AppSettings {
     /// turn ends (a short `claude -p` call on the user's own login).
     #[serde(default = "default_true")]
     ai_titles_enabled: bool,
+    /// Compact an idle chat session just before its 1h prompt cache lapses,
+    /// when its context is at least `idle_compact_min_tokens`. Read only by
+    /// the frontend; kept here so it round-trips through save_app_settings.
+    #[serde(default = "default_true")]
+    idle_compact_enabled: bool,
+    #[serde(default = "default_idle_compact_min_tokens")]
+    idle_compact_min_tokens: u64,
     /// Show all active sessions as a card grid instead of one at a time
     #[serde(default)]
     grid_view: bool,
@@ -588,6 +595,10 @@ fn default_claude_search_dirs() -> Vec<String> {
 
 fn default_renderer() -> String {
     "webgl".to_string()
+}
+
+fn default_idle_compact_min_tokens() -> u64 {
+    150_000
 }
 
 fn default_true() -> bool {
@@ -640,6 +651,8 @@ impl Default for AppSettings {
             webhook_secret: None,
             show_active_sessions_group: true,
             ai_titles_enabled: true,
+            idle_compact_enabled: true,
+            idle_compact_min_tokens: default_idle_compact_min_tokens(),
             grid_view: false,
             default_model: default_model_default(),
             webhook_model: None,
