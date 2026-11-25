@@ -7875,27 +7875,35 @@ async function sweepIdleCompact(): Promise<void> {
     if (cs?.isProcessing) continue;
     idleCompactTried.set(session.id, session.cacheExpiresAt);
 
+    const data =
+      JSON.stringify({ type: "user", message: { role: "user", content: `/compact ${IDLE_COMPACT_INSTRUCTIONS}` } }) + "\n";
     try {
-      // Like keepalive, not gated on isRunning (stale after a webview reload):
-      // write_to_process errors when there's no process and never starts one.
-      await invoke("write_to_process", {
-        sessionId: session.id,
-        data:
-          JSON.stringify({ type: "user", message: { role: "user", content: `/compact ${IDLE_COMPACT_INSTRUCTIONS}` } }) +
-          "\n",
-      });
+      // Not gated on isRunning (stale after a webview reload): write_to_process
+      // is the authority on whether a process is live.
+      try {
+        await invoke("write_to_process", { sessionId: session.id, data });
+      } catch (err) {
+        // No process - usually because the app restarted (an update, say) after
+        // the last turn. Resuming reads the same prefix, so the compact still
+        // hits the warm cache; this is the same restart a typed message does.
+        if (!String(err).includes("Process not found") || !session.claudeSessionId) throw err;
+        session.isRunning = false;
+        session.hasBeenStarted = true;
+        if (!chatSessions.has(session.id)) await initializeChatView(session);
+        await startJsonProcess(session);
+        await invoke("write_to_process", { sessionId: session.id, data });
+      }
       addChatMessage(session.id, {
         type: "system",
         result: `--- Idle compact: ${Math.round(session.contextTokens / 1000)}k tokens, cache expires ${new Date(expiry).toLocaleTimeString()} ---`,
       });
-      if (cs) {
-        cs.isProcessing = true;
+      const chat = chatSessions.get(session.id);
+      if (chat) {
+        chat.isProcessing = true;
         updateSessionActivityIndicator(session.id, true);
       }
     } catch (err) {
-      // No live process: nothing to compact, and resuming it later would be a
-      // cold start either way.
-      console.log(`Idle compact skipped for "${session.name}":`, err);
+      console.error(`Idle compact failed for "${session.name}":`, err);
     }
   }
 }
